@@ -106,7 +106,13 @@ type PoleSlot = {
   expanded: boolean;
 };
 
-function buildPoleMapHtml(lat: number, lng: number, accentColor: string) {
+function buildPoleMapHtml(lat: number, lng: number, accentColor: string, satellite = false) {
+  const tileUrl = satellite
+    ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+    : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+  const tileOpts = satellite
+    ? 'maxZoom:19,attribution:""'
+    : 'subdomains:"abcd",maxZoom:20,attribution:""';
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -114,17 +120,32 @@ function buildPoleMapHtml(lat: number, lng: number, accentColor: string) {
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;}
-html,body,#map{width:100%;height:100%;background:#f0f4f8;}
+html,body,#map{width:100%;height:100%;background:#0d1117;}
 .leaflet-div-icon{background:none!important;border:none!important;}
-.pin-pulse{
-  width:20px;height:20px;border-radius:50%;
-  background:${accentColor};
-  box-shadow:0 0 0 0 ${accentColor}66;
-  animation:pulse 1.8s infinite;
+.leaflet-control-attribution{display:none!important;}
+.leaflet-control-zoom{display:none!important;}
+.pin-wrap{display:flex;flex-direction:column;align-items:center;}
+.pin-ring{
+  width:36px;height:36px;border-radius:50%;
+  background:${accentColor}22;
+  border:2px solid ${accentColor}88;
+  display:flex;align-items:center;justify-content:center;
+  animation:ring-pulse 2s infinite;
 }
-@keyframes pulse{
-  0%{box-shadow:0 0 0 0 ${accentColor}66;}
-  70%{box-shadow:0 0 0 14px ${accentColor}00;}
+.pin-dot{
+  width:14px;height:14px;border-radius:50%;
+  background:${accentColor};
+  border:2.5px solid #fff;
+  box-shadow:0 2px 8px rgba(0,0,0,0.5);
+}
+.pin-line{
+  width:2px;height:12px;
+  background:linear-gradient(${accentColor},transparent);
+  margin-top:-1px;
+}
+@keyframes ring-pulse{
+  0%{box-shadow:0 0 0 0 ${accentColor}55;}
+  70%{box-shadow:0 0 0 16px ${accentColor}00;}
   100%{box-shadow:0 0 0 0 ${accentColor}00;}
 }
 </style>
@@ -134,28 +155,26 @@ html,body,#map{width:100%;height:100%;background:#f0f4f8;}
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 var map=L.map('map',{
-  zoomControl:true,
+  zoomControl:false,
   scrollWheelZoom:false,
   dragging:true,
-  doubleClickZoom:false,
-  touchZoom:true
-}).setView([${lat},${lng}],17);
+  doubleClickZoom:true,
+  touchZoom:true,
+  attributionControl:false
+}).setView([${lat},${lng}],18);
 
-L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{
-  subdomains:'abcd',
-  maxZoom:20
-}).addTo(map);
+L.tileLayer('${tileUrl}',{${tileOpts}}).addTo(map);
 
 var icon=L.divIcon({
   className:'',
-  html:'<div class="pin-pulse"></div>',
-  iconSize:[20,20],
-  iconAnchor:[10,10]
+  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div><div class="pin-line"></div></div>',
+  iconSize:[36,60],
+  iconAnchor:[18,60]
 });
 
 L.marker([${lat},${lng}],{icon:icon}).addTo(map);
 
-setTimeout(function(){map.invalidateSize();},100);
+setTimeout(function(){map.invalidateSize();},80);
 </script>
 </body>
 </html>`;
@@ -1156,7 +1175,9 @@ export default function PoleDetailScreen() {
   const hasGps = !!(lat && lng);
   const infoComplete = isPoleReport ? hasGps : hasGps && !!slot;
 
-  const [showCameraModal, setShowCameraModal] = useState(false);
+  const [showCameraModal, setShowCameraModal]   = useState(false);
+  const [mapFullscreen, setMapFullscreen]       = useState(false);
+  const [mapSatellite, setMapSatellite]         = useState(true);
   const [activeCameraTab, setActiveCameraTab] = useState<"before" | "after" | "tag">("before");
   const cameraRef = useRef<React.ComponentRef<typeof CameraView>>(null);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -1620,7 +1641,11 @@ export default function PoleDetailScreen() {
             />
 
             {hasGps && lat !== null && lng !== null ? (
-              <View style={styles.gpsMapBox}>
+              <TouchableOpacity
+                activeOpacity={0.95}
+                onPress={() => setMapFullscreen(true)}
+                style={styles.gpsMapBox}
+              >
                 <WebView
                   style={StyleSheet.absoluteFillObject}
                   scrollEnabled={false}
@@ -1629,12 +1654,33 @@ export default function PoleDetailScreen() {
                   domStorageEnabled
                   mixedContentMode="always"
                   source={{
-                    html: buildPoleMapHtml(lat, lng, accentColor),
+                    html: buildPoleMapHtml(lat, lng, accentColor, mapSatellite),
                     baseUrl: "https://local.telcovantage/",
                   }}
                   cacheEnabled={false}
+                  pointerEvents="none"
                 />
-              </View>
+                {/* Satellite toggle pill */}
+                <TouchableOpacity
+                  style={styles.mapLayerBtn}
+                  onPress={() => setMapSatellite(v => !v)}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Text style={styles.mapLayerBtnText}>
+                    {mapSatellite ? '🗺 Map' : '🛰 Sat'}
+                  </Text>
+                </TouchableOpacity>
+                {/* Fullscreen hint */}
+                <View style={styles.mapExpandHint}>
+                  <Text style={styles.mapExpandHintText}>⛶ Tap to expand</Text>
+                </View>
+                {/* Coordinates overlay */}
+                <View style={styles.mapCoordsOverlay}>
+                  <Text style={styles.mapCoordsText}>
+                    {lat.toFixed(6)},  {lng.toFixed(6)}
+                  </Text>
+                </View>
+              </TouchableOpacity>
             ) : null}
 
             <Pressable
@@ -2307,6 +2353,53 @@ export default function PoleDetailScreen() {
           originWhitelist={["*"]}
         />
 
+        {/* ── Fullscreen Map Modal ── */}
+        <Modal
+          visible={mapFullscreen}
+          animationType="slide"
+          statusBarTranslucent
+          onRequestClose={() => setMapFullscreen(false)}
+        >
+          <View style={{ flex: 1, backgroundColor: '#0d1117' }}>
+            {/* Header */}
+            <View style={styles.mapModalHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.mapModalTitle}>Pole Location</Text>
+                {lat !== null && lng !== null && (
+                  <Text style={styles.mapModalCoords}>{lat.toFixed(7)},  {lng.toFixed(7)}</Text>
+                )}
+              </View>
+              <TouchableOpacity
+                onPress={() => setMapSatellite(v => !v)}
+                style={styles.mapModalLayerBtn}
+              >
+                <Text style={styles.mapModalLayerText}>{mapSatellite ? '🗺 Map' : '🛰 Satellite'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setMapFullscreen(false)}
+                style={styles.mapModalCloseBtn}
+              >
+                <Text style={styles.mapModalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            {/* Full map */}
+            {lat !== null && lng !== null && (
+              <WebView
+                style={{ flex: 1 }}
+                originWhitelist={["*"]}
+                javaScriptEnabled
+                domStorageEnabled
+                mixedContentMode="always"
+                source={{
+                  html: buildPoleMapHtml(lat, lng, accentColor, mapSatellite),
+                  baseUrl: "https://local.telcovantage/",
+                }}
+                cacheEnabled={false}
+              />
+            )}
+          </View>
+        </Modal>
+
         {/* ── Tabbed Camera Modal ── */}
         <Modal
           visible={showCameraModal}
@@ -2871,10 +2964,115 @@ const styles = StyleSheet.create({
   },
 
   gpsMapBox: {
-    height: 200,
-    borderRadius: 16,
+    height: 260,
+    borderRadius: 20,
     overflow: "hidden",
     marginBottom: 12,
+    backgroundColor: "#0d1117",
+  },
+
+  mapLayerBtn: {
+    position: "absolute",
+    top: 10,
+    right: 10,
+    backgroundColor: "rgba(0,0,0,0.65)",
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+    zIndex: 10,
+  },
+  mapLayerBtnText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+
+  mapExpandHint: {
+    position: "absolute",
+    top: 10,
+    left: 10,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    zIndex: 10,
+  },
+  mapExpandHintText: {
+    color: "rgba(255,255,255,0.85)",
+    fontSize: 10,
+    fontWeight: "600",
+  },
+
+  mapCoordsOverlay: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    paddingVertical: 7,
+    paddingHorizontal: 14,
+    zIndex: 10,
+  },
+  mapCoordsText: {
+    color: "#fff",
+    fontSize: 11,
+    fontFamily: "monospace",
+    fontWeight: "600",
+    textAlign: "center",
+    letterSpacing: 0.5,
+  },
+
+  mapModalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 56,
+    paddingBottom: 14,
+    backgroundColor: "#0d1117",
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,255,255,0.08)",
+  },
+  mapModalTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#fff",
+  },
+  mapModalCoords: {
+    fontSize: 11,
+    color: "rgba(255,255,255,0.5)",
+    fontFamily: "monospace",
+    marginTop: 2,
+  },
+  mapModalLayerBtn: {
+    backgroundColor: "rgba(255,255,255,0.1)",
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+  },
+  mapModalLayerText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  mapModalCloseBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "rgba(255,255,255,0.1)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  mapModalCloseText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "700",
   },
 
   gpsCardButton: {

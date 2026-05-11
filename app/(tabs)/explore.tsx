@@ -1,7 +1,8 @@
 import { useAuth } from "@/context/auth-context";
 import { cacheGet, cacheSet } from "@/lib/cache";
-import { getPoles } from "@/services/pole";
-import { useEffect, useRef, useState } from "react";
+import api from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useFocusEffect } from "expo-router";
 import {
   ActivityIndicator,
   Pressable,
@@ -13,40 +14,47 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 const CACHE_KEY = "pole_map_pins_v1";
-const PER_PAGE = 500;
 
 type PolePin = {
   id: number;
   pole_code: string;
-  lat: number;
-  lng: number;
+  lat: number | null;
+  lng: number | null;
+  has_gps: boolean;
   status: string | null;
   barangay: string | null;
+  node: string | null;
 };
 
 const STATUS_COLORS: Record<string, string> = {
-  active:      "#10b981",
   cleared:     "#10b981",
-  inactive:    "#6b7280",
+  completed:   "#10b981",
+  in_progress: "#10b981",
   pending:     "#f59e0b",
-  in_progress: "#3b82f6",
-  for_removal: "#ef4444",
 };
 
+// Normalize any backend status to just "completed" or "pending"
+function normalizeStatus(s: string | null): "completed" | "pending" {
+  if (!s) return "pending";
+  if (s === "cleared" || s === "completed" || s === "in_progress") return "completed";
+  return "pending";
+}
+
 const STATUS_FILTERS = [
-  { key: "all",        label: "All" },
-  { key: "pending",    label: "Pending" },
-  { key: "active",     label: "Active" },
-  { key: "inactive",   label: "Inactive" },
-  { key: "for_removal",label: "For Removal" },
+  { key: "all",       label: "All" },
+  { key: "pending",   label: "Pending" },
+  { key: "completed", label: "Completed" },
 ] as const;
 
 type StatusFilter = typeof STATUS_FILTERS[number]["key"];
 
 function buildMapHtml(pins: PolePin[], filter: StatusFilter): string {
-  const filtered = filter === "all" ? pins : pins.filter(p => p.status === filter);
+  // Only plot poles that have GPS coordinates
+  const withGps = pins.filter(p => p.has_gps);
+  const normalized = withGps.map(p => ({ ...p, status: normalizeStatus(p.status) }));
+  const filtered = filter === "all" ? normalized : normalized.filter(p => p.status === filter);
   const pinsJson = JSON.stringify(filtered);
-  const colorsJson = JSON.stringify(STATUS_COLORS);
+  const colorsJson = JSON.stringify({ completed: "#10b981", pending: "#f59e0b" });
 
   return `<!DOCTYPE html>
 <html>
@@ -72,8 +80,8 @@ var COLORS=${colorsJson};
 var map=L.map('map',{zoomControl:true,attributionControl:false});
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
 
-function color(s){return COLORS[s]||'#8b5cf6';}
-function label(s){return s?(s.replace(/_/g,' ').replace(/\\b\\w/g,function(c){return c.toUpperCase()})):'Unknown';}
+function color(s){return COLORS[s]||'#f59e0b';}
+function label(s){return s==='completed'?'Completed':'Pending';}
 
 var bounds=[];
 PINS.forEach(function(p){
@@ -81,10 +89,11 @@ PINS.forEach(function(p){
   var icon=L.divIcon({className:'',html:'<div class="pp" style="background:'+c+'"></div>',iconSize:[9,9],iconAnchor:[4.5,4.5]});
   var m=L.marker([p.lat,p.lng],{icon:icon}).addTo(map);
   m.bindPopup(
-    '<div style="min-width:140px">'+
+    '<div style="min-width:160px">'+
     '<div style="font-size:13px;font-weight:800;color:#e2e8f0;font-family:monospace">'+p.pole_code+'</div>'+
-    (p.barangay?'<div style="font-size:11px;color:#94a3b8;margin-top:3px">'+p.barangay+'</div>':'')+
-    '<div style="margin-top:6px;display:inline-block;padding:2px 8px;border-radius:99px;background:'+c+'22;color:'+c+';font-size:10px;font-weight:700">'+label(p.status)+'</div>'+
+    (p.node?'<div style="font-size:11px;color:#7dd3fc;margin-top:3px;font-weight:600">'+p.node+'</div>':'')+
+    (p.barangay?'<div style="font-size:11px;color:#94a3b8;margin-top:2px">'+p.barangay+'</div>':'')+
+    '<div style="margin-top:7px;display:inline-block;padding:2px 8px;border-radius:99px;background:'+c+'22;color:'+c+';font-size:10px;font-weight:700">'+label(p.status)+'</div>'+
     '</div>'
   );
   bounds.push([p.lat,p.lng]);
@@ -112,55 +121,50 @@ export default function PoleMapScreen() {
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [mapHtml, setMapHtml] = useState("");
 
-  // Load from cache then fetch fresh
-  useEffect(() => {
+  const fetchPins = useCallback(async (bustCache = false) => {
     if (!token) return;
+    if (bustCache) await cacheSet(CACHE_KEY, null);
 
-    (async () => {
-      // 1. Show cached data instantly
-      const cached = await cacheGet<PolePin[]>(CACHE_KEY);
-      if (cached && cached.length > 0) {
-        setPins(cached);
-        setLoading(false);
+    // Show cached data immediately
+    const cached = await cacheGet<PolePin[]>(CACHE_KEY);
+    if (cached && cached.length > 0) {
+      setPins(cached);
+      setLoading(false);
+    }
+
+    // Always fetch fresh — use allPoles so poles without GPS still count in totals
+    setFetching(true);
+    try {
+      const { data } = await api.get("/skycable/poles/all");
+      const rows: any[] = Array.isArray(data) ? data : (data?.data ?? []);
+      const all: PolePin[] = rows.map(p => ({
+        id:        p.id,
+        pole_code: p.pole_code,
+        lat:       p.lat ? Number(p.lat) : null,
+        lng:       p.lng ? Number(p.lng) : null,
+        has_gps:   !!(p.lat && p.lng),
+        status:    p.skycable_status ?? "pending",
+        barangay:  p.barangay ?? null,
+        node:      p.node ?? null,
+      }));
+      if (all.length > 0) {
+        setPins(all);
+        await cacheSet(CACHE_KEY, all);
       }
-
-      // 2. Fetch all pages in background
-      setFetching(true);
-      try {
-        const all: PolePin[] = [];
-        let page = 1;
-        let lastPage = 1;
-
-        do {
-          const res = await getPoles(token, { page, per_page: PER_PAGE });
-          const rows = res.data ?? [];
-          rows.forEach(p => {
-            if (p.lat && p.lng) {
-              all.push({
-                id:       p.id,
-                pole_code: p.pole_code,
-                lat:      parseFloat(p.lat),
-                lng:      parseFloat(p.lng),
-                status:   p.globe_status,
-                barangay: p.barangay?.name ?? null,
-              });
-            }
-          });
-          lastPage = res.meta?.last_page ?? res.last_page ?? 1;
-          page++;
-        } while (page <= lastPage);
-
-        if (all.length > 0) {
-          setPins(all);
-          await cacheSet(CACHE_KEY, all);
-        }
-      } catch {}
-      finally {
-        setFetching(false);
-        setLoading(false);
-      }
-    })();
+    } catch {}
+    finally {
+      setFetching(false);
+      setLoading(false);
+    }
   }, [token]);
+
+  // Initial load
+  useEffect(() => { fetchPins(); }, [fetchPins]);
+
+  // Bust cache and refresh every time the tab comes into focus
+  useFocusEffect(useCallback(() => {
+    fetchPins(true);
+  }, [fetchPins]));
 
   // Rebuild map HTML whenever pins or filter changes
   useEffect(() => {
@@ -169,9 +173,14 @@ export default function PoleMapScreen() {
     }
   }, [pins, filter]);
 
+  const gpspoles   = pins.filter(p => p.has_gps);
+  const noGpsPoles = pins.filter(p => !p.has_gps);
+  const completedNoGps = noGpsPoles.filter(p => normalizeStatus(p.status) === "completed").length;
+  const pendingNoGps   = noGpsPoles.filter(p => normalizeStatus(p.status) === "pending").length;
+
   const visibleCount = filter === "all"
-    ? pins.length
-    : pins.filter(p => p.status === filter).length;
+    ? gpspoles.length
+    : gpspoles.filter(p => normalizeStatus(p.status) === filter).length;
 
   return (
     <SafeAreaView style={s.safe}>
@@ -180,7 +189,9 @@ export default function PoleMapScreen() {
         <View>
           <Text style={s.title}>Pole Map</Text>
           <Text style={s.subtitle}>
-            {loading ? "Loading…" : `${visibleCount.toLocaleString()} poles with GPS`}
+            {loading
+              ? "Loading…"
+              : `${visibleCount} on map · ${pins.length} total`}
             {fetching && !loading ? "  ↻" : ""}
           </Text>
         </View>
@@ -215,9 +226,9 @@ export default function PoleMapScreen() {
             <ActivityIndicator size="large" color="#8b5cf6" />
             <Text style={s.loaderText}>Loading poles…</Text>
           </View>
-        ) : pins.length === 0 ? (
+        ) : gpspoles.length === 0 ? (
           <View style={s.loader}>
-            <Text style={s.loaderText}>No poles with GPS coordinates found.</Text>
+            <Text style={s.loaderText}>No poles with GPS yet. Capture GPS during teardown to pin them here.</Text>
           </View>
         ) : (
           <WebView
@@ -230,6 +241,32 @@ export default function PoleMapScreen() {
           />
         )}
       </View>
+
+      {/* No-GPS poles strip */}
+      {noGpsPoles.length > 0 && (
+        <View style={s.noGpsStrip}>
+          <View style={s.noGpsLeft}>
+            <Text style={s.noGpsIcon}>📍</Text>
+            <Text style={s.noGpsLabel}>
+              {noGpsPoles.length} pole{noGpsPoles.length !== 1 ? "s" : ""} without GPS
+            </Text>
+          </View>
+          <View style={s.noGpsRight}>
+            {completedNoGps > 0 && (
+              <View style={[s.noGpsBadge, { backgroundColor: "#10b98122" }]}>
+                <View style={[s.noGpsDot, { backgroundColor: "#10b981" }]} />
+                <Text style={[s.noGpsBadgeText, { color: "#10b981" }]}>{completedNoGps} done</Text>
+              </View>
+            )}
+            {pendingNoGps > 0 && (
+              <View style={[s.noGpsBadge, { backgroundColor: "#f59e0b22" }]}>
+                <View style={[s.noGpsDot, { backgroundColor: "#f59e0b" }]} />
+                <Text style={[s.noGpsBadgeText, { color: "#f59e0b" }]}>{pendingNoGps} pending</Text>
+              </View>
+            )}
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -309,5 +346,24 @@ const s = StyleSheet.create({
     fontSize: 13,
     fontWeight: "600",
     color: "#64748b",
+    textAlign: "center",
+    paddingHorizontal: 32,
   },
+  noGpsStrip: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#1e293b",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: "#334155",
+  },
+  noGpsLeft: { flexDirection: "row", alignItems: "center", gap: 6 },
+  noGpsIcon: { fontSize: 14 },
+  noGpsLabel: { fontSize: 12, fontWeight: "600", color: "#94a3b8" },
+  noGpsRight: { flexDirection: "row", gap: 8 },
+  noGpsBadge: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 99 },
+  noGpsDot: { width: 5, height: 5, borderRadius: 3 },
+  noGpsBadgeText: { fontSize: 11, fontWeight: "700" },
 });

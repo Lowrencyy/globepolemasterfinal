@@ -448,6 +448,8 @@ export default function DestinationPoleScreen() {
   const [elapsedSecs, setElapsedSecs] = useState(0);
 
   const timerStartRef = useRef(Date.now());
+  // Record ISO start time when lineman enters this screen — sent to backend as started_at
+  const startedAtRef  = useRef(new Date().toISOString());
   const toPoleGpsRef = useRef<GpsData | null>(null);
   const locationWatcher = useRef<Location.LocationSubscription | null>(null);
   const blurCheckRef = useRef<WebView>(null);
@@ -458,13 +460,9 @@ export default function DestinationPoleScreen() {
   const hasGps = !!capturedGps;
   const infoComplete = hasGps && !!slot && !!landmark.trim();
 
-  const canProceed =
-    hasGps &&
-    !!photoBefore &&
-    !!photoAfter &&
-    !!photoTag &&
-    !!slot &&
-    !!landmark.trim();
+  // Always allow starting — don't block the user with "complete required fields first"
+  // Missing fields will be indicated by the progress tracker but won't block navigation
+  const canProceed = true;
 
   const progress = useMemo(
     () =>
@@ -982,6 +980,11 @@ export default function DestinationPoleScreen() {
   function goToComponents() {
     const gps = capturedGps ?? toPoleGpsRef.current;
 
+    // Mark span as in_progress immediately — fire-and-forget, don't block navigation
+    if (params.span_id) {
+      api.put(`/skycable/spans/${params.span_id}`, { status: 'in_progress' }).catch(() => {});
+    }
+
     router.push({
       pathname: "/teardowns/components" as any,
       params: {
@@ -993,6 +996,7 @@ export default function DestinationPoleScreen() {
         to_pole_gps_accuracy: gps?.accuracy != null ? String(gps.accuracy) : "",
         destination_slot: slot,
         destination_landmark: landmark,
+        teardown_started_at: startedAtRef.current,
       },
     });
   }
@@ -1305,15 +1309,12 @@ export default function DestinationPoleScreen() {
           <Pressable
             style={({ pressed }) => [
               styles.submitBtn,
-              { backgroundColor: canProceed ? accentColor : "#C9CED6" },
-              pressed && canProceed && styles.pressedDown,
+              { backgroundColor: accentColor },
+              pressed && styles.pressedDown,
             ]}
-            onPress={canProceed ? goToComponents : undefined}
-            disabled={!canProceed}
+            onPress={goToComponents}
           >
-            <Text style={styles.submitText}>
-              {canProceed ? "Continue to Components  →" : "Complete required fields first"}
-            </Text>
+            <Text style={styles.submitText}>Start Teardown  →</Text>
           </Pressable>
         </View>
 

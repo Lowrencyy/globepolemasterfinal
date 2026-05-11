@@ -1,7 +1,7 @@
 import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
-import { queuePush } from "@/lib/sync-queue";
+import { queuePush, imageQueuePush, persistImage } from "@/lib/sync-queue";
 import { tokenStore } from "@/lib/token";
 import * as FileSystem from "expo-file-system/legacy";
 import { Image as ExpoImage } from "expo-image";
@@ -405,7 +405,9 @@ export default function TeardownComponentsScreen() {
   const declaredRuns = Number(params.declared_runs) || 0;
   const lengthMeters = Number(params.length_meters) || 0;
 
-  const startedAt = useRef(getPHTNow());
+  // Use the start time passed from destination-pole (when lineman entered that screen)
+  // Fall back to now only if not passed (shouldn't happen in normal flow)
+  const startedAt = useRef(params.teardown_started_at ?? new Date().toISOString());
   const gpsRef = useRef<{
     lat: number;
     lng: number;
@@ -755,7 +757,7 @@ export default function TeardownComponentsScreen() {
   }
 
   async function buildFields(): Promise<Record<string, string>> {
-    const finishedAt = await getDisplayTime();
+    const finishedAt = new Date().toISOString(); // ISO for accurate duration computation
     const user = await tokenStore.getUser();
 
     const didCollectComponents =
@@ -910,10 +912,8 @@ export default function TeardownComponentsScreen() {
       return;
     }
 
-    const form = new FormData();
-    for (const [key, value] of Object.entries(fields)) {
-      form.append(key, value);
-    }
+    // Generate a unique local_id for deduplication on the backend
+    const local_id = `td_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
     const fieldNameMap: Record<string, string> = {
       from_tag:    "from_pole_tag",
@@ -921,6 +921,11 @@ export default function TeardownComponentsScreen() {
       before_span: "bunching",
     };
 
+    const form = new FormData();
+    form.append("local_id", local_id);
+    for (const [key, value] of Object.entries(fields)) {
+      form.append(key, value);
+    }
     for (const [internalKey, uri] of Object.entries(photoPaths)) {
       const fieldName = fieldNameMap[internalKey] ?? internalKey;
       form.append(fieldName, {
@@ -932,6 +937,10 @@ export default function TeardownComponentsScreen() {
 
     if (params.from_pole_id) {
       cacheSet(`spans_pole_${params.from_pole_id}`, null).catch(() => {});
+    }
+    // Invalidate destination pole span cache — it may now have new pending spans
+    if (params.to_pole_id) {
+      cacheSet(`spans_pole_${params.to_pole_id}`, null).catch(() => {});
     }
     cacheSet("teardown_logs", null).catch(() => {});
     if (params.node_id) {
@@ -977,97 +986,110 @@ export default function TeardownComponentsScreen() {
     api
       .post("/teardown-logs", form)
       .then(async (res: any) => {
-        const reportId = res?.data?.id;
-        
-        // Sequential upload to the new unified endpoint
-        for (const [internalKey, uri] of Object.entries(photoPaths)) {
-          try {
+        const reportId = String(res?.data?.id ?? "");
+        console.log("[ONLINE_UPLOAD_SUCCESS] report_id=" + reportId);
+
+        // Upload images in parallel; queue any that fail
+        const imageResults = await Promise.allSettled(
+          Object.entries(photoPaths).map(async ([internalKey, uri]) => {
             const fieldName = fieldNameMap[internalKey] ?? internalKey;
-            
-            // Determine image_type and pole_id for this photo
             let imageType = "before";
             if (fieldName.includes("after")) imageType = "after";
             if (fieldName.includes("tag"))   imageType = "pole_tag";
             if (fieldName === "bunching")    imageType = "bunching";
-
             const isToPole = fieldName.startsWith("to_");
             const poleId   = isToPole ? params.to_pole_id : params.from_pole_id;
             const poleCode = isToPole ? params.to_pole_code : params.pole_code;
-
             const photoForm = new FormData();
-            photoForm.append("report_id",      String(reportId ?? ""));
+            photoForm.append("report_id",      reportId);
             photoForm.append("pole_id",        String(poleId ?? ""));
             photoForm.append("node_id",        String(params.node_id ?? ""));
             photoForm.append("pole_code",      String(poleCode ?? "pole"));
             photoForm.append("image_type",     imageType);
             photoForm.append("inventory_type", "skycable");
-            photoForm.append("image", {
-              uri,
-              name: `${fieldName}.jpg`,
-              type: "image/jpeg",
-            } as any);
+            photoForm.append("image", { uri, name: `${fieldName}.jpg`, type: "image/jpeg" } as any);
+            return { fieldName, uri, poleId, poleCode, imageType, result: await api.post("/teardown/upload-image", photoForm) };
+          })
+        );
 
-            await api.post("/teardown/upload-image", photoForm);
-          } catch (uploadErr) {
-            console.error("Single image upload failed:", uploadErr);
-          }
+        // Copy failed images to persistent storage BEFORE deleting draftDir.
+        // This prevents file loss when the draft directory is cleaned up below.
+        const failedImageEntries = await Promise.all(
+          Object.entries(photoPaths).map(async ([internalKey, uri], idx) => {
+            const r = imageResults[idx];
+            if (r.status === "fulfilled") return null;
+            const fieldName = fieldNameMap[internalKey] ?? internalKey;
+            let imageType = "before";
+            if (fieldName.includes("after")) imageType = "after";
+            if (fieldName.includes("tag"))   imageType = "pole_tag";
+            if (fieldName === "bunching")    imageType = "bunching";
+            const isToPole = fieldName.startsWith("to_");
+            // Persist to a safe directory that survives draft cleanup
+            const persistentUri = await persistImage(uri, `${local_id}_${fieldName}.jpg`).catch(() => uri);
+            return {
+              reportLocalId: local_id,
+              fieldName,
+              uri: persistentUri,
+              meta: {
+                report_id:  reportId,
+                pole_id:    String(isToPole ? params.to_pole_id : params.from_pole_id ?? ""),
+                node_id:    String(params.node_id ?? ""),
+                pole_code:  String(isToPole ? params.to_pole_code : params.pole_code ?? ""),
+                image_type: imageType,
+              },
+            };
+          }),
+        );
+
+        const failedImages = failedImageEntries.filter(Boolean) as any[];
+        if (failedImages.length > 0) {
+          await imageQueuePush(failedImages).catch(() => {});
+          console.log(`[NETWORK_ERROR_KEEP_PENDING] ${failedImages.length} image(s) persisted and queued`);
         }
 
+        // Safe to delete draft dir now — failed images were already copied above
         await FileSystem.deleteAsync(draftDir, { idempotent: true }).catch(() => {});
-        if (params.node_id) {
-          cacheSet(`node_logs_${params.node_id}`, null).catch(() => {});
-        }
+        if (params.node_id) cacheSet(`node_logs_${params.node_id}`, null).catch(() => {});
         if (params.from_pole_id) {
           cacheSet(`pole_submitted_${params.from_pole_id}`, true).catch(() => {});
+          FileSystem.deleteAsync(poleDraftDir + `pole_${params.from_pole_id}_after.jpg`, { idempotent: true }).catch(() => {});
         }
-        FileSystem.deleteAsync(
-          poleDraftDir + `pole_${params.from_pole_id}_after.jpg`,
-          { idempotent: true },
-        ).catch(() => {});
       })
       .catch(async (e: any) => {
         const status = e?.response?.status;
+
+        // Already on server — treat as success
         if (status === 409) {
-          if (params.from_pole_id) {
-            cacheSet(`pole_submitted_${params.from_pole_id}`, true).catch(
-              () => {},
-            );
-          }
-          return;
-        }
-        if (status === 422) {
-          const errors = e?.response?.data?.errors;
-          const msg = errors
-            ? Object.values(errors).flat().join("\n")
-            : JSON.stringify(e?.response?.data ?? "Validation error");
-          Alert.alert(
-            "Submission Rejected (422)",
-            `Server rejected the data:\n\n${msg}\n\nPlease screenshot this and report.`,
-          );
+          if (params.from_pole_id) cacheSet(`pole_submitted_${params.from_pole_id}`, true).catch(() => {});
           return;
         }
 
-        const isTimeout = !e?.response?.status && e?.name === 'AbortError';
-        const isUnauth  = e?.response?.status === 401;
-        const isServer  = e?.response?.status >= 500;
-        const reason    = isTimeout  ? 'Connection timed out (large photo upload).'
-                        : isUnauth   ? 'Session expired — please log out and back in.'
-                        : isServer   ? `Server error ${e?.response?.status}.`
-                        : e?.message ?? 'Network error.';
+        const isBadRequest = status === 400 || status === 404 || status === 422;
+        const isServer     = status >= 500;
+        const isTimeout    = !status && e?.name === "AbortError";
+        const isUnauth     = status === 401;
 
-        console.log("Submission failed, adding to queue:", reason, e);
+        const reason = isUnauth   ? "Session expired — please log out and back in."
+                     : isBadRequest ? `Server rejected data (${status}) — saved for review.`
+                     : isServer   ? `Server error ${status} — will retry automatically.`
+                     : isTimeout  ? "Connection timed out — saved offline."
+                     : e?.message ?? "Network error — saved offline.";
+
+        console.log("[OFFLINE_CACHE_SAVED] reason=" + reason);
         await queuePush({
-          fields,
+          fields: { ...fields, local_id },
           photoPaths,
           draftDir,
           poleDraftDir,
           fromPoleId: params.from_pole_id || undefined,
-          nodeId: params.node_id || undefined,
+          toPoleId:   params.to_pole_id   || undefined,
+          nodeId:     params.node_id || undefined,
           poleAfterPath: poleDraftDir + `pole_${params.from_pole_id}_after.jpg`,
         }).catch(() => {});
+
         Alert.alert(
-          "Saved to Queue",
-          `${reason}\n\nYour report has been saved locally and will upload automatically when connection improves.`
+          "Saved Offline",
+          `${reason}\n\nYour report is saved locally and will upload automatically when connection improves.`,
         );
       });
   }

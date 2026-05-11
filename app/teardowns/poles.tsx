@@ -1,14 +1,15 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, ActivityIndicator, SafeAreaView, StatusBar } from "react-native";
-import { Stack, useRouter, useLocalSearchParams } from "expo-router";
+import { Stack, useRouter, useLocalSearchParams, useFocusEffect } from "expo-router";
 import { CircleDot, Search, X, ChevronLeft } from "lucide-react-native";
 import { getNodePoles, SkycablePole } from "@/services/skycable";
 import { useAuth } from "@/context/auth-context";
+import { cacheGet, cacheSet } from "@/lib/cache";
 
 const SC: Record<string, { label: string; color: string; bg: string }> = {
-  pending: { label: "Pending", color: "#B54708", bg: "#FFF7E8" },
-  in_progress: { label: "In Progress", color: "#1D4ED8", bg: "#EEF4FF" },
-  cleared: { label: "Completed", color: "#067647", bg: "#ECFDF3" },
+  pending:     { label: "Pending",     color: "#B54708", bg: "#FFF7E8" },
+  in_progress: { label: "In Progress", color: "#1D4ED8", bg: "#EFF6FF" }, // some spans done, more remain
+  cleared:     { label: "Completed",   color: "#067647", bg: "#ECFDF3" }, // all spans done
 };
 
 const SLOT_COLORS: Record<string, string> = { skycable: "#DC2626", globe: "#1D4ED8", meralco: "#F59E0B", free: "#E2E8F0" };
@@ -20,26 +21,47 @@ export default function PolesScreen() {
   const [search, setSearch] = useState("");
   const [poles, setPoles] = useState<SkycablePole[]>([]);
   const [loading, setLoading] = useState(true);
+  const [offline, setOffline] = useState(false);
+  const [showCompleted, setShowCompleted] = useState(false);
 
-  useEffect(() => {
-    async function loadPoles() {
-      if (!token || !nodeId) return;
-      try {
-        const data = await getNodePoles(Number(nodeId), token);
-        setPoles(data);
-      } catch (err) {
-        console.error("Failed to load poles:", err);
-      } finally {
+  useFocusEffect(useCallback(() => {
+    if (!token || !nodeId) return;
+    const CACHE_KEY = `sitemap_poles_${nodeId}`;
+    let hasCached = false;
+
+    cacheGet<SkycablePole[]>(CACHE_KEY).then(cached => {
+      if (cached?.length) {
+        hasCached = true;
+        setPoles(cached);
         setLoading(false);
+        setOffline(false);
       }
-    }
-    loadPoles();
-  }, [token, nodeId]);
+    });
+
+    getNodePoles(Number(nodeId), token)
+      .then(data => {
+        cacheSet(CACHE_KEY, data).catch(() => {});
+        setPoles(data);
+        setOffline(false);
+      })
+      .catch(() => {
+        if (!hasCached) setOffline(true);
+      })
+      .finally(() => setLoading(false));
+  }, [token, nodeId]));
+
+  // Only truly cleared (ALL spans done) goes to Completed tab.
+  // in_progress stays in Active — it still has remaining spans.
+  const isCompleted = (p: SkycablePole) => p.pole?.skycable_status === "cleared";
+
+  const activePoles = useMemo(() => poles.filter(p => !isCompleted(p)), [poles]);
+  const completedPoles = useMemo(() => poles.filter(p => isCompleted(p)), [poles]);
 
   const filtered = useMemo(() => {
+    const base = showCompleted ? completedPoles : activePoles;
     const q = search.toLowerCase();
-    return q ? poles.filter(p => p.pole?.pole_code?.toLowerCase().includes(q)) : poles;
-  }, [search, poles]);
+    return q ? base.filter(p => p.pole?.pole_code?.toLowerCase().includes(q)) : base;
+  }, [search, showCompleted, activePoles, completedPoles]);
 
   return (
     <>
@@ -62,13 +84,38 @@ export default function PolesScreen() {
             <TextInput style={s.searchInput} placeholder="Search poles…" placeholderTextColor="#98A2B3" value={search} onChangeText={setSearch} autoCapitalize="none" />
             {!!search && <TouchableOpacity onPress={() => setSearch("")}><X size={16} color="#98A2B3" /></TouchableOpacity>}
           </View>
-          <Text style={s.count}>{filtered.length} pole{filtered.length !== 1 ? "s" : ""}</Text>
+          <View style={s.filterRow}>
+            <TouchableOpacity
+              activeOpacity={0.8}
+              onPress={() => { setShowCompleted(false); setSearch(""); }}
+              style={[s.filterChip, !showCompleted && s.filterChipActive]}
+            >
+              <Text style={[s.filterChipText, !showCompleted && s.filterChipTextActive]}>
+                Pending ({activePoles.length})
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              activeOpacity={0.8}
+              onPress={() => { setShowCompleted(true); setSearch(""); }}
+              style={[s.filterChip, showCompleted && s.filterChipDone]}
+            >
+              <Text style={[s.filterChipText, showCompleted && s.filterChipTextActive]}>
+                Completed ({completedPoles.length})
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         {loading ? (
           <View style={s.empty}>
             <ActivityIndicator size="large" color="#0B7A5A" />
             <Text style={s.emptyTitle}>Loading Poles...</Text>
+          </View>
+        ) : offline ? (
+          <View style={s.empty}>
+            <CircleDot size={40} color="#F59E0B" />
+            <Text style={s.emptyTitle}>No offline data</Text>
+            <Text style={s.emptySub}>Connect to the internet once to cache poles for offline use.</Text>
           </View>
         ) : (
           <FlatList data={filtered} keyExtractor={i => String(i.id)} contentContainerStyle={s.list} showsVerticalScrollIndicator={false}
@@ -144,6 +191,7 @@ const s = StyleSheet.create({
   list: { padding: 16, paddingTop: 4, gap: 16, paddingBottom: 40 },
   empty: { alignItems: "center", paddingTop: 80 },
   emptyTitle: { fontSize: 18, fontWeight: "900", color: "#111827", marginTop: 16 },
+  emptySub: { fontSize: 13, color: "#98A2B3", fontWeight: "500", marginTop: 8, textAlign: "center", paddingHorizontal: 32 },
   card: { backgroundColor: "#FFFFFF", borderRadius: 28, padding: 20, borderWidth: 1.5, borderColor: "#E7ECF2", shadowColor: "#101828", shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.06, shadowRadius: 18, elevation: 4 },
   cardTop: { flexDirection: "row", alignItems: "center", gap: 14, marginBottom: 18 },
   seqBox: { width: 42, height: 42, borderRadius: 21, backgroundColor: "#EEF2F6", alignItems: "center", justifyContent: "center" },
@@ -159,4 +207,10 @@ const s = StyleSheet.create({
   slotDot: { width: 8, height: 8, borderRadius: 4 },
   slotLabel: { fontSize: 11, fontWeight: "800" },
   slotInfo: { fontSize: 11, fontWeight: "700", color: "#98A2B3", textAlign: "center" },
+  filterRow: { flexDirection: "row", gap: 8, marginTop: 12 },
+  filterChip: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 999, borderWidth: 1.5, borderColor: "#E7ECF2", backgroundColor: "#FFFFFF" },
+  filterChipActive: { backgroundColor: "#0B7A5A", borderColor: "#0B7A5A" },
+  filterChipDone: { backgroundColor: "#059669", borderColor: "#059669" },
+  filterChipText: { fontSize: 12, fontWeight: "700", color: "#667085" },
+  filterChipTextActive: { color: "#FFFFFF" },
 });

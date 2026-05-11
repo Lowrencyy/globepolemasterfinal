@@ -451,9 +451,20 @@ export default function SelectPairScreen() {
   const accentColor = accent || "#0B7A5A";
 
   const [spans, setSpans] = useState<Span[]>([]);
-  const [status, setStatus] = useState<"loading" | "ok" | "error" | "empty">(
-    "loading",
-  );
+  const [status, setStatus] = useState<"loading" | "ok" | "error" | "empty">("loading");
+  const [allDone, setAllDone] = useState(false); // true = had spans but all completed
+
+  // Auto-navigate back to poles after 2 s when all spans are done
+  useEffect(() => {
+    if (!allDone) return;
+    const timer = setTimeout(() => {
+      router.replace({
+        pathname: "/teardowns/poles",
+        params: { nodeId: node_id, nodeName: pole_name, accent },
+      } as any);
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [allDone]);
   const [selectedSpan, setSelectedSpan] = useState<Span | null>(null);
   const [showVicinityModal, setShowVicinityModal] = useState(false);
 
@@ -558,6 +569,7 @@ export default function SelectPairScreen() {
         const active = list.filter((s) => s.status !== "completed" && s.status !== "superseded");
 
         if (active.length === 0) {
+          if (list.length > 0) setAllDone(true); // had spans but all completed
           setStatus("empty");
           return;
         }
@@ -576,7 +588,10 @@ export default function SelectPairScreen() {
             setStatus("error");
           } else {
             const active = cached.filter((s) => s.status !== "completed" && s.status !== "superseded");
-            if (active.length === 0) setStatus("empty");
+            if (active.length === 0) {
+              if (cached.length > 0) setAllDone(true);
+              setStatus("empty");
+            }
           }
         });
       });
@@ -693,9 +708,14 @@ export default function SelectPairScreen() {
     const name = newPoleName.trim();
     if (!name || !newPoleSpanId) return;
     setSubmittingNewPole(true);
+
+    // Generate idempotency key so duplicate taps / retries don't create duplicate poles
+    const idemKey = `split_${newPoleSpanId}_${Date.now()}`;
+
     try {
-      const res = await api.post(`/pole-spans/${newPoleSpanId}/split`, {
+      const res = await api.post(`/skycable/spans/${newPoleSpanId}/split`, {
         pole_name: name,
+        idempotency_key: idemKey,
       });
       const { span_a, span_b, new_pole } = (res as any).data ?? res;
 
@@ -705,8 +725,7 @@ export default function SelectPairScreen() {
       setNewPoleSpanId(null);
       setNewPoleTargetSpan(null);
 
-      // Only keep the span that still involves the current pole (span_a: currentPole → newPole).
-      // span_b (newPole → pole2) belongs to a different pole's view.
+      // Instantly update the spans list — no alert, list refreshes immediately
       setSpans((prev) => {
         const without = prev.filter((s) => s.id !== splitId);
         const built: Span[] = [];
@@ -719,16 +738,24 @@ export default function SelectPairScreen() {
         }
         const next = [...without, ...built];
         cacheSet(`spans_pole_${pole_id}`, next).catch(() => {});
+        if (new_pole?.id) cacheSet(`spans_pole_${new_pole.id}`, null).catch(() => {});
         return next;
       });
-
-      Alert.alert(
-        "Pole Added Successfully",
-        `"${new_pole?.pole_code ?? name}" has been inserted.\n\nNew spans:\n• ${span_a?.from_pole?.pole?.pole_code ?? "?"} → ${span_a?.to_pole?.pole?.pole_code ?? "?"}\n• ${span_b?.from_pole?.pole?.pole_code ?? "?"} → ${span_b?.to_pole?.pole?.pole_code ?? "?"}`,
-      );
     } catch (e: any) {
-      const msg = e?.response?.data?.message ?? e?.message ?? "Unknown error";
-      Alert.alert("Failed to Add Pole", msg);
+      const status = (e as any)?.response?.status;
+      const msg    = (e as any)?.response?.data?.message ?? (e as any)?.message ?? "Unknown error";
+
+      if (status === 409) {
+        Alert.alert("Already Split", "This span was already split. Pull to refresh your span list.");
+      } else if (!status) {
+        // Network error — inform user they need internet for this operation
+        Alert.alert(
+          "Internet Required",
+          "Adding a new pole creates server records that other operations depend on.\n\nPlease connect to the internet and try again.",
+        );
+      } else {
+        Alert.alert("Failed to Add Pole", `${msg}`);
+      }
     } finally {
       setSubmittingNewPole(false);
     }
@@ -854,20 +881,24 @@ export default function SelectPairScreen() {
 
         {status === "empty" && (
           <View style={styles.center}>
-            <View style={styles.stateIconWrap}>
+            <View style={[styles.stateIconWrap, allDone && { backgroundColor: "#ECFDF3" }]}>
               <MaterialCommunityIcons
-                name="transmission-tower-off"
+                name={allDone ? "check-decagram" : "transmission-tower-off"}
                 size={30}
-                color="#667085"
+                color={allDone ? "#067647" : "#667085"}
               />
             </View>
-            <Text style={styles.centerTitle}>No Span Available</Text>
+            <Text style={styles.centerTitle}>
+              {allDone ? "All Spans Done!" : "No Span Available"}
+            </Text>
             <Text style={styles.centerSub}>
-              This pole does not have any available span connections.
+              {allDone
+                ? "All spans for this pole are completed. Returning to poles list…"
+                : "This pole does not have any available span connections."}
             </Text>
 
             <Pressable
-              style={[styles.primaryButton, { backgroundColor: "#111827" }]}
+              style={[styles.primaryButton, { backgroundColor: allDone ? "#067647" : "#111827" }]}
               onPress={() =>
                 router.replace({
                   pathname: "/teardowns/poles",
@@ -875,7 +906,9 @@ export default function SelectPairScreen() {
                 } as any)
               }
             >
-              <Text style={styles.primaryButtonText}>Back to Pole List</Text>
+              <Text style={styles.primaryButtonText}>
+                {allDone ? "Back to Poles" : "Back to Pole List"}
+              </Text>
             </Pressable>
           </View>
         )}

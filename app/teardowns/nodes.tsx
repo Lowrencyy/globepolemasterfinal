@@ -4,6 +4,7 @@ import { Stack, useRouter, useLocalSearchParams } from "expo-router";
 import { Layers, Search, X, ChevronLeft } from "lucide-react-native";
 import { getNodes, SkycableNode } from "@/services/skycable";
 import { useAuth } from "@/context/auth-context";
+import { cacheGet, cacheSet } from "@/lib/cache";
 
 const SC: Record<string, { label: string; color: string; bg: string }> = {
   pending: { label: "Pending", color: "#F59E0B", bg: "#FEF3C7" },
@@ -18,15 +19,29 @@ export default function NodesScreen() {
   const [search, setSearch] = useState("");
   const [nodes, setNodes] = useState<SkycableNode[]>([]);
   const [loading, setLoading] = useState(true);
+  const [offline, setOffline] = useState(false);
 
   useEffect(() => {
     async function loadNodes() {
       if (!token || !areaId) return;
+      const CACHE_KEY = `sitemap_nodes_${areaId}`;
+      let hasCached = false;
+
+      const cached = await cacheGet<SkycableNode[]>(CACHE_KEY);
+      if (cached?.length) {
+        hasCached = true;
+        setNodes(cached);
+        setLoading(false);
+        setOffline(false);
+      }
+
       try {
         const response = await getNodes(Number(areaId), token);
+        cacheSet(CACHE_KEY, response.data).catch(() => {});
         setNodes(response.data);
-      } catch (err) {
-        console.error("Failed to load nodes:", err);
+        setOffline(false);
+      } catch {
+        if (!hasCached) setOffline(true);
       } finally {
         setLoading(false);
       }
@@ -67,6 +82,12 @@ export default function NodesScreen() {
           <View style={s.empty}>
             <ActivityIndicator size="large" color="#0B7A5A" />
             <Text style={s.emptyTitle}>Loading Nodes...</Text>
+          </View>
+        ) : offline ? (
+          <View style={s.empty}>
+            <Layers size={40} color="#F59E0B" />
+            <Text style={s.emptyTitle}>No offline data</Text>
+            <Text style={s.emptySub}>Connect once to cache nodes for offline use.</Text>
           </View>
         ) : (
           <FlatList data={filtered} keyExtractor={i => String(i.id)} contentContainerStyle={s.list} showsVerticalScrollIndicator={false}
@@ -116,6 +137,7 @@ const s = StyleSheet.create({
   list: { padding: 16, paddingTop: 4, gap: 16, paddingBottom: 40 },
   empty: { alignItems: "center", paddingTop: 80 },
   emptyTitle: { fontSize: 18, fontWeight: "900", color: "#111827", marginTop: 16 },
+  emptySub: { fontSize: 13, color: "#98A2B3", fontWeight: "500", marginTop: 8, textAlign: "center", paddingHorizontal: 32 },
   card: { backgroundColor: "#FFFFFF", borderRadius: 28, padding: 20, borderWidth: 1.5, borderColor: "#E7ECF2", shadowColor: "#101828", shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.06, shadowRadius: 18, elevation: 4 },
   cardTop: { flexDirection: "row", alignItems: "center", gap: 14 },
   cardIconBox: { width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center" },

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   View,
   Text,
@@ -11,6 +11,7 @@ import {
   Easing,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useFocusEffect } from "expo-router";
 import { useAuth } from "@/context/auth-context";
 import {
   User,
@@ -25,8 +26,14 @@ import {
   Activity,
   Download,
   Radio,
+  RefreshCw,
+  CheckCircle,
 } from "lucide-react-native";
 import { BASE_URL } from "@/lib/api";
+import { queueReadAll, imageQueueReadAll, processSyncQueue, processImageQueue } from "@/lib/sync-queue";
+import { gpsQueueReadAll, gpsQueueFlush } from "@/lib/gps-queue";
+import { simpleQueueReadAll, processSimpleQueue } from "@/lib/simple-queue";
+import { isOnline } from "@/lib/net-sync";
 
 // ── Network test helpers ───────────────────────────────────────────────────
 
@@ -133,7 +140,7 @@ function PulseRing({ color, running }: { color: string; running: boolean }) {
   return (
     <Animated.View
       style={[
-        styles.pulseRing,
+        nd.pulseRing,
         { borderColor: color, transform: [{ scale }], opacity },
       ]}
     />
@@ -367,13 +374,58 @@ function NetworkTestModal({ visible, onClose }: { visible: boolean; onClose: () 
 // ── Profile Screen ─────────────────────────────────────────────────────────
 
 export default function ProfileScreen() {
-  const { logout, user } = useAuth();
+  const { logout, user, token } = useAuth();
   const [netModalOpen, setNetModalOpen] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+  const [lastSynced, setLastSynced] = useState<"ok" | "error" | null>(null);
 
   const firstName = user?.first_name ?? "—";
   const lastName  = user?.last_name  ?? "";
   const role      = user?.role       ?? "Field Staff";
   const initials  = firstName.charAt(0).toUpperCase();
+
+  const loadPendingCount = useCallback(async () => {
+    const [td, imgs, gps, simple] = await Promise.all([
+      queueReadAll().catch(() => []),
+      imageQueueReadAll().catch(() => []),
+      gpsQueueReadAll().catch(() => []),
+      simpleQueueReadAll().catch(() => []),
+    ]);
+    const count =
+      td.filter((i: any) => i.status !== "synced").length +
+      imgs.filter((i: any) => i.status !== "synced").length +
+      gps.length +
+      simple.length;
+    setPendingCount(count);
+  }, []);
+
+  useFocusEffect(useCallback(() => { loadPendingCount(); }, [loadPendingCount]));
+
+  async function handleSyncAll() {
+    const online = await isOnline();
+    if (!online) {
+      setLastSynced("error");
+      return;
+    }
+    setSyncing(true);
+    setLastSynced(null);
+    try {
+      await Promise.allSettled([
+        processSyncQueue(),
+        processSimpleQueue(),
+        gpsQueueFlush(),
+        processImageQueue(),
+        token ? import("@/services/offline").then(m => m.syncQueue(token)) : Promise.resolve(),
+      ]);
+      setLastSynced("ok");
+    } catch {
+      setLastSynced("error");
+    } finally {
+      setSyncing(false);
+      await loadPendingCount();
+    }
+  }
 
   return (
     <SafeAreaView style={styles.safeArea} edges={["top", "left", "right"]}>
@@ -427,6 +479,43 @@ export default function ProfileScreen() {
             </View>
             <Text style={styles.menuText}>Notifications</Text>
             <ChevronRight size={20} color="#CBD5E1" />
+          </Pressable>
+        </View>
+
+        {/* Sync Bar */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Offline Sync</Text>
+          <Pressable
+            style={[styles.syncBar, syncing && { opacity: 0.7 }]}
+            onPress={handleSyncAll}
+            disabled={syncing}
+          >
+            <View style={styles.syncBarLeft}>
+              <View style={[styles.syncBarIcon, {
+                backgroundColor: lastSynced === "ok" ? "#F0FDF4" : lastSynced === "error" ? "#FEF2F2" : "#EFF6FF",
+              }]}>
+                {syncing
+                  ? <ActivityIndicator size="small" color="#3B82F6" />
+                  : lastSynced === "ok"
+                  ? <CheckCircle size={20} color="#16A34A" />
+                  : lastSynced === "error"
+                  ? <WifiOff size={20} color="#EF4444" />
+                  : <RefreshCw size={20} color="#3B82F6" />}
+              </View>
+              <View>
+                <Text style={styles.menuText}>
+                  {syncing ? "Syncing…" : lastSynced === "ok" ? "All Synced" : lastSynced === "error" ? "Offline — Retry Later" : "Sync Pending Data"}
+                </Text>
+                <Text style={styles.menuSub}>
+                  {pendingCount === 0 ? "No offline data to sync" : `${pendingCount} item${pendingCount !== 1 ? "s" : ""} pending upload`}
+                </Text>
+              </View>
+            </View>
+            {pendingCount > 0 && !syncing && (
+              <View style={styles.syncBadge}>
+                <Text style={styles.syncBadgeText}>{pendingCount}</Text>
+              </View>
+            )}
           </Pressable>
         </View>
 
@@ -495,6 +584,18 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: "#FEE2E2",
   },
   logoutText: { fontSize: 16, fontWeight: "700", color: "#EF4444" },
+
+  syncBar: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    backgroundColor: "#FFFFFF", padding: 16, borderRadius: 20,
+    shadowColor: "#0F172A", shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.03, shadowRadius: 12, elevation: 2,
+    borderWidth: 1, borderColor: "#F1F5F9",
+  },
+  syncBarLeft:  { flexDirection: "row", alignItems: "center", gap: 16, flex: 1 },
+  syncBarIcon:  { width: 44, height: 44, borderRadius: 14, alignItems: "center", justifyContent: "center" },
+  syncBadge:    { minWidth: 24, height: 24, borderRadius: 12, backgroundColor: "#EF4444", alignItems: "center", justifyContent: "center", paddingHorizontal: 6 },
+  syncBadgeText:{ fontSize: 11, fontWeight: "800", color: "#fff" },
 });
 
 const nd = StyleSheet.create({

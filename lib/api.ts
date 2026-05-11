@@ -51,19 +51,21 @@ async function handleResponse(response: Response) {
   return { data };
 }
 
-const TIMEOUT_MS = 30_000;          // 30 s for normal requests
+const TIMEOUT_MS = 10_000;          // 10 s — fast fail so cache kicks in sooner
 const UPLOAD_TIMEOUT_MS = 120_000;  // 120 s for photo/file uploads
 
-function fetchWithTimeout(
+async function fetchWithTimeout(
   url: string,
   options: RequestInit,
   timeoutMs: number = TIMEOUT_MS,
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() =>
-    clearTimeout(timer),
-  );
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const api = {

@@ -14,7 +14,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { gpsQueueReadAll, gpsQueueFlush, gpsQueueRemove } from "@/lib/gps-queue";
 import { simpleQueueReadAll, simpleQueueRemove, processSimpleQueue } from "@/lib/simple-queue";
-import { queueReadAll, queueRemove, processSyncQueue } from "@/lib/sync-queue";
+import { queueReadAll, queueRemove, processSyncQueue, imageQueueReadAll, imageQueueRemove, processImageQueue } from "@/lib/sync-queue";
 import { getQueue } from "@/services/offline";
 import { isOnline } from "@/lib/net-sync";
 import { useAuth } from "@/context/auth-context";
@@ -24,7 +24,7 @@ const OFFLINE_BG = "#FFF7ED";
 const OFFLINE_DOT = "#F97316";
 const PENDING_BG = "#EFF6FF";
 
-type SectionKey = "gps" | "teardown" | "simple" | "nap";
+type SectionKey = "gps" | "teardown" | "simple" | "nap" | "images" | "all";
 
 function fmtDate(iso: string | number) {
   const d = typeof iso === "number" ? new Date(iso) : new Date(iso);
@@ -80,23 +80,26 @@ export default function QueueScreen() {
   const [teardownItems, setTeardownItems] = useState<any[]>([]);
   const [simpleItems,   setSimpleItems]   = useState<any[]>([]);
   const [napItems,      setNapItems]      = useState<any[]>([]);
+  const [imageItems,    setImageItems]    = useState<any[]>([]);
   const [online,        setOnline]        = useState(true);
   const [refreshing,    setRefreshing]    = useState(false);
   const [retrying,      setRetrying]      = useState<SectionKey | null>(null);
   const [previewItem,   setPreviewItem]   = useState<any | null>(null);
 
   const load = useCallback(async () => {
-    const [gps, td, simple, nap, net] = await Promise.all([
+    const [gps, td, simple, nap, imgs, net] = await Promise.all([
       gpsQueueReadAll().catch(() => []),
       queueReadAll().catch(() => []),
       simpleQueueReadAll().catch(() => []),
       getQueue().catch(() => []),
+      imageQueueReadAll().catch(() => []),
       isOnline().catch(() => false),
     ]);
     setGpsItems(gps);
     setTeardownItems(td);
     setSimpleItems(simple);
     setNapItems(nap);
+    setImageItems(imgs);
     setOnline(net);
   }, []);
 
@@ -108,7 +111,12 @@ export default function QueueScreen() {
     setRefreshing(false);
   };
 
-  const totalPending = gpsItems.length + teardownItems.length + simpleItems.length + napItems.length;
+  const pendingTeardowns = teardownItems.filter(i => i.status !== "synced");
+  const pendingImages    = imageItems.filter(i => i.status !== "synced");
+  // Count only truly retryable items (not permanently failed) for the sync badge
+  const syncableTeardowns = pendingTeardowns.filter(i => i.status !== "permanently_failed");
+  const syncableImages    = pendingImages.filter(i => i.status !== "permanently_failed");
+  const totalPending      = gpsItems.length + syncableTeardowns.length + simpleItems.length + napItems.length + syncableImages.length;
 
   // ── Retry handlers ────────────────────────────────────────────────────────
 
@@ -126,17 +134,19 @@ export default function QueueScreen() {
   const retryTeardown = async () => {
     setRetrying("teardown");
     const result = await processSyncQueue().catch((e: any) => ({
-      submitted: 0, failed: teardownItems.length,
+      submitted: 0, failed: pendingTeardowns.length, permanentlyFailed: 0,
       firstError: e?.message ?? "Unknown error",
     }));
     await load();
     setRetrying(null);
-    if (result.failed > 0) {
+    if (result.permanentlyFailed > 0) {
+      Alert.alert("Upload Error", `${result.permanentlyFailed} item(s) permanently failed (bad data). Please remove them manually.`);
+    } else if (result.failed > 0) {
       Alert.alert(
         "Upload Failed",
         result.firstError
           ? `${result.failed} item(s) still pending.\n\nReason: ${result.firstError}`
-          : `${result.failed} item(s) could not be uploaded. Check your connection and try again.`,
+          : `${result.failed} item(s) could not upload. Check your connection and try again.`,
       );
     } else if (result.submitted > 0) {
       Alert.alert("Uploaded", `${result.submitted} teardown report(s) submitted successfully.`);
@@ -164,6 +174,44 @@ export default function QueueScreen() {
       Alert.alert("Retry Failed", e?.message ?? "Could not reach backend.");
     }
     await load();
+    setRetrying(null);
+  };
+
+  const retryImages = async () => {
+    setRetrying("images");
+    try {
+      await processImageQueue();
+    } catch (e: any) {
+      Alert.alert("Retry Failed", e?.message ?? "Could not reach backend.");
+    }
+    await load();
+    setRetrying(null);
+  };
+
+  const syncAll = async () => {
+    if (totalPending === 0) {
+      Alert.alert("No offline data to sync", "All items are already synced.");
+      return;
+    }
+    setRetrying("all");
+    try {
+      const [tdResult] = await Promise.allSettled([
+        processSyncQueue(),
+        processSimpleQueue(),
+        gpsQueueFlush(),
+        processImageQueue(),
+        token ? import("@/services/offline").then(m => m.syncQueue(token)) : Promise.resolve(),
+      ]);
+      await load();
+      const td = tdResult.status === "fulfilled" ? tdResult.value : null;
+      if (td && td.failed > 0) {
+        Alert.alert("Sync Partial", `${td.failed} item(s) could not upload.\n${td.firstError ?? ""}`);
+      } else {
+        Alert.alert("Sync Complete", "All pending data has been uploaded.");
+      }
+    } catch (e: any) {
+      Alert.alert("Sync Failed", e?.message ?? "Unknown error.");
+    }
     setRetrying(null);
   };
 
@@ -197,11 +245,16 @@ export default function QueueScreen() {
     await load();
   });
 
+  const clearImages = () => confirmClear("image queue", async () => {
+    for (const item of pendingImages) await imageQueueRemove(item.id).catch(() => {});
+    await load();
+  });
+
   return (
     <SafeAreaView style={styles.root} edges={["top"]}>
       {/* Header */}
       <View style={styles.header}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={styles.headerTitle}>Pending Queue</Text>
           <Text style={styles.headerSub}>
             {totalPending === 0 ? "All synced" : `${totalPending} item${totalPending !== 1 ? "s" : ""} waiting`}
@@ -213,6 +266,15 @@ export default function QueueScreen() {
             {online ? "Online" : "Offline"}
           </Text>
         </View>
+        <TouchableOpacity
+          style={[styles.syncAllBtn, (retrying === "all" || totalPending === 0) && { opacity: 0.5 }]}
+          onPress={syncAll}
+          disabled={retrying === "all"}
+        >
+          {retrying === "all"
+            ? <ActivityIndicator size="small" color="#fff" />
+            : <Text style={styles.syncAllText}>↑ Sync All</Text>}
+        </TouchableOpacity>
       </View>
 
       <ScrollView
@@ -256,20 +318,24 @@ export default function QueueScreen() {
         <View style={styles.section}>
           <SectionHeader
             label="Teardown Submissions"
-            count={teardownItems.length}
+            count={pendingTeardowns.length}
             color={PRIMARY}
             onRetry={retryTeardown}
             onClear={clearTeardown}
             retrying={retrying === "teardown"}
           />
-          {teardownItems.length === 0 ? <EmptySection /> : teardownItems.map((item, i) => {
+          {pendingTeardowns.length === 0 ? <EmptySection /> : pendingTeardowns.map((item, i) => {
             const f = item.fields ?? {};
             const fromCode = f.from_pole_code ?? f.pole_code ?? "—";
             const toCode   = f.to_pole_code ?? "—";
+            const isPermanent = item.status === "permanently_failed";
+            const isFailed = item.status === "failed" || isPermanent;
+            const statusColor = isPermanent ? "#7C3AED" : isFailed ? "#DC2626" : "#3B82F6";
+            const statusBg    = isPermanent ? "#F5F3FF" : isFailed ? "#FEF2F2" : PENDING_BG;
             return (
               <TouchableOpacity
                 key={item.id}
-                style={[styles.row, i < teardownItems.length - 1 && styles.rowBorder]}
+                style={[styles.row, i < pendingTeardowns.length - 1 && styles.rowBorder]}
                 activeOpacity={0.7}
                 onPress={() => setPreviewItem(item)}
               >
@@ -283,6 +349,17 @@ export default function QueueScreen() {
                     <Text style={{ color: "#6366F1" }}>{toCode}</Text>
                   </Text>
                   <Text style={styles.rowSub}>{fmtDate(item.queuedAt)}</Text>
+                  {isFailed && item.lastError ? <Text style={[styles.rowSub, { color: isPermanent ? "#7C3AED" : "#DC2626" }]} numberOfLines={1}>{item.lastError}</Text> : null}
+                </View>
+                <View style={styles.rowRight}>
+                  <View style={[styles.statusPill, { backgroundColor: statusBg }]}>
+                    <Text style={[styles.statusText, { color: statusColor }]}>
+                      {isPermanent ? "perm. failed" : item.status}
+                    </Text>
+                  </View>
+                  {(item.retryCount ?? 0) > 0 && (
+                    <Text style={styles.rowTime}>attempt {item.retryCount}/5</Text>
+                  )}
                 </View>
               </TouchableOpacity>
             );
@@ -313,6 +390,39 @@ export default function QueueScreen() {
               <Text style={styles.rowTime}>{fmtDate(item.queuedAt)}</Text>
             </View>
           ))}
+        </View>
+
+        {/* ── Image Queue ── */}
+        <View style={styles.section}>
+          <SectionHeader
+            label="Pending Images"
+            count={pendingImages.length}
+            color="#EC4899"
+            onRetry={retryImages}
+            onClear={clearImages}
+            retrying={retrying === "images"}
+          />
+          {pendingImages.length === 0 ? <EmptySection /> : pendingImages.map((item, i) => {
+            const isFailed = item.status === "failed";
+            return (
+              <View key={item.id} style={[styles.row, i < pendingImages.length - 1 && styles.rowBorder]}>
+                <View style={[styles.rowIcon, { backgroundColor: "#FDF2F8" }]}>
+                  <Text style={styles.rowIconText}>🖼️</Text>
+                </View>
+                <View style={styles.rowBody}>
+                  <Text style={styles.rowTitle}>{item.fieldName?.replace(/_/g, " ")}</Text>
+                  <Text style={styles.rowSub} numberOfLines={1}>{item.meta?.pole_code ?? "—"} · {item.meta?.image_type ?? "—"}</Text>
+                  {isFailed && item.lastError ? <Text style={[styles.rowSub, { color: "#DC2626" }]} numberOfLines={1}>{item.lastError}</Text> : null}
+                </View>
+                <View style={styles.rowRight}>
+                  <View style={[styles.statusPill, { backgroundColor: isFailed ? "#FEF2F2" : PENDING_BG }]}>
+                    <Text style={[styles.statusText, { color: isFailed ? "#DC2626" : "#3B82F6" }]}>{item.status}</Text>
+                  </View>
+                  <Text style={styles.rowTime}>{fmtDate(item.queuedAt)}</Text>
+                </View>
+              </View>
+            );
+          })}
         </View>
 
         {/* ── NAP / Pole Queue ── */}
@@ -599,4 +709,16 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: "transparent",
   },
   modalBtnText: { fontSize: 14, fontWeight: "800" },
+
+  syncAllBtn: {
+    marginLeft: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+    minWidth: 88,
+  },
+  syncAllText: { fontSize: 12, fontWeight: "800", color: "#fff" },
 });

@@ -1,17 +1,20 @@
 /**
- * Lightweight queue for simple JSON PUT/POST requests (no photos).
- * Used for things like pole name edits that need to sync to the backend.
+ * Queue for simple JSON PUT/POST requests (no photos).
+ * Used for pole name edits, GPS updates, etc.
  */
 import * as FileSystem from "expo-file-system/legacy";
 import api from "./api";
 
-const QUEUE_FILE = `${FileSystem.documentDirectory}simple_queue.json`;
+const QUEUE_FILE  = `${FileSystem.documentDirectory}simple_queue.json`;
+const MAX_RETRIES = 5;
 
 export type SimpleQueueEntry = {
   id: string;
   method: "put" | "post";
   url: string;
   body: Record<string, any>;
+  retryCount: number;
+  lastError?: string;
   queuedAt: string;
 };
 
@@ -19,11 +22,8 @@ async function readQueue(): Promise<SimpleQueueEntry[]> {
   try {
     const info = await FileSystem.getInfoAsync(QUEUE_FILE);
     if (!info.exists) return [];
-    const raw = await FileSystem.readAsStringAsync(QUEUE_FILE);
-    return JSON.parse(raw) ?? [];
-  } catch {
-    return [];
-  }
+    return JSON.parse(await FileSystem.readAsStringAsync(QUEUE_FILE)) ?? [];
+  } catch { return []; }
 }
 
 async function writeQueue(entries: SimpleQueueEntry[]): Promise<void> {
@@ -31,21 +31,22 @@ async function writeQueue(entries: SimpleQueueEntry[]): Promise<void> {
 }
 
 export async function simpleQueuePush(
-  entry: Omit<SimpleQueueEntry, "id" | "queuedAt">,
+  entry: Omit<SimpleQueueEntry, "id" | "retryCount" | "queuedAt">,
 ): Promise<void> {
   const entries = await readQueue();
-  // Replace existing entry for the same URL so we don't stack duplicates
-  const filtered = entries.filter((e) => e.url !== entry.url);
+  // Replace existing entry for the same URL — no point stacking identical edits
+  const filtered = entries.filter(e => e.url !== entry.url);
   filtered.push({
     ...entry,
     id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    retryCount: 0,
     queuedAt: new Date().toISOString(),
   });
   await writeQueue(filtered);
 }
 
 export async function simpleQueueCount(): Promise<number> {
-  return (await readQueue()).length;
+  return (await readQueue()).filter(e => e.retryCount < MAX_RETRIES).length;
 }
 
 export async function simpleQueueReadAll(): Promise<SimpleQueueEntry[]> {
@@ -53,15 +54,9 @@ export async function simpleQueueReadAll(): Promise<SimpleQueueEntry[]> {
 }
 
 export async function simpleQueueRemove(id: string): Promise<void> {
-  const entries = await readQueue();
-  await writeQueue(entries.filter((e) => e.id !== id));
+  await writeQueue((await readQueue()).filter(e => e.id !== id));
 }
 
-/**
- * Process all queued simple requests.
- * Called from handleSync and net-reconnect.
- * Never throws.
- */
 export async function processSimpleQueue(): Promise<void> {
   const entries = await readQueue();
   if (entries.length === 0) return;
@@ -75,14 +70,18 @@ export async function processSimpleQueue(): Promise<void> {
       } else {
         await api.post(entry.url, entry.body);
       }
-      // Success — entry removed (not pushed to remaining)
+      // Success — removed from remaining
     } catch (e: any) {
       const status = e?.response?.status;
-      if (status === 422 || status === 404) {
-        // Validation or not-found — drop it, retrying won't help
+
+      if (status === 422 || status === 404 || status === 400) {
+        // Validation/not-found — retrying won't help; log and drop
+        console.warn(`[SIMPLE_QUEUE_DROP] ${entry.method.toUpperCase()} ${entry.url} → ${status}:`, e?.response?.data ?? e?.message);
+      } else if ((entry.retryCount ?? 0) + 1 >= MAX_RETRIES) {
+        console.warn(`[MAX_RETRIES_EXCEEDED] ${entry.method.toUpperCase()} ${entry.url} after ${MAX_RETRIES} attempts`);
       } else {
-        // Network error — keep for next retry
-        remaining.push(entry);
+        // Network / 5xx — keep for retry
+        remaining.push({ ...entry, retryCount: (entry.retryCount ?? 0) + 1, lastError: e?.message });
       }
     }
   }

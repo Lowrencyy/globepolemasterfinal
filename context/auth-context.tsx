@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState } from "react";
 import { loginGlobe, logoutGlobe, type GlobeUser } from "@/services/auth";
 import { tokenStore } from "@/lib/token";
 import { setBridgeToken } from "@/lib/token-bridge";
+import { startNetSync, stopNetSync, setNetSyncToken } from "@/lib/net-sync";
 
 type AuthContextType = {
   isLoggedIn: boolean;
@@ -28,7 +29,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     tokenStore.get().then(saved => {
       if (saved) {
         setToken(saved);
-        setBridgeToken(saved);   // make lib/api.ts aware immediately
+        setBridgeToken(saved);
+        setNetSyncToken(saved);
+        startNetSync();
       }
     });
     tokenStore.getUser().then(saved => {
@@ -40,15 +43,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await loginGlobe(email, password);
     setToken(res.token);
     setUser(res.user);
-    setBridgeToken(res.token);          // sync bridge for this session
-    await tokenStore.set(res.token);    // persist for next app start
+    setBridgeToken(res.token);
+    setNetSyncToken(res.token);
+    startNetSync();
+    await tokenStore.set(res.token);
     await tokenStore.setUser(res.user);
   }
 
   async function logout() {
-    if (token) {
-      await logoutGlobe(token).catch(() => {});
-    }
+    if (token) await logoutGlobe(token).catch(() => {});
+    stopNetSync();
+    setNetSyncToken(null);
     setToken(null);
     setUser(null);
     setBridgeToken(null);

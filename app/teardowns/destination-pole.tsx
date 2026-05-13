@@ -1,6 +1,8 @@
 import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
+import { startPoleTeardown } from "@/services/skycable";
+import { useAuth } from "@/context/auth-context";
 import { simpleQueuePush } from "@/lib/simple-queue";
 import { gpsQueueGet } from "@/lib/gps-queue";
 import * as FileSystem from "expo-file-system/legacy";
@@ -10,13 +12,14 @@ import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
 import * as MediaLibrary from "expo-media-library";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import { ChevronLeft } from "lucide-react-native";
+import { ChevronLeft, Play, Timer } from "lucide-react-native";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   Animated,
   Easing,
+  Image,
   Modal,
   Pressable,
   ScrollView,
@@ -29,6 +32,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import { WebView } from "react-native-webview";
+import { buildSpanMapHtml } from "./components";
 
 const SLOTS = ["DA", "C1", "C2", "C3", "C4", "C5"] as const;
 const REQUIRED_GPS_ACCURACY_METERS = 10;
@@ -98,6 +102,28 @@ function getCompletionState({
     total: 6,
     percent: Math.round((completed / 6) * 100),
   };
+}
+
+function fmtPHT(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const pht = new Date(d.getTime() + 8 * 3600 * 1000);
+  const mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][pht.getUTCMonth()];
+  const day = pht.getUTCDate();
+  const h = pht.getUTCHours();
+  const min = String(pht.getUTCMinutes()).padStart(2,"0");
+  const ampm = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${mon} ${day} · ${h12}:${min} ${ampm}`;
+}
+
+function fmtDuration(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const mm = String(m).padStart(2,"0");
+  const ss = String(s).padStart(2,"0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
 function buildPoleMapHtml(lat: number, lng: number, accentColor: string) {
@@ -446,6 +472,54 @@ export default function DestinationPoleScreen() {
 
 
   const [elapsedSecs, setElapsedSecs] = useState(0);
+
+  // ── Pole teardown session (date_start persisted to backend) ──────────────
+  const { token } = useAuth();
+  const [poleStartedAt, setPoleStartedAt] = useState<string | null>(null);
+  const [poleStarting, setPoleStarting] = useState(false);
+  const [poleDuration, setPoleDuration] = useState(0);
+  const poleDurationRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Load date_start from the cached poles list for this node
+  useEffect(() => {
+    cacheGet<any[]>(`sitemap_poles_${params.node_id}`).then(cached => {
+      if (!cached?.length) return;
+      const entry = cached.find(p => String(p.pole_id) === String(params.to_pole_id));
+      if (entry?.date_start) setPoleStartedAt(entry.date_start);
+    }).catch(() => {});
+  }, [params.node_id, params.to_pole_id]);
+
+  // Run duration counter once poleStartedAt is known
+  useEffect(() => {
+    if (!poleStartedAt) return;
+    const startMs = new Date(poleStartedAt).getTime();
+    const tick = () => setPoleDuration(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
+    tick();
+    poleDurationRef.current = setInterval(tick, 1000);
+    return () => { if (poleDurationRef.current) clearInterval(poleDurationRef.current); };
+  }, [poleStartedAt]);
+
+  async function handleStartPoleTeardown() {
+    if (!token || poleStarting) return;
+    setPoleStarting(true);
+    try {
+      const now = getPHTNow();
+      await startPoleTeardown(Number(params.node_id), Number(params.to_pole_id), token, now);
+      setPoleStartedAt(now);
+      // Patch the cached poles list so poles.tsx reflects the change
+      const cached = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`);
+      if (cached?.length) {
+        const updated = cached.map(p =>
+          String(p.pole_id) === String(params.to_pole_id) ? { ...p, date_start: now } : p
+        );
+        await cacheSet(`sitemap_poles_${params.node_id}`, updated);
+      }
+    } catch {
+      Alert.alert("Error", "Could not start pole teardown. Check your connection and try again.");
+    } finally {
+      setPoleStarting(false);
+    }
+  }
 
   const timerStartRef = useRef(Date.now());
   // Record ISO start time when lineman enters this screen — sent to backend as started_at
@@ -1095,6 +1169,51 @@ export default function DestinationPoleScreen() {
             />
           </View>
 
+          {/* ── Pole Teardown Session ─────────────────────────────────── */}
+          <View style={styles.sectionCard}>
+            {!poleStartedAt ? (
+              // Not yet started
+              <View style={styles.poleSessionGate}>
+                <View style={styles.poleSessionGateIcon}>
+                  <Play size={22} color="#0B7A5A" fill="#0B7A5A" />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.poleSessionGateTitle}>Start Pole Teardown</Text>
+                  <Text style={styles.poleSessionGateSub}>
+                    Record when you began working on this pole. Start time and duration are saved to the backend.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={[styles.poleSessionStartBtn, poleStarting && { opacity: 0.6 }]}
+                  activeOpacity={0.8}
+                  onPress={handleStartPoleTeardown}
+                  disabled={poleStarting}
+                >
+                  {poleStarting
+                    ? <ActivityIndicator size="small" color="#FFFFFF" />
+                    : <Text style={styles.poleSessionStartBtnText}>Start</Text>
+                  }
+                </TouchableOpacity>
+              </View>
+            ) : (
+              // Session active
+              <View style={styles.poleSessionActive}>
+                <View style={styles.poleSessionRow}>
+                  <Timer size={14} color="#0B7A5A" />
+                  <Text style={styles.poleSessionDuration}>{fmtDuration(poleDuration)}</Text>
+                  <View style={styles.poleSessionActiveBadge}>
+                    <View style={styles.poleSessionActiveDot} />
+                    <Text style={styles.poleSessionActiveBadgeText}>Active</Text>
+                  </View>
+                </View>
+                <View style={styles.poleSessionMeta}>
+                  <Text style={styles.poleSessionMetaLabel}>Started</Text>
+                  <Text style={styles.poleSessionMetaValue}>{fmtPHT(poleStartedAt)}</Text>
+                </View>
+              </View>
+            )}
+          </View>
+
           <View style={styles.sectionCard}>
             <SectionHeading
               title="GPS Location"
@@ -1122,26 +1241,62 @@ export default function DestinationPoleScreen() {
             />
 
             {hasGps && capturedGps ? (
-              <View style={styles.gpsMapBox}>
-                <WebView
-                  style={StyleSheet.absoluteFillObject}
-                  scrollEnabled={false}
-                  originWhitelist={["*"]}
-                  javaScriptEnabled
-                  domStorageEnabled
-                  mixedContentMode="always"
-                  source={{
-                    html: buildPoleMapHtml(
-                      capturedGps.latitude,
-                      capturedGps.longitude,
-                      accentColor,
-                    ),
-                    baseUrl: "https://local.telcovantage/",
-                  }}
-                  cacheEnabled={false}
+              <>
+                <View style={styles.spanPoleRow}>
+                  <View style={styles.spanPoleBox}>
+                    <View style={[styles.spanPoleDot, { backgroundColor: accentColor }]} />
+                    <Text style={[styles.spanPoleCode, { color: accentColor }]} numberOfLines={1}>{params.pole_code || "FROM"}</Text>
+                    <Text style={styles.spanPoleLabel}>From</Text>
+                  </View>
+                  <View style={styles.spanConnector}>
+                    <View style={[styles.spanLine, { borderColor: `${accentColor}50` }]} />
+                    {params.length_meters ? (
+                      <View style={[styles.spanDistBadge, { backgroundColor: `${accentColor}12` }]}>
+                        <Text style={[styles.spanDistText, { color: accentColor }]}>{params.length_meters}m</Text>
+                      </View>
+                    ) : null}
+                    <View style={[styles.spanLine, { borderColor: `${accentColor}50` }]} />
+                  </View>
+                  <View style={styles.spanPoleBox}>
+                    <View style={[styles.spanPoleDot, { backgroundColor: "#6366F1" }]} />
+                    <Text style={[styles.spanPoleCode, { color: "#6366F1" }]} numberOfLines={1}>{editedToPoleName || params.to_pole_code || "TO"}</Text>
+                    <Text style={styles.spanPoleLabel}>To</Text>
+                  </View>
+                </View>
+                <View style={styles.gpsMapBox}>
+                  <WebView
+                    style={StyleSheet.absoluteFillObject}
+                    scrollEnabled={false}
+                    originWhitelist={["*"]}
+                    javaScriptEnabled
+                    domStorageEnabled
+                    mixedContentMode="always"
+                    source={{
+                      html: buildSpanMapHtml(
+                        parseFloat(params.from_pole_latitude || "0"),
+                        parseFloat(params.from_pole_longitude || "0"),
+                        params.pole_code || "FROM",
+                        capturedGps.latitude,
+                        capturedGps.longitude,
+                        editedToPoleName || params.to_pole_code || "TO",
+                        accentColor,
+                        false,
+                      ),
+                      baseUrl: "https://local.telcovantage/",
+                    }}
+                    cacheEnabled={false}
+                  />
+                </View>
+              </>
+            ) : (
+              <View style={styles.noGpsPlaceholder}>
+                <Image
+                  source={require("../../assets/images/logo.png")}
+                  style={styles.noGpsLogo}
+                  resizeMode="contain"
                 />
               </View>
-            ) : null}
+            )}
 
             <Pressable
               style={({ pressed }) => [
@@ -1980,11 +2135,75 @@ const styles = StyleSheet.create({
     color: "#667085",
   },
 
+  noGpsPlaceholder: {
+    height: 180,
+    backgroundColor: "#F3F4F6",
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 8,
+    marginBottom: 16,
+  },
+  noGpsLogo: {
+    width: "40%",
+    height: "40%",
+    opacity: 0.15,
+  },
   gpsMapBox: {
-    height: 200,
-    borderRadius: 16,
+    height: 180,
+    backgroundColor: "#F3F4F6",
+    borderRadius: 14,
     overflow: "hidden",
-    marginBottom: 12,
+    marginTop: 8,
+    marginBottom: 16,
+  },
+  spanPoleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  spanPoleBox: {
+    flex: 1,
+    alignItems: "center",
+    gap: 4,
+  },
+  spanPoleDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    marginBottom: 2,
+  },
+  spanPoleCode: {
+    fontSize: 15,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  spanPoleLabel: {
+    fontSize: 10,
+    fontWeight: "600",
+    color: "#9CA3AF",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  spanConnector: {
+    flex: 2,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  spanLine: {
+    flex: 1,
+    borderTopWidth: 2,
+    borderStyle: "dashed",
+  },
+  spanDistBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  spanDistText: {
+    fontSize: 11,
+    fontWeight: "800",
   },
 
   gpsCardButton: {
@@ -2095,11 +2314,16 @@ const styles = StyleSheet.create({
 
   photoTileCard: {
     flex: 1,
-    borderRadius: 16,
-    borderWidth: 1.5,
-    borderColor: "#E8ECF0",
-    overflow: "hidden",
     backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: "#F1F5F9",
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 20,
+    elevation: 3,
   },
 
   photoTileImgWrap: {
@@ -2936,5 +3160,108 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "900",
     color: "#FFFFFF",
+  },
+
+  // ── Pole Session Card ──────────────────────────────────────────────────
+  poleSessionGate: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  poleSessionGateIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: "#ECFDF5",
+    borderWidth: 1.5,
+    borderColor: "#A7F3D0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  poleSessionGateTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#111827",
+    marginBottom: 2,
+  },
+  poleSessionGateSub: {
+    fontSize: 11,
+    fontWeight: "500",
+    color: "#6B7280",
+    lineHeight: 16,
+  },
+  poleSessionStartBtn: {
+    backgroundColor: "#0B7A5A",
+    borderRadius: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    shadowColor: "#0B7A5A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  poleSessionStartBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
+
+  poleSessionActive: {
+    gap: 10,
+  },
+  poleSessionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  poleSessionDuration: {
+    flex: 1,
+    fontSize: 22,
+    fontWeight: "900",
+    color: "#0B7A5A",
+    letterSpacing: -0.5,
+  },
+  poleSessionActiveBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "#ECFDF5",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "#A7F3D0",
+  },
+  poleSessionActiveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#059669",
+  },
+  poleSessionActiveBadgeText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#065F46",
+  },
+  poleSessionMeta: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#F1F5F9",
+  },
+  poleSessionMetaLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#94A3B8",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  poleSessionMetaValue: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#374151",
   },
 });

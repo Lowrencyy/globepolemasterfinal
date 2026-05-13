@@ -1178,6 +1178,7 @@ function AddNapBoxModal({
 
 export default function NapsScreen() {
   const { token } = useAuth();
+  const router = useRouter();
   const [search, setSearch] = useState("");
   const [napBoxes, setNapBoxes] = useState<NapBox[]>([]);
   const [loading, setLoading] = useState(true);

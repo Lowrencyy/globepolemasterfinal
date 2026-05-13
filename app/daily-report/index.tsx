@@ -1,18 +1,36 @@
+import api from "@/lib/api";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Stack, useFocusEffect, useRouter } from "expo-router";
+import {
+  AlertCircle,
+  BarChart3,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  RefreshCw,
+} from "lucide-react-native";
 import React, { useCallback, useMemo, useState } from "react";
 import {
-  View, Text, StyleSheet, ScrollView, RefreshControl,
-  TouchableOpacity, ActivityIndicator,
+  ActivityIndicator,
+  FlatList,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect, useRouter } from "expo-router";
-import { ChevronLeft, ChevronRight, BarChart3, AlertCircle, RefreshCw } from "lucide-react-native";
-import api from "@/lib/api";
 
-const GREEN  = "#0A5C3B";
+const GREEN = "#0B7A5A";
+const GREEN_L = "#ECFDF3";
 const INDIGO = "#6366F1";
-const SLATE  = "#0F172A";
-const MUTED  = "#64748B";
-const BORDER = "#F1F5F9";
+const SLATE = "#111827";
+const MUTED = "#667085";
+const BORDER = "#E7ECF2";
+const ORANGE = "#F59E0B";
+const CACHE_KEY = "daily_reports_cache_v3";
+
+const USE_FAKE_DATA = true;
 
 type TeardownLog = {
   id: number;
@@ -27,236 +45,772 @@ type TeardownLog = {
   ps_housing_collected: number;
   start_time: string;
   end_time: string | null;
-  span: { node?: { name: string } | null } | null;
-  lineman: { id: number; name?: string; first_name?: string; last_name?: string } | null;
+  team?: { name: string } | null;
 };
 
-function dayKey(iso: string) { return iso.slice(0, 10); }
+const FAKE_LOGS: TeardownLog[] = [
+  {
+    id: 1,
+    status: "submitted",
+    actual_cable: 120,
+    expected_cable: 150,
+    nodes_collected: 2,
+    amplifiers_collected: 1,
+    extenders_collected: 0,
+    tsc_collected: 1,
+    powersupply_collected: 0,
+    ps_housing_collected: 0,
+    start_time: "2026-05-12T08:30:00",
+    end_time: "2026-05-12T10:15:00",
+    team: { name: "Team Alpha" },
+  },
+  {
+    id: 2,
+    status: "backend_approved",
+    actual_cable: 85,
+    expected_cable: 100,
+    nodes_collected: 1,
+    amplifiers_collected: 0,
+    extenders_collected: 2,
+    tsc_collected: 0,
+    powersupply_collected: 1,
+    ps_housing_collected: 0,
+    start_time: "2026-05-12T11:00:00",
+    end_time: "2026-05-12T12:20:00",
+    team: { name: "Team Alpha" },
+  },
+  {
+    id: 3,
+    status: "pending",
+    actual_cable: 60,
+    expected_cable: 80,
+    nodes_collected: 0,
+    amplifiers_collected: 1,
+    extenders_collected: 1,
+    tsc_collected: 0,
+    powersupply_collected: 0,
+    ps_housing_collected: 1,
+    start_time: "2026-05-11T09:10:00",
+    end_time: "2026-05-11T10:05:00",
+    team: { name: "Team Bravo" },
+  },
+  {
+    id: 4,
+    status: "submitted",
+    actual_cable: 210,
+    expected_cable: 220,
+    nodes_collected: 3,
+    amplifiers_collected: 2,
+    extenders_collected: 1,
+    tsc_collected: 1,
+    powersupply_collected: 1,
+    ps_housing_collected: 1,
+    start_time: "2026-05-10T13:00:00",
+    end_time: "2026-05-10T15:45:00",
+    team: { name: "Team Charlie" },
+  },
+  {
+    id: 5,
+    status: "backend_approved",
+    actual_cable: 140,
+    expected_cable: 160,
+    nodes_collected: 2,
+    amplifiers_collected: 2,
+    extenders_collected: 0,
+    tsc_collected: 1,
+    powersupply_collected: 1,
+    ps_housing_collected: 0,
+    start_time: "2026-05-10T16:00:00",
+    end_time: "2026-05-10T17:35:00",
+    team: { name: "Team Charlie" },
+  },
+];
+
+function dayKey(iso: string) {
+  return iso.slice(0, 10);
+}
 
 function fmtDay(dateStr: string) {
   return new Date(dateStr + "T00:00:00").toLocaleDateString("en-PH", {
-    weekday: "long", month: "long", day: "numeric", year: "numeric",
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
   });
 }
 
-const STATUS_COLOR: Record<string, string> = {
-  submitted: "#3B82F6", subcon_approved: "#10B981",
-  backend_approved: "#16A34A", rejected: "#EF4444", pending: "#F59E0B",
-};
+function SummaryCard({
+  label,
+  value,
+  color = SLATE,
+}: {
+  label: string;
+  value: string | number;
+  color?: string;
+}) {
+  return (
+    <View style={s.summaryCard}>
+      <Text style={[s.summaryValue, { color }]}>{value}</Text>
+      <Text style={s.summaryLabel}>{label}</Text>
+    </View>
+  );
+}
+
+function ComponentBox({
+  label,
+  value,
+  color,
+  tone,
+}: {
+  label: string;
+  value: number;
+  color: string;
+  tone: "blue" | "orange";
+}) {
+  return (
+    <View style={s.componentBox}>
+      <View
+        style={tone === "blue" ? s.componentIconBlue : s.componentIconOrange}
+      >
+        <Text style={[s.componentIconText, { color }]}>
+          {tone === "blue" ? "□" : "▭"}
+        </Text>
+      </View>
+
+      <View>
+        <Text style={s.componentTitle}>{label}</Text>
+        <Text style={[s.componentValue, { color }]}>{value}</Text>
+      </View>
+    </View>
+  );
+}
 
 export default function DailyReportScreen() {
   const router = useRouter();
-  const [logs,       setLogs]       = useState<TeardownLog[]>([]);
-  const [loading,    setLoading]    = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error,      setError]      = useState<string | null>(null);
 
-  const fetchLogs = useCallback(async () => {
+  const [logs, setLogs] = useState<TeardownLog[]>(
+    USE_FAKE_DATA ? FAKE_LOGS : [],
+  );
+  const [loading, setLoading] = useState(!USE_FAKE_DATA);
+  const [refreshing, setRefreshing] = useState(false);
+  const [backgroundSyncing, setBackgroundSyncing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const saveCache = useCallback(async (items: TeardownLog[]) => {
     try {
-      setError(null);
-      const { data } = await api.get("/skycable/teardowns?per_page=500");
-      setLogs(data?.data ?? data ?? []);
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to load.");
-    } finally {
+      await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(items));
+    } catch {}
+  }, []);
+
+  const loadCache = useCallback(async () => {
+    if (USE_FAKE_DATA) return true;
+
+    try {
+      const raw = await AsyncStorage.getItem(CACHE_KEY);
+      if (!raw) return false;
+
+      const items = JSON.parse(raw);
+      if (!Array.isArray(items)) return false;
+
+      setLogs(items);
       setLoading(false);
-      setRefreshing(false);
+
+      return items.length > 0;
+    } catch {
+      return false;
     }
   }, []);
 
-  useFocusEffect(useCallback(() => {
-    setLoading(true);
-    fetchLogs();
-  }, [fetchLogs]));
+  const fetchLogs = useCallback(
+    async (silent = false) => {
+      if (USE_FAKE_DATA) {
+        setLogs(FAKE_LOGS);
+        setLoading(false);
+        setRefreshing(false);
+        setBackgroundSyncing(false);
+        return;
+      }
 
-  // Group by date descending
+      try {
+        setError(null);
+        if (silent) setBackgroundSyncing(true);
+
+        const { data } = await api.get("/skycable/teardowns?per_page=500");
+        const items = data?.data ?? data ?? [];
+
+        setLogs(items);
+        await saveCache(items);
+      } catch (e: any) {
+        setError(e?.message ?? "Failed to load reports.");
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+        setBackgroundSyncing(false);
+      }
+    },
+    [saveCache],
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+
+      const start = async () => {
+        const hasCache = await loadCache();
+        if (!active) return;
+        await fetchLogs(hasCache);
+      };
+
+      start();
+
+      return () => {
+        active = false;
+      };
+    }, [fetchLogs, loadCache]),
+  );
+
   const grouped = useMemo(() => {
     const map = new Map<string, TeardownLog[]>();
+
     for (const log of logs) {
       const key = dayKey(log.end_time ?? log.start_time);
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(log);
     }
+
     return Array.from(map.entries()).sort((a, b) => b[0].localeCompare(a[0]));
   }, [logs]);
 
-  // Overall totals
   const totalCable = logs.reduce((s, l) => s + (l.actual_cable ?? 0), 0);
-  const totalComponents = logs.reduce((s, l) =>
-    s + (l.nodes_collected ?? 0) + (l.amplifiers_collected ?? 0) +
-    (l.extenders_collected ?? 0) + (l.tsc_collected ?? 0) +
-    (l.powersupply_collected ?? 0) + (l.ps_housing_collected ?? 0), 0);
+  const totalNodes = logs.reduce((s, l) => s + (l.nodes_collected ?? 0), 0);
+  const totalAmplifiers = logs.reduce(
+    (s, l) => s + (l.amplifiers_collected ?? 0),
+    0,
+  );
 
   return (
-    <SafeAreaView style={s.root} edges={["top"]}>
-      {/* Header */}
-      <View style={s.header}>
-        <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
-          <ChevronLeft size={22} color={SLATE} />
-        </TouchableOpacity>
-        <View style={s.headerMid}>
-          <Text style={s.title}>Daily Report</Text>
-          <Text style={s.sub}>{grouped.length} day{grouped.length !== 1 ? "s" : ""} with activity</Text>
-        </View>
-      </View>
+    <>
+      <Stack.Screen options={{ headerShown: false }} />
 
-      {loading ? (
-        <View style={s.centered}>
-          <ActivityIndicator color={GREEN} size="large" />
-          <Text style={s.loadTxt}>Loading daily reports…</Text>
-        </View>
-      ) : error ? (
-        <View style={s.centered}>
-          <AlertCircle size={40} color="#EF4444" />
-          <Text style={s.errTxt}>{error}</Text>
-          <TouchableOpacity style={s.retryBtn} onPress={() => { setLoading(true); fetchLogs(); }}>
-            <RefreshCw size={14} color={GREEN} />
-            <Text style={s.retryTxt}>Try Again</Text>
+      <SafeAreaView style={s.container}>
+        <View style={s.floatingHeader}>
+          <TouchableOpacity onPress={() => router.back()} style={s.backBtn}>
+            <ChevronLeft size={22} color={SLATE} />
           </TouchableOpacity>
-        </View>
-      ) : (
-        <ScrollView
-          contentContainerStyle={s.content}
-          showsVerticalScrollIndicator={false}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); fetchLogs(); }} colors={[GREEN]} />}
-        >
-          {/* Overall summary banner */}
-          <View style={s.banner}>
-            <View style={s.bannerStat}>
-              <Text style={s.bannerNum}>{logs.length}</Text>
-              <Text style={s.bannerLbl}>Total Spans</Text>
-            </View>
-            <View style={s.bannerDiv} />
-            <View style={s.bannerStat}>
-              <Text style={[s.bannerNum, { color: GREEN }]}>{totalCable}m</Text>
-              <Text style={s.bannerLbl}>Cable Recovered</Text>
-            </View>
-            <View style={s.bannerDiv} />
-            <View style={s.bannerStat}>
-              <Text style={[s.bannerNum, { color: INDIGO }]}>{totalComponents}</Text>
-              <Text style={s.bannerLbl}>Components</Text>
-            </View>
-            <View style={s.bannerDiv} />
-            <View style={s.bannerStat}>
-              <Text style={[s.bannerNum, { color: "#F59E0B" }]}>{grouped.length}</Text>
-              <Text style={s.bannerLbl}>Days Active</Text>
-            </View>
+
+          <View style={s.headerText}>
+            <Text style={s.headerTitle}>Daily Reports</Text>
+            <Text style={s.headerSub}>
+              {grouped.length} generated report{grouped.length !== 1 ? "s" : ""}
+              {backgroundSyncing ? " · updating..." : ""}
+            </Text>
           </View>
+        </View>
 
-          {grouped.length === 0 ? (
-            <View style={s.centered}>
-              <BarChart3 size={48} color="#CBD5E1" />
-              <Text style={s.emptyTxt}>No teardown activity yet</Text>
-            </View>
-          ) : grouped.map(([date, dayLogs]) => {
-            const dayCable = dayLogs.reduce((s, l) => s + (l.actual_cable ?? 0), 0);
-            const dayComponents = dayLogs.reduce((s, l) =>
-              s + (l.nodes_collected ?? 0) + (l.amplifiers_collected ?? 0) +
-              (l.extenders_collected ?? 0) + (l.tsc_collected ?? 0) +
-              (l.powersupply_collected ?? 0) + (l.ps_housing_collected ?? 0), 0);
-            const statusCounts = dayLogs.reduce((acc, l) => {
-              acc[l.status] = (acc[l.status] ?? 0) + 1;
-              return acc;
-            }, {} as Record<string, number>);
+        {loading && logs.length === 0 ? (
+          <View style={s.empty}>
+            <ActivityIndicator size="large" color={GREEN} />
+            <Text style={s.emptyTitle}>Loading Daily Reports...</Text>
+          </View>
+        ) : error && logs.length === 0 ? (
+          <View style={s.empty}>
+            <AlertCircle size={42} color="#EF4444" />
+            <Text style={s.emptyTitle}>Something went wrong</Text>
+            <Text style={s.emptySub}>{error}</Text>
 
-            return (
-              <TouchableOpacity
-                key={date}
-                style={s.dayCard}
-                activeOpacity={0.75}
-                onPress={() => router.push(`/daily-report/${date}` as any)}
-              >
-                {/* Left accent bar */}
-                <View style={s.accentBar} />
-
-                <View style={s.dayBody}>
-                  {/* Date */}
-                  <Text style={s.dayDate}>{fmtDay(date)}</Text>
-
-                  {/* Stats row */}
-                  <View style={s.statsRow}>
-                    <View style={s.stat}>
-                      <Text style={s.statNum}>{dayLogs.length}</Text>
-                      <Text style={s.statLbl}>Spans</Text>
-                    </View>
-                    <View style={s.stat}>
-                      <Text style={[s.statNum, { color: GREEN }]}>{dayCable}m</Text>
-                      <Text style={s.statLbl}>Cable</Text>
-                    </View>
-                    {dayComponents > 0 && (
-                      <View style={s.stat}>
-                        <Text style={[s.statNum, { color: INDIGO }]}>{dayComponents}</Text>
-                        <Text style={s.statLbl}>Components</Text>
-                      </View>
-                    )}
-                  </View>
-
-                  {/* Status dots */}
-                  <View style={s.statusRow}>
-                    {Object.entries(statusCounts).map(([st, count]) => (
-                      <View key={st} style={[s.statusChip, { backgroundColor: (STATUS_COLOR[st] ?? "#94A3B8") + "18" }]}>
-                        <View style={[s.statusDot, { backgroundColor: STATUS_COLOR[st] ?? "#94A3B8" }]} />
-                        <Text style={[s.statusTxt, { color: STATUS_COLOR[st] ?? "#94A3B8" }]}>
-                          {count} {st.replace(/_/g, " ")}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
+            <TouchableOpacity
+              style={s.retryBtn}
+              onPress={() => {
+                setLoading(true);
+                fetchLogs(false);
+              }}
+            >
+              <RefreshCw size={14} color={GREEN} />
+              <Text style={s.retryTxt}>Try Again</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <FlatList
+            data={grouped}
+            keyExtractor={([date]) => date}
+            contentContainerStyle={s.list}
+            showsVerticalScrollIndicator={false}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={() => {
+                  setRefreshing(true);
+                  fetchLogs(false);
+                }}
+                colors={[GREEN]}
+              />
+            }
+            ListHeaderComponent={
+              <>
+                <View style={s.summaryGrid}>
+                  <SummaryCard label="Reports" value={grouped.length} />
+                  <SummaryCard
+                    label="Cable"
+                    value={`${totalCable}m`}
+                    color={GREEN}
+                  />
+                  <SummaryCard
+                    label="Nodes"
+                    value={totalNodes}
+                    color={INDIGO}
+                  />
+                  <SummaryCard
+                    label="Amplifier"
+                    value={totalAmplifiers}
+                    color={ORANGE}
+                  />
                 </View>
 
-                <ChevronRight size={18} color="#CBD5E1" />
-              </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
-      )}
-    </SafeAreaView>
+                {grouped.length === 0 ? (
+                  <View style={s.emptyDashboard}>
+                    <View style={s.emptyIconWrap}>
+                      <BarChart3 size={48} color="#C9D3E0" />
+                    </View>
+
+                    <Text style={s.dashboardTitle}>No Daily Reports Yet</Text>
+                    <Text style={s.dashboardSub}>
+                      Daily teardown summaries will appear here automatically
+                      once submissions are completed.
+                    </Text>
+                    <Text style={s.pullTxt}>Pull down to refresh</Text>
+                  </View>
+                ) : (
+                  <Text style={s.sectionTitle}>GENERATED REPORTS</Text>
+                )}
+              </>
+            }
+            renderItem={({ item: [date, dayLogs] }) => {
+              const totalSpans = dayLogs.length;
+              const recoveredCable = dayLogs.reduce(
+                (sum, log) => sum + (log.actual_cable ?? 0),
+                0,
+              );
+              const nodes = dayLogs.reduce(
+                (sum, log) => sum + (log.nodes_collected ?? 0),
+                0,
+              );
+              const amplifiers = dayLogs.reduce(
+                (sum, log) => sum + (log.amplifiers_collected ?? 0),
+                0,
+              );
+              const tsc = dayLogs.reduce(
+                (sum, log) => sum + (log.tsc_collected ?? 0),
+                0,
+              );
+              const extenders = dayLogs.reduce(
+                (sum, log) => sum + (log.extenders_collected ?? 0),
+                0,
+              );
+
+              const teamNames = Array.from(
+                new Set(dayLogs.map((log) => log.team?.name).filter(Boolean)),
+              ).join(", ");
+
+              return (
+                <TouchableOpacity
+                  activeOpacity={0.82}
+                  style={s.reportCard}
+                  onPress={() => router.push(`/daily-report/${date}` as any)}
+                >
+                  <View style={s.reportHeader}>
+                    <View style={s.reportBadge}>
+                      <CalendarDays size={16} color={GREEN} />
+                    </View>
+
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.reportTitle}>{fmtDay(date)}</Text>
+                      <Text style={s.reportDate}>
+                        {teamNames || "No team assigned"}
+                      </Text>
+                    </View>
+
+                    <ChevronRight size={20} color="#98A2B3" />
+                  </View>
+
+                  <View style={s.table}>
+                    <View style={s.tableRow}>
+                      <Text style={s.tableLabel}>Total Spans</Text>
+                      <Text style={s.tableValue}>{totalSpans}</Text>
+                    </View>
+
+                    <View style={s.tableRow}>
+                      <Text style={s.tableLabel}>Cable</Text>
+                      <Text style={[s.tableValue, { color: GREEN }]}>
+                        {recoveredCable}m recovered
+                      </Text>
+                    </View>
+
+                    <View style={s.componentRow}>
+                      <ComponentBox
+                        label="NODES"
+                        value={nodes}
+                        color={INDIGO}
+                        tone="blue"
+                      />
+                      <ComponentBox
+                        label="AMPLIFIER"
+                        value={amplifiers}
+                        color={ORANGE}
+                        tone="orange"
+                      />
+                      <ComponentBox
+                        label="TSC"
+                        value={tsc}
+                        color={INDIGO}
+                        tone="blue"
+                      />
+                      <ComponentBox
+                        label="EXTENDER"
+                        value={extenders}
+                        color={ORANGE}
+                        tone="orange"
+                      />
+                    </View>
+                  </View>
+
+                  <View style={s.footer}>
+                    <Text style={s.previewText}>View Full Preview</Text>
+                    <ChevronRight size={18} color="#CBD5E1" />
+                  </View>
+                </TouchableOpacity>
+              );
+            }}
+          />
+        )}
+      </SafeAreaView>
+    </>
   );
 }
 
 const s = StyleSheet.create({
-  root:    { flex: 1, backgroundColor: "#F8FAFC" },
-  header:  { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12, gap: 12 },
-  backBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: "#fff", borderWidth: 1, borderColor: BORDER, alignItems: "center", justifyContent: "center" },
-  headerMid: { flex: 1 },
-  title:   { fontSize: 22, fontWeight: "900", color: SLATE },
-  sub:     { fontSize: 13, color: MUTED, fontWeight: "500", marginTop: 2 },
-
-  centered: { flex: 1, alignItems: "center", justifyContent: "center", padding: 40 },
-  loadTxt:  { fontSize: 14, color: MUTED, marginTop: 12, fontWeight: "500" },
-  errTxt:   { fontSize: 14, color: "#DC2626", textAlign: "center", marginTop: 12, fontWeight: "600" },
-  retryBtn: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 16, backgroundColor: "#F0FDF4", paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12 },
-  retryTxt: { fontSize: 14, fontWeight: "700", color: GREEN },
-  emptyTxt: { fontSize: 16, fontWeight: "700", color: MUTED, marginTop: 16 },
-
-  content: { paddingHorizontal: 16, paddingBottom: 100 },
-
-  banner: {
-    flexDirection: "row", backgroundColor: "#fff", borderRadius: 18,
-    borderWidth: 1, borderColor: BORDER, padding: 16, marginBottom: 16,
-    shadowColor: SLATE, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.04, shadowRadius: 8, elevation: 2,
+  container: {
+    flex: 1,
+    backgroundColor: "#F4F6F8",
   },
-  bannerStat: { flex: 1, alignItems: "center" },
-  bannerNum:  { fontSize: 20, fontWeight: "900", color: SLATE },
-  bannerLbl:  { fontSize: 9, fontWeight: "600", color: MUTED, marginTop: 2, textAlign: "center" },
-  bannerDiv:  { width: 1, backgroundColor: BORDER, marginHorizontal: 4 },
 
-  dayCard: {
-    flexDirection: "row", alignItems: "center",
-    backgroundColor: "#fff", borderRadius: 18, marginBottom: 12,
-    borderWidth: 1, borderColor: BORDER,
-    shadowColor: SLATE, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.04, shadowRadius: 8, elevation: 2,
-    overflow: "hidden", paddingRight: 16,
+  floatingHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
+    gap: 12,
+    backgroundColor: "#F4F6F8",
   },
-  accentBar: { width: 4, alignSelf: "stretch", backgroundColor: GREEN },
-  dayBody:   { flex: 1, padding: 16 },
-  dayDate:   { fontSize: 15, fontWeight: "800", color: SLATE, marginBottom: 10 },
-  statsRow:  { flexDirection: "row", gap: 16, marginBottom: 10 },
-  stat:      { alignItems: "center" },
-  statNum:   { fontSize: 20, fontWeight: "900", color: SLATE },
-  statLbl:   { fontSize: 10, fontWeight: "600", color: MUTED, marginTop: 2 },
-  statusRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  statusChip:{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 99 },
-  statusDot: { width: 5, height: 5, borderRadius: 3 },
-  statusTxt: { fontSize: 10, fontWeight: "700" },
+
+  backBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: BORDER,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#101828",
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 3,
+  },
+
+  headerText: {
+    flex: 1,
+  },
+
+  headerTitle: {
+    fontSize: 30,
+    fontWeight: "900",
+    color: SLATE,
+  },
+
+  headerSub: {
+    marginTop: 2,
+    fontSize: 13,
+    color: MUTED,
+    fontWeight: "600",
+  },
+
+  list: {
+    padding: 16,
+    paddingTop: 8,
+    paddingBottom: 120,
+  },
+
+  summaryGrid: {
+    flexDirection: "row",
+    gap: 6,
+    marginBottom: 24,
+  },
+
+  summaryCard: {
+    flex: 1,
+    minHeight: 88,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: BORDER,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.04,
+    shadowRadius: 10,
+    elevation: 3,
+  },
+
+  summaryValue: {
+    fontSize: 22,
+    fontWeight: "900",
+  },
+
+  summaryLabel: {
+    marginTop: 6,
+    fontSize: 9,
+    fontWeight: "800",
+    color: "#98A2B3",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+
+  sectionTitle: {
+    marginBottom: 12,
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#98A2B3",
+    letterSpacing: 1,
+  },
+
+  reportCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 26,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: BORDER,
+    marginBottom: 14,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 16,
+    elevation: 4,
+  },
+
+  reportHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 18,
+  },
+
+  reportBadge: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: GREEN_L,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 14,
+  },
+
+  reportTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: SLATE,
+  },
+
+  reportDate: {
+    marginTop: 4,
+    fontSize: 13,
+    color: MUTED,
+    fontWeight: "600",
+  },
+
+  table: {
+    borderRadius: 18,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#FFFFFF",
+  },
+
+  tableRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: BORDER,
+  },
+
+  tableLabel: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: MUTED,
+  },
+
+  tableValue: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: SLATE,
+  },
+
+  componentRow: {
+    flexDirection: "row",
+    borderTopWidth: 1,
+    borderTopColor: BORDER,
+  },
+
+  componentBox: {
+    flex: 1,
+    minHeight: 88,
+    paddingVertical: 13,
+    paddingHorizontal: 6,
+    borderRightWidth: 1,
+    borderRightColor: BORDER,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  componentIconBlue: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#EEF2FF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 6,
+  },
+
+  componentIconOrange: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#FFF7ED",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 6,
+  },
+
+  componentIconText: {
+    fontSize: 17,
+    fontWeight: "900",
+  },
+
+  componentTitle: {
+    fontSize: 9,
+    fontWeight: "900",
+    color: MUTED,
+    letterSpacing: 0.4,
+    textAlign: "center",
+  },
+
+  componentValue: {
+    marginTop: 3,
+    fontSize: 20,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+
+  footer: {
+    marginTop: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  previewText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: GREEN,
+  },
+
+  emptyDashboard: {
+    minHeight: 430,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
+
+  emptyIconWrap: {
+    width: 104,
+    height: 104,
+    borderRadius: 52,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: BORDER,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 24,
+  },
+
+  dashboardTitle: {
+    fontSize: 24,
+    fontWeight: "900",
+    color: SLATE,
+    textAlign: "center",
+  },
+
+  dashboardSub: {
+    marginTop: 10,
+    maxWidth: 320,
+    fontSize: 15,
+    lineHeight: 24,
+    color: MUTED,
+    textAlign: "center",
+    fontWeight: "500",
+  },
+
+  pullTxt: {
+    marginTop: 22,
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#98A2B3",
+    textTransform: "uppercase",
+    letterSpacing: 1,
+  },
+
+  empty: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 40,
+    paddingBottom: 100,
+  },
+
+  emptyTitle: {
+    marginTop: 18,
+    fontSize: 18,
+    fontWeight: "900",
+    color: SLATE,
+  },
+
+  emptySub: {
+    marginTop: 10,
+    fontSize: 14,
+    lineHeight: 22,
+    color: "#98A2B3",
+    textAlign: "center",
+  },
+
+  retryBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 18,
+    backgroundColor: GREEN_L,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+
+  retryTxt: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: GREEN,
+  },
 });

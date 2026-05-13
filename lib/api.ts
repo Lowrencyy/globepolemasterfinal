@@ -51,7 +51,7 @@ async function handleResponse(response: Response) {
   return { data };
 }
 
-const TIMEOUT_MS = 10_000;          // 10 s — fast fail so cache kicks in sooner
+const TIMEOUT_MS = 30_000;          // 30 s — extended timeout for reliable mobile loading
 const UPLOAD_TIMEOUT_MS = 120_000;  // 120 s for photo/file uploads
 
 async function fetchWithTimeout(

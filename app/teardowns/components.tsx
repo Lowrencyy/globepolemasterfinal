@@ -39,7 +39,7 @@ import { WebView } from "react-native-webview";
 
 type PhotoFile = { uri: string; name: string; type: string } | null;
 
-function buildSpanMapHtml(
+export function buildSpanMapHtml(
   fromLat: number,
   fromLng: number,
   fromLabel: string,
@@ -393,6 +393,7 @@ export default function TeardownComponentsScreen() {
     from_pole_latitude: string;
     from_pole_longitude: string;
     from_pole_gps_captured_at: string;
+    teardown_started_at?: string;
   }>();
 
   const accentColor = params.accent || "#0B7A5A";
@@ -1054,13 +1055,49 @@ export default function TeardownComponentsScreen() {
           cacheSet(`pole_submitted_${params.from_pole_id}`, true).catch(() => {});
           FileSystem.deleteAsync(poleDraftDir + `pole_${params.from_pole_id}_after.jpg`, { idempotent: true }).catch(() => {});
         }
+
+        // Mark the destination pole as cleared on the backend
+        if (params.node_id && params.to_pole_id) {
+          const clearedAt = getPHTNow();
+          api.put(
+            `/skycable/nodes/${params.node_id}/poles/${params.to_pole_id}`,
+            { cleared_at: clearedAt, skycable_status: "cleared" }
+          ).catch(() => {});
+
+          // Patch the local cache so poles.tsx reflects cleared_at immediately
+          cacheGet<any[]>(`sitemap_poles_${params.node_id}`).then(cached => {
+            if (!cached?.length) return;
+            const updated = cached.map(p =>
+              String(p.pole_id) === String(params.to_pole_id)
+                ? { ...p, cleared_at: clearedAt, pole: { ...p.pole, skycable_status: "cleared" } }
+                : p
+            );
+            cacheSet(`sitemap_poles_${params.node_id}`, updated).catch(() => {});
+          }).catch(() => {});
+        }
       })
       .catch(async (e: any) => {
         const status = e?.response?.status;
 
-        // Already on server — treat as success
+        // Already on server — treat as success, still mark pole cleared
         if (status === 409) {
           if (params.from_pole_id) cacheSet(`pole_submitted_${params.from_pole_id}`, true).catch(() => {});
+          if (params.node_id && params.to_pole_id) {
+            const clearedAt = getPHTNow();
+            api.put(
+              `/skycable/nodes/${params.node_id}/poles/${params.to_pole_id}`,
+              { cleared_at: clearedAt, skycable_status: "cleared" }
+            ).catch(() => {});
+            cacheGet<any[]>(`sitemap_poles_${params.node_id}`).then(cached => {
+              if (!cached?.length) return;
+              const updated = cached.map(p =>
+                String(p.pole_id) === String(params.to_pole_id)
+                  ? { ...p, cleared_at: clearedAt, pole: { ...p.pole, skycable_status: "cleared" } }
+                  : p
+              );
+              cacheSet(`sitemap_poles_${params.node_id}`, updated).catch(() => {});
+            }).catch(() => {});
+          }
           return;
         }
 
@@ -2733,12 +2770,17 @@ const styles = StyleSheet.create({
 
   counterCard: {
     flex: 1,
-    backgroundColor: "#F8FAFF",
-    borderRadius: 18,
-    padding: 14,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    padding: 16,
     alignItems: "center",
     borderWidth: 1,
-    borderColor: "#E8ECF5",
+    borderColor: "#F1F5F9",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 20,
+    elevation: 3,
   },
 
   counterLabel: {
@@ -3292,15 +3334,15 @@ const styles = StyleSheet.create({
 
   summaryCard: {
     backgroundColor: "#FFFFFF",
-    borderRadius: 20,
+    borderRadius: 24,
     padding: 16,
-    marginBottom: 14,
+    marginBottom: 16,
     borderWidth: 1,
-    borderColor: "#E9EDF2",
+    borderColor: "#F1F5F9",
     shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.05,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 4 },
+    shadowRadius: 20,
     elevation: 3,
   },
 

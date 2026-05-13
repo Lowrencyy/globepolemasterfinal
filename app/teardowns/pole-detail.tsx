@@ -24,6 +24,7 @@ import {
   Alert,
   Animated,
   Easing,
+  Image,
   Modal,
   Pressable,
   ScrollView,
@@ -554,19 +555,26 @@ export default function PoleDetailScreen() {
   const [viewerPhoto, setViewerPhoto] = useState<PhotoField>(null);
   const [viewerRetake, setViewerRetake] = useState<(() => void) | null>(null);
 
-  // Work timer
-  const timerStartRef = useRef(Date.now());
+  // ── Teardown gate ──────────────────────────────────────────────────────────
+  const teardownStartedKey = `teardown_started_${pole_id}`;
+  const [teardownStarted, setTeardownStarted] = useState(false);
+  const [teardownStartedAt, setTeardownStartedAt] = useState<string>("");
+
+  // Work timer — only counts after Start Teardown is pressed
+  const timerStartRef = useRef<number | null>(null);
   const blurCheckRef = useRef<WebView>(null);
   const blurResolverRef = useRef<((variance: number) => void) | null>(null);
   const stampRef = useRef<WebView>(null);
   const stampResolverRef = useRef<((b64: string | null) => void) | null>(null);
   const [elapsedSecs, setElapsedSecs] = useState(0);
   useEffect(() => {
+    if (!teardownStarted || timerStartRef.current === null) return;
+    const startTime = timerStartRef.current;
     const id = setInterval(() => {
-      setElapsedSecs(Math.floor((Date.now() - timerStartRef.current) / 1000));
+      setElapsedSecs(Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [teardownStarted]);
 
   // Draft recovery
   const [draftRestored, setDraftRestored] = useState(false);
@@ -651,6 +659,18 @@ export default function PoleDetailScreen() {
   }, [poleSlots, pole_id]);
 
   useEffect(() => {
+    // Restore teardown started state
+    cacheGet<{ startedAt: string }>(teardownStartedKey).then(v => {
+      if (v?.startedAt) {
+        setTeardownStarted(true);
+        setTeardownStartedAt(v.startedAt);
+        // Restore elapsed time
+        const elapsed = Math.floor((Date.now() - new Date(v.startedAt).getTime()) / 1000);
+        setElapsedSecs(elapsed);
+        timerStartRef.current = new Date(v.startedAt).getTime();
+      }
+    }).catch(() => {});
+
     cacheGet<GpsDraft>(gpsDraftKey)
       .then(async (cached) => {
         if (cached?.lat && cached?.lng) {
@@ -666,6 +686,18 @@ export default function PoleDetailScreen() {
             lng: queued.lng,
             capturedAt: "",
           });
+          return;
+        }
+
+        // Pre-seed from the poles list cache so the map shows immediately
+        // without waiting for the /poles/:id API response
+        if (node_id) {
+          const polesList = await cacheGet<any[]>(`sitemap_poles_${node_id}`).catch(() => null);
+          const match = polesList?.find((p) => String(p.pole_id) === String(pole_id));
+          if (match?.pole?.lat && match?.pole?.lng) {
+            setLat(parseFloat(match.pole.lat));
+            setLng(parseFloat(match.pole.lng));
+          }
         }
       })
       .catch(() => {});
@@ -1159,6 +1191,28 @@ export default function PoleDetailScreen() {
       setGpsDraftState(draft);
       await cacheSet(gpsDraftKey, draft).catch(() => {});
 
+      // Update the parent poles list cache so the map appears instantly
+      if (node_id && pole_id) {
+        const listCacheKey = `sitemap_poles_${node_id}`;
+        const listCache = await cacheGet<any[]>(listCacheKey);
+        if (listCache) {
+          const updatedList = listCache.map((p) => {
+            if (String(p.pole_id) === String(pole_id) && p.pole) {
+              return {
+                ...p,
+                pole: {
+                  ...p.pole,
+                  lat: draft.lat.toFixed(6),
+                  lng: draft.lng.toFixed(6),
+                },
+              };
+            }
+            return p;
+          });
+          await cacheSet(listCacheKey, updatedList).catch(() => {});
+        }
+      }
+
       // GPS stored locally — will be sent with the teardown submission
       Alert.alert(
         "GPS Captured",
@@ -1610,7 +1664,8 @@ export default function PoleDetailScreen() {
             />
           </View>
 
-          <View style={styles.sectionCard}>
+          <View style={[styles.sectionCard, !teardownStarted && styles.lockedSection]}>
+            {!teardownStarted && <View style={StyleSheet.absoluteFillObject} pointerEvents="box-only" />}
             <SectionHeading
               title="GPS Location"
               right={
@@ -1681,7 +1736,15 @@ export default function PoleDetailScreen() {
                   </Text>
                 </View>
               </TouchableOpacity>
-            ) : null}
+            ) : (
+              <View style={styles.noGpsPlaceholder}>
+                <Image
+                  source={require("../../assets/images/logo.png")}
+                  style={styles.noGpsLogo}
+                  resizeMode="contain"
+                />
+              </View>
+            )}
 
             <Pressable
               style={({ pressed }) => [
@@ -2963,8 +3026,23 @@ const styles = StyleSheet.create({
     color: "#667085",
   },
 
+  noGpsPlaceholder: {
+    height: 180,
+    backgroundColor: "#F3F4F6",
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 8,
+    marginBottom: 16,
+  },
+  noGpsLogo: {
+    width: "40%",
+    height: "40%",
+    opacity: 0.15,
+  },
+
   gpsMapBox: {
-    height: 260,
+    height: 200,
     borderRadius: 20,
     overflow: "hidden",
     marginBottom: 12,
@@ -3193,11 +3271,16 @@ const styles = StyleSheet.create({
 
   photoTileCard: {
     flex: 1,
-    borderRadius: 16,
-    borderWidth: 1.5,
-    borderColor: "#E8ECF0",
-    overflow: "hidden",
     backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: "#F1F5F9",
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 20,
+    elevation: 3,
   },
 
   photoTileImgWrap: {
@@ -4124,11 +4207,17 @@ const styles = StyleSheet.create({
   },
 
   prSlotCard: {
-    borderRadius: 14,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 24,
     borderWidth: 1,
-    borderColor: "#E5E7EB",
+    borderColor: "#F1F5F9",
     overflow: "hidden",
     marginTop: 10,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 20,
+    elevation: 3,
   },
   prSlotHeader: {
     flexDirection: "row",
@@ -4288,17 +4377,27 @@ const styles = StyleSheet.create({
   prModalCard: {
     width: "100%",
     backgroundColor: "#FFFFFF",
-    borderRadius: 20,
-    padding: 20,
+    borderRadius: 28,
+    padding: 24,
     maxWidth: 380,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.06,
+    shadowRadius: 18,
+    elevation: 4,
   },
   prPickerCard: {
     width: "100%",
     backgroundColor: "#FFFFFF",
-    borderRadius: 20,
-    paddingVertical: 8,
+    borderRadius: 28,
+    paddingVertical: 12,
     maxWidth: 340,
     maxHeight: 420,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.06,
+    shadowRadius: 18,
+    elevation: 4,
   },
   prModalTitle: {
     fontSize: 16,

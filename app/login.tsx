@@ -1,4 +1,4 @@
-import { Redirect } from "expo-router";
+import { Redirect, router } from "expo-router";
 import { useState } from "react";
 import { useAuth } from "@/context/auth-context";
 import {
@@ -7,13 +7,13 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 const LOGO = require("@/assets/images/logo.png");
 
@@ -21,8 +21,9 @@ export default function LoginScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
-  const { login, isLoggedIn } = useAuth();
+  const { login, isLoggedIn, mustChangePassword } = useAuth();
 
+  if (isLoggedIn && mustChangePassword) return <Redirect href="/change-password" />;
   if (isLoggedIn) return <Redirect href="/(tabs)" />;
 
   const handleLogin = async () => {
@@ -33,7 +34,10 @@ export default function LoginScreen() {
 
     setLoading(true);
     try {
-      await login(email.trim(), password);
+      const result = await login(email.trim(), password);
+      if (result.mustChangePassword) {
+        router.replace("/change-password");
+      }
     } catch (err: any) {
       Alert.alert("Login Failed", err.message || "Something went wrong.");
     } finally {

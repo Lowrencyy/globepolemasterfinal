@@ -25,12 +25,12 @@ export type LoginResponse = {
 };
 
 export function loginGlobe(email: string, password: string) {
-  return api.request<LoginResponse>("/globe/auth/login", {
+  return api.request<LoginResponse>("/skycable/auth/login", {
     method: "POST",
     body: JSON.stringify({ email, password }),
   });
 }
 
 export function logoutGlobe(token: string) {
-  return api.request<void>("/globe/auth/logout", { method: "POST" }, token);
+  return api.request<void>("/skycable/auth/logout", { method: "POST" }, token);
 }

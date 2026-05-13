@@ -1,365 +1,1143 @@
-import React, { useCallback, useMemo, useState } from "react";
+import api from "@/lib/api";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import {
-  View, Text, StyleSheet, FlatList, RefreshControl,
-  TouchableOpacity, ActivityIndicator, Modal, Pressable, ScrollView,
+  Cable,
+  ChevronLeft,
+  Cpu,
+  Route
+} from "lucide-react-native";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  FlatList,
+  Image,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
-import { ChevronLeft, Cable, Box, User, X, AlertCircle, RefreshCw } from "lucide-react-native";
-import api from "@/lib/api";
 
-const GREEN  = "#0A5C3B";
-const INDIGO = "#6366F1";
-const SLATE  = "#0F172A";
-const MUTED  = "#64748B";
-const BORDER = "#F1F5F9";
+const GREEN = "#0B7A5A";
+const GREEN_LIGHT = "#ECFDF3";
+const BLUE = "#6366F1";
+const ORANGE = "#F59E0B";
+const SLATE = "#111827";
+const MUTED = "#667085";
+const BORDER = "#E7ECF2";
 
-type TeardownLog = {
+const CACHE_PREFIX = "daily_report_preview_";
+
+const USE_FAKE_DATA = true;
+
+const FAKE_DATE = "2026-05-12";
+
+const TILE_PX = 256;
+
+function latLngToTileFrac(lat: number, lng: number, z: number) {
+  const n = Math.pow(2, z);
+  const xFrac = ((lng + 180) / 360) * n;
+  const latRad = (lat * Math.PI) / 180;
+  const yFrac =
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
+  return { xFrac, yFrac, tileX: Math.floor(xFrac), tileY: Math.floor(yFrac) };
+}
+
+function getDistanceMeters(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+) {
+  const R = 6371e3;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dp = ((lat2 - lat1) * Math.PI) / 180;
+  const dl = ((lon2 - lon1) * Math.PI) / 180;
+
+  const a =
+    Math.sin(dp / 2) * Math.sin(dp / 2) +
+    Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return Math.round(R * c);
+}
+
+export function SpanVicinityMap({
+  fromLat,
+  fromLng,
+  toLat,
+  toLng,
+  fromCode,
+  toCode,
+  nodeName,
+}: {
+  fromLat?: number;
+  fromLng?: number;
+  toLat?: number;
+  toLng?: number;
+  fromCode: string;
+  toCode: string;
+  nodeName?: string;
+}) {
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+
+  const validFrom =
+    typeof fromLat === "number" && typeof fromLng === "number" && !isNaN(fromLat);
+  const validTo =
+    typeof toLat === "number" && typeof toLng === "number" && !isNaN(toLat);
+
+  const pFrom = validFrom ? { lat: fromLat, lng: fromLng } : null;
+  const pTo = validTo ? { lat: toLat, lng: toLng } : null;
+
+  const pts: { lat: number; lng: number }[] = [];
+  if (pFrom) pts.push(pFrom);
+  if (pTo) pts.push(pTo);
+  if (pts.length === 0) {
+    pts.push({ lat: 14.5995, lng: 120.9842 });
+  }
+
+  const minLat = Math.min(...pts.map((p) => p.lat));
+  const maxLat = Math.max(...pts.map((p) => p.lat));
+  const minLng = Math.min(...pts.map((p) => p.lng));
+  const maxLng = Math.max(...pts.map((p) => p.lng));
+
+  const centerLat = (minLat + maxLat) / 2;
+  const centerLng = (minLng + maxLng) / 2;
+
+  const w = size?.w ?? 320;
+  const h = size?.h ?? 190;
+
+  const latSpan = Math.max(maxLat - minLat, 0.0005);
+  const lngSpan = Math.max(maxLng - minLng, 0.0005);
+
+  const zLng = Math.log2((w * 0.45 * 360) / (TILE_PX * lngSpan));
+  const zLat = Math.log2((h * 0.45 * 180) / (TILE_PX * latSpan));
+  const baseZoom = Math.floor(Math.min(zLng, zLat));
+  const zoom = Math.max(15, Math.min(19, baseZoom + 1));
+
+  const { xFrac, yFrac, tileX, tileY } = latLngToTileFrac(
+    centerLat,
+    centerLng,
+    zoom
+  );
+  const fracX = xFrac - tileX;
+  const fracY = yFrac - tileY;
+
+  const tileBase = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${tileY}`;
+
+  const scale = size ? Math.max(size.w / TILE_PX, size.h / TILE_PX) : 1;
+  const imgW = TILE_PX * scale;
+  const imgH = TILE_PX * scale;
+  const offsetX = size ? size.w / 2 - fracX * imgW : 0;
+  const offsetY = size ? size.h / 2 - fracY * imgH : 0;
+
+  let startX = 0,
+    startY = 0,
+    endX = 0,
+    endY = 0;
+  if (size && pFrom) {
+    const pf = latLngToTileFrac(pFrom.lat, pFrom.lng, zoom);
+    startX = offsetX + (pf.xFrac - tileX) * imgW;
+    startY = offsetY + (pf.yFrac - tileY) * imgH;
+  }
+  if (size && pTo) {
+    const pt = latLngToTileFrac(pTo.lat, pTo.lng, zoom);
+    endX = offsetX + (pt.xFrac - tileX) * imgW;
+    endY = offsetY + (pt.yFrac - tileY) * imgH;
+  }
+
+  const spanLengthMeters =
+    pFrom && pTo
+      ? getDistanceMeters(pFrom.lat, pFrom.lng, pTo.lat, pTo.lng)
+      : 0;
+
+  return (
+    <View
+      style={{
+        height: 190,
+        borderRadius: 22,
+        overflow: "hidden",
+        backgroundColor: "#1E293B",
+        position: "relative",
+      }}
+      onLayout={(e) =>
+        setSize({
+          w: e.nativeEvent.layout.width,
+          h: e.nativeEvent.layout.height,
+        })
+      }
+    >
+      <Image
+        source={{ uri: `${tileBase}/${tileX - 1}` }}
+        style={{
+          position: "absolute",
+          left: offsetX - imgW,
+          top: offsetY,
+          width: imgW,
+          height: imgH,
+        }}
+        resizeMode="cover"
+      />
+      <Image
+        source={{ uri: `${tileBase}/${tileX}` }}
+        style={{
+          position: "absolute",
+          left: offsetX,
+          top: offsetY,
+          width: imgW,
+          height: imgH,
+        }}
+        resizeMode="cover"
+      />
+      <Image
+        source={{ uri: `${tileBase}/${tileX + 1}` }}
+        style={{
+          position: "absolute",
+          left: offsetX + imgW,
+          top: offsetY,
+          width: imgW,
+          height: imgH,
+        }}
+        resizeMode="cover"
+      />
+
+      <View
+        style={{
+          ...StyleSheet.absoluteFillObject,
+          backgroundColor: "rgba(15, 23, 42, 0.35)",
+        }}
+      />
+
+      {size && pFrom && pTo && (() => {
+        const dx = endX - startX;
+        const dy = endY - startY;
+        const length = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+        const midX = startX + dx / 2;
+        const midY = startY + dy / 2;
+
+        return (
+          <View
+            style={{
+              position: "absolute",
+              left: midX - length / 2,
+              top: midY - 1.5,
+              width: length,
+              height: 3,
+              backgroundColor: "#38BDF8",
+              transform: [{ rotate: `${angle}deg` }],
+              shadowColor: "#000",
+              shadowOffset: { width: 0, height: 1 },
+              shadowOpacity: 0.8,
+              shadowRadius: 2,
+            }}
+          />
+        );
+      })()}
+
+      {size && pFrom && (
+        <View
+          style={{
+            position: "absolute",
+            left: startX - 8,
+            top: startY - 8,
+            alignItems: "center",
+          }}
+        >
+          <View
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: 8,
+              backgroundColor: GREEN,
+              borderWidth: 2,
+              borderColor: "#FFFFFF",
+              shadowColor: "#000",
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.5,
+              shadowRadius: 4,
+            }}
+          />
+          <View
+            style={{
+              backgroundColor: GREEN,
+              paddingHorizontal: 6,
+              paddingVertical: 2,
+              borderRadius: 6,
+              marginTop: 3,
+            }}
+          >
+            <Text style={{ fontSize: 9, fontWeight: "900", color: "#FFFFFF" }}>
+              {fromCode}
+            </Text>
+          </View>
+        </View>
+      )}
+
+      {size && pTo && (
+        <View
+          style={{
+            position: "absolute",
+            left: endX - 8,
+            top: endY - 8,
+            alignItems: "center",
+          }}
+        >
+          <View
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: 8,
+              backgroundColor: ORANGE,
+              borderWidth: 2,
+              borderColor: "#FFFFFF",
+              shadowColor: "#000",
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.5,
+              shadowRadius: 4,
+            }}
+          />
+          <View
+            style={{
+              backgroundColor: ORANGE,
+              paddingHorizontal: 6,
+              paddingVertical: 2,
+              borderRadius: 6,
+              marginTop: 3,
+            }}
+          >
+            <Text style={{ fontSize: 9, fontWeight: "900", color: "#FFFFFF" }}>
+              {toCode}
+            </Text>
+          </View>
+        </View>
+      )}
+
+      <View
+        style={{
+          position: "absolute",
+          bottom: 12,
+          left: 12,
+          right: 12,
+          flexDirection: "row",
+          justifyContent: "space-between",
+          alignItems: "center",
+          backgroundColor: "rgba(255, 255, 255, 0.92)",
+          paddingHorizontal: 12,
+          paddingVertical: 8,
+          borderRadius: 14,
+        }}
+      >
+        <View style={{ flex: 1, paddingRight: 8 }}>
+          <Text style={{ fontSize: 13, fontWeight: "900", color: SLATE }}>
+            {fromCode} → {toCode}
+          </Text>
+          {nodeName ? (
+            <Text style={{ fontSize: 10, fontWeight: "600", color: MUTED, marginTop: 1 }} numberOfLines={1}>
+              {nodeName}
+            </Text>
+          ) : null}
+        </View>
+        <View style={{ backgroundColor: "#EFF6FF", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8, alignItems: "flex-end" }}>
+          <Text style={{ fontSize: 9, fontWeight: "800", color: "#2563EB" }}>MAP PREVIEW</Text>
+          {spanLengthMeters > 0 ? (
+            <Text style={{ fontSize: 10, fontWeight: "900", color: "#1D4ED8", marginTop: 1 }}>
+              ~{spanLengthMeters}m span
+            </Text>
+          ) : null}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+export type TeardownLog = {
   id: number;
   status: string;
   actual_cable: number | null;
   expected_cable: number | null;
+
   nodes_collected: number;
   amplifiers_collected: number;
   extenders_collected: number;
   tsc_collected: number;
+
   powersupply_collected: number;
   ps_housing_collected: number;
+
   start_time: string;
   end_time: string | null;
-  captured_lat: number | string | null;
-  captured_lng: number | string | null;
-  span: {
+
+  captured_lat?: number;
+  captured_lng?: number;
+
+  from_lat?: number;
+  from_lng?: number;
+
+  to_lat?: number;
+  to_lng?: number;
+
+  span?: {
     id: number;
-    fromPole?: { pole?: { pole_code: string } };
-    toPole?:   { pole?: { pole_code: string } };
-    node?: { name: string };
-  } | null;
-  team: { name: string } | null;
-  lineman: { id: number; name?: string; first_name?: string; last_name?: string } | null;
+
+    fromPole?: {
+      pole?: {
+        pole_code?: string;
+      };
+    };
+
+    toPole?: {
+      pole?: {
+        pole_code?: string;
+      };
+    };
+
+    node?: {
+      name?: string;
+    };
+  };
+
+  team?: {
+    name?: string;
+  };
+
+  lineman?: {
+    id?: number;
+    first_name?: string;
+    last_name?: string;
+  };
 };
 
-function fmtTime(iso: string) {
-  return new Date(iso).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit", hour12: true });
-}
+export const FAKE_LOGS: TeardownLog[] = [
+  {
+    id: 1,
+    status: "submitted",
+    actual_cable: 120,
+    expected_cable: 150,
 
-function fmtDate(iso: string) {
-  return new Date(iso).toLocaleString("en-PH", {
-    month: "short", day: "numeric", year: "numeric",
-    hour: "2-digit", minute: "2-digit", hour12: true,
+    nodes_collected: 2,
+    amplifiers_collected: 1,
+    extenders_collected: 0,
+    tsc_collected: 1,
+
+    powersupply_collected: 0,
+    ps_housing_collected: 0,
+
+    start_time: "2026-05-12T08:30:00",
+    end_time: "2026-05-12T10:15:00",
+
+    from_lat: 14.599512,
+    from_lng: 120.984222,
+
+    to_lat: 14.599882,
+    to_lng: 120.984612,
+
+    span: {
+      id: 101,
+
+      fromPole: {
+        pole: {
+          pole_code: "P-001",
+        },
+      },
+
+      toPole: {
+        pole: {
+          pole_code: "P-002",
+        },
+      },
+
+      node: {
+        name: "Node Manila A",
+      },
+    },
+
+    team: {
+      name: "Team Alpha",
+    },
+
+    lineman: {
+      first_name: "Juan",
+      last_name: "Dela Cruz",
+    },
+  },
+
+  {
+    id: 2,
+    status: "backend_approved",
+    actual_cable: 85,
+    expected_cable: 100,
+
+    nodes_collected: 1,
+    amplifiers_collected: 0,
+    extenders_collected: 2,
+    tsc_collected: 0,
+
+    powersupply_collected: 1,
+    ps_housing_collected: 0,
+
+    start_time: "2026-05-12T11:00:00",
+    end_time: "2026-05-12T12:20:00",
+
+    from_lat: 14.60012,
+    from_lng: 120.98501,
+
+    to_lat: 14.60046,
+    to_lng: 120.98539,
+
+    span: {
+      id: 102,
+
+      fromPole: {
+        pole: {
+          pole_code: "P-003",
+        },
+      },
+
+      toPole: {
+        pole: {
+          pole_code: "P-004",
+        },
+      },
+
+      node: {
+        name: "Node Manila B",
+      },
+    },
+
+    team: {
+      name: "Team Alpha",
+    },
+
+    lineman: {
+      first_name: "Mark",
+      last_name: "Santos",
+    },
+  },
+
+  {
+    id: 3,
+    status: "pending",
+    actual_cable: 60,
+    expected_cable: 80,
+
+    nodes_collected: 0,
+    amplifiers_collected: 1,
+    extenders_collected: 1,
+    tsc_collected: 0,
+
+    powersupply_collected: 0,
+    ps_housing_collected: 1,
+
+    start_time: "2026-05-12T13:10:00",
+    end_time: "2026-05-12T14:05:00",
+
+    from_lat: 14.60102,
+    from_lng: 120.9861,
+
+    to_lat: 14.60139,
+    to_lng: 120.98647,
+
+    span: {
+      id: 103,
+
+      fromPole: {
+        pole: {
+          pole_code: "P-005",
+        },
+      },
+
+      toPole: {
+        pole: {
+          pole_code: "P-006",
+        },
+      },
+
+      node: {
+        name: "Node Manila C",
+      },
+    },
+
+    team: {
+      name: "Team Bravo",
+    },
+
+    lineman: {
+      first_name: "Carlo",
+      last_name: "Reyes",
+    },
+  },
+];
+
+function formatTime(time?: string | null) {
+  if (!time) return "--";
+
+  return new Date(time).toLocaleTimeString("en-PH", {
+    hour: "numeric",
+    minute: "2-digit",
   });
 }
 
-function fmtDay(dateStr: string) {
-  return new Date(dateStr + "T00:00:00").toLocaleDateString("en-PH", {
-    weekday: "long", month: "long", day: "numeric", year: "numeric",
-  });
-}
-
-function fromCode(log: TeardownLog) { return log.span?.fromPole?.pole?.pole_code ?? "—"; }
-function toCode(log: TeardownLog)   { return log.span?.toPole?.pole?.pole_code   ?? "—"; }
-function linemanName(log: TeardownLog) {
-  if (!log.lineman) return "—";
-  const full = `${log.lineman.first_name ?? ""} ${log.lineman.last_name ?? ""}`.trim();
-  return log.lineman.name ?? (full || "—");
-}
-
-const STATUS_COLOR: Record<string, string> = {
-  submitted: "#3B82F6", subcon_approved: "#10B981",
-  backend_approved: "#16A34A", rejected: "#EF4444", pending: "#F59E0B",
-};
-const STATUS_LABEL: Record<string, string> = {
-  submitted: "Submitted", subcon_approved: "Sub-con Approved",
-  backend_approved: "Approved", rejected: "Rejected", pending: "Pending",
-};
-
-function StatusBadge({ status }: { status: string }) {
-  const color = STATUS_COLOR[status] ?? "#94A3B8";
-  return (
-    <View style={[sb.badge, { backgroundColor: color + "18", borderColor: color + "40" }]}>
-      <View style={[sb.dot, { backgroundColor: color }]} />
-      <Text style={[sb.lbl, { color }]}>{STATUS_LABEL[status] ?? status}</Text>
-    </View>
-  );
-}
-const sb = StyleSheet.create({
-  badge: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 100, borderWidth: 1 },
-  dot:   { width: 5, height: 5, borderRadius: 3, marginRight: 5 },
-  lbl:   { fontSize: 11, fontWeight: "700" },
-});
-
-// ── Detail Modal ─────────────────────────────────────────────────────────
-
-function DetailModal({ log, visible, onClose }: { log: TeardownLog | null; visible: boolean; onClose: () => void }) {
-  if (!log) return null;
-  const components = [
-    { label: "Nodes",        count: log.nodes_collected },
-    { label: "Amplifiers",   count: log.amplifiers_collected },
-    { label: "Extenders",    count: log.extenders_collected },
-    { label: "TSC",          count: log.tsc_collected },
-    { label: "Power Supply", count: log.powersupply_collected },
-    { label: "PS Housing",   count: log.ps_housing_collected },
-  ].filter(c => (c.count ?? 0) > 0);
-
-  return (
-    <Modal visible={visible} animationType="slide" transparent presentationStyle="overFullScreen">
-      <View style={dm.overlay}>
-        <View style={dm.sheet}>
-          <View style={dm.handle} />
-          <View style={dm.headerRow}>
-            <View>
-              <Text style={dm.codes}>
-                <Text style={{ color: GREEN }}>{fromCode(log)}</Text>
-                <Text style={{ color: MUTED }}> → </Text>
-                <Text style={{ color: INDIGO }}>{toCode(log)}</Text>
-              </Text>
-              <Text style={dm.sub}>{log.span?.node?.name ?? "—"}</Text>
-            </View>
-            <Pressable style={dm.closeBtn} onPress={onClose}>
-              <X size={20} color={MUTED} />
-            </Pressable>
-          </View>
-          <ScrollView contentContainerStyle={dm.body} showsVerticalScrollIndicator={false}>
-            <View style={{ marginBottom: 16 }}><StatusBadge status={log.status} /></View>
-            <View style={dm.card}>
-              <Text style={dm.cardTitle}>CABLE</Text>
-              <View style={{ flexDirection: "row", gap: 16 }}>
-                <View><Text style={dm.kvLabel}>Collected</Text><Text style={[dm.kvVal, { color: GREEN }]}>{log.actual_cable ?? 0}m</Text></View>
-                <View><Text style={dm.kvLabel}>Expected</Text><Text style={dm.kvVal}>{log.expected_cable ?? 0}m</Text></View>
-              </View>
-            </View>
-            {components.length > 0 && (
-              <View style={dm.card}>
-                <Text style={dm.cardTitle}>COMPONENTS</Text>
-                <View style={dm.compGrid}>
-                  {components.map(c => (
-                    <View key={c.label} style={dm.compChip}>
-                      <Text style={dm.compNum}>{c.count}</Text>
-                      <Text style={dm.compLbl}>{c.label}</Text>
-                    </View>
-                  ))}
-                </View>
-              </View>
-            )}
-            <View style={dm.card}>
-              <Text style={dm.cardTitle}>TIMELINE</Text>
-              <View><Text style={dm.kvLabel}>Started</Text><Text style={dm.kvVal}>{fmtDate(log.start_time)}</Text></View>
-              {log.end_time && <View style={{ marginTop: 8 }}><Text style={dm.kvLabel}>Completed</Text><Text style={dm.kvVal}>{fmtDate(log.end_time)}</Text></View>}
-            </View>
-            <View style={dm.card}>
-              <Text style={dm.cardTitle}>SUBMITTED BY</Text>
-              <Text style={dm.bigName}>{linemanName(log)}</Text>
-              {log.team && <Text style={dm.teamLbl}>{log.team.name}</Text>}
-            </View>
-            {log.captured_lat && log.captured_lng && (
-              <View style={dm.card}>
-                <Text style={dm.cardTitle}>GPS LOCATION</Text>
-                <Text style={dm.kvVal}>{Number(log.captured_lat).toFixed(6)}, {Number(log.captured_lng).toFixed(6)}</Text>
-              </View>
-            )}
-          </ScrollView>
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
-const dm = StyleSheet.create({
-  overlay:   { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(15,23,42,0.55)" },
-  sheet:     { backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingTop: 12, maxHeight: "85%" },
-  handle:    { width: 40, height: 4, borderRadius: 2, backgroundColor: "#E2E8F0", alignSelf: "center", marginBottom: 16 },
-  headerRow: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", paddingHorizontal: 20, marginBottom: 4 },
-  codes:     { fontSize: 20, fontWeight: "900" },
-  sub:       { fontSize: 13, color: MUTED, fontWeight: "500", marginTop: 4 },
-  closeBtn:  { padding: 4 },
-  body:      { padding: 20, paddingBottom: 40 },
-  card:      { backgroundColor: "#F8FAFC", borderRadius: 16, padding: 16, borderWidth: 1, borderColor: BORDER, marginBottom: 12 },
-  cardTitle: { fontSize: 10, fontWeight: "800", color: MUTED, letterSpacing: 1, marginBottom: 12, textTransform: "uppercase" },
-  kvLabel:   { fontSize: 11, color: MUTED, fontWeight: "600", marginBottom: 2 },
-  kvVal:     { fontSize: 15, fontWeight: "800", color: SLATE },
-  compGrid:  { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  compChip:  { backgroundColor: "#fff", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: BORDER, alignItems: "center" },
-  compNum:   { fontSize: 18, fontWeight: "900", color: INDIGO },
-  compLbl:   { fontSize: 10, fontWeight: "600", color: MUTED, marginTop: 2 },
-  bigName:   { fontSize: 18, fontWeight: "800", color: SLATE },
-  teamLbl:   { fontSize: 13, color: MUTED, fontWeight: "500", marginTop: 4 },
-});
-
-// ── Log Card ──────────────────────────────────────────────────────────────
-
-function LogCard({ log, onPress }: { log: TeardownLog; onPress: () => void }) {
-  const cable = log.actual_cable ?? 0;
-  const totalComponents = (log.nodes_collected ?? 0) + (log.amplifiers_collected ?? 0) +
-    (log.extenders_collected ?? 0) + (log.tsc_collected ?? 0) +
-    (log.powersupply_collected ?? 0) + (log.ps_housing_collected ?? 0);
-
-  return (
-    <TouchableOpacity style={lc.card} activeOpacity={0.75} onPress={onPress}>
-      <View style={lc.topRow}>
-        <View style={lc.timeBox}>
-          <Text style={lc.time}>{log.end_time ? fmtTime(log.end_time) : fmtTime(log.start_time)}</Text>
-        </View>
-        <View style={lc.codes}>
-          <Text style={lc.fromCode}>{fromCode(log)}</Text>
-          <Text style={lc.arrow}> → </Text>
-          <Text style={lc.toCode}>{toCode(log)}</Text>
-        </View>
-        <StatusBadge status={log.status} />
-      </View>
-      {log.span?.node?.name && <Text style={lc.node}>{log.span.node.name}</Text>}
-      <View style={lc.statsRow}>
-        <View style={lc.stat}><Cable size={12} color={GREEN} /><Text style={lc.statVal}>{cable}m</Text></View>
-        {totalComponents > 0 && <View style={lc.stat}><Box size={12} color={INDIGO} /><Text style={[lc.statVal, { color: INDIGO }]}>{totalComponents} items</Text></View>}
-        <View style={lc.stat}><User size={12} color={MUTED} /><Text style={lc.statMuted} numberOfLines={1}>{linemanName(log)}</Text></View>
-      </View>
-    </TouchableOpacity>
-  );
-}
-
-const lc = StyleSheet.create({
-  card:     { backgroundColor: "#fff", borderRadius: 18, padding: 16, marginBottom: 10, borderWidth: 1, borderColor: BORDER, shadowColor: SLATE, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.04, shadowRadius: 8, elevation: 2 },
-  topRow:   { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 6 },
-  timeBox:  { backgroundColor: "#F8FAFC", borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: BORDER },
-  time:     { fontSize: 11, fontWeight: "700", color: MUTED },
-  codes:    { flex: 1, flexDirection: "row", alignItems: "center" },
-  fromCode: { fontSize: 14, fontWeight: "800", color: GREEN },
-  arrow:    { fontSize: 12, color: MUTED },
-  toCode:   { fontSize: 14, fontWeight: "800", color: INDIGO },
-  node:     { fontSize: 12, color: MUTED, fontWeight: "500", marginBottom: 8 },
-  statsRow: { flexDirection: "row", gap: 14, flexWrap: "wrap" },
-  stat:     { flexDirection: "row", alignItems: "center", gap: 4 },
-  statVal:  { fontSize: 12, fontWeight: "700", color: SLATE },
-  statMuted:{ fontSize: 12, color: MUTED, fontWeight: "500" },
-});
-
-// ── Main Screen ───────────────────────────────────────────────────────────
-
-export default function DailyLogsScreen() {
+export default function DailyReportPreviewScreen() {
   const router = useRouter();
-  const { date } = useLocalSearchParams<{ date: string }>();
 
-  const [allLogs,    setAllLogs]    = useState<TeardownLog[]>([]);
-  const [loading,    setLoading]    = useState(true);
+  const params = useLocalSearchParams<{
+    date: string;
+  }>();
+
+  const date = USE_FAKE_DATA ? FAKE_DATE : params.date;
+
+  const [allLogs, setAllLogs] = useState<TeardownLog[]>(
+    USE_FAKE_DATA ? FAKE_LOGS : [],
+  );
+
+  const [loading, setLoading] = useState(!USE_FAKE_DATA);
+
   const [refreshing, setRefreshing] = useState(false);
-  const [error,      setError]      = useState<string | null>(null);
-  const [selected,   setSelected]   = useState<TeardownLog | null>(null);
+
+  const [backgroundSyncing, setBackgroundSyncing] = useState(false);
 
   const fetchLogs = useCallback(async () => {
+    if (USE_FAKE_DATA) {
+      setAllLogs(FAKE_LOGS);
+
+      setLoading(false);
+      setRefreshing(false);
+      setBackgroundSyncing(false);
+
+      return;
+    }
+
     try {
-      setError(null);
-      const { data } = await api.get(`/skycable/teardowns?per_page=500&date=${date}`);
-      setAllLogs(data?.data ?? data ?? []);
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to load.");
+      const cacheKey = `${CACHE_PREFIX}${date}`;
+
+      const cache = await AsyncStorage.getItem(cacheKey);
+
+      if (cache) {
+        setAllLogs(JSON.parse(cache));
+        setLoading(false);
+      }
+
+      setBackgroundSyncing(true);
+
+      const { data } = await api.get(`/skycable/teardowns?date=${date}`);
+
+      const items = data?.data ?? data ?? [];
+
+      setAllLogs(items);
+
+      await AsyncStorage.setItem(cacheKey, JSON.stringify(items));
+    } catch (e) {
+      console.log(e);
     } finally {
       setLoading(false);
       setRefreshing(false);
+      setBackgroundSyncing(false);
     }
   }, [date]);
 
-  useFocusEffect(useCallback(() => {
-    setLoading(true);
+  useEffect(() => {
     fetchLogs();
-  }, [fetchLogs]));
+  }, [fetchLogs]);
 
-  // Filter client-side by date as well (backend might not support date filter)
-  const logs = useMemo(() =>
-    allLogs.filter(l => (l.end_time ?? l.start_time).slice(0, 10) === date),
-    [allLogs, date]);
+  const totalCable = useMemo(() => {
+    return allLogs.reduce((sum, log) => sum + (log.actual_cable ?? 0), 0);
+  }, [allLogs]);
 
-  const totalCable = logs.reduce((s, l) => s + (l.actual_cable ?? 0), 0);
-  const totalComponents = logs.reduce((s, l) =>
-    s + (l.nodes_collected ?? 0) + (l.amplifiers_collected ?? 0) +
-    (l.extenders_collected ?? 0) + (l.tsc_collected ?? 0) +
-    (l.powersupply_collected ?? 0) + (l.ps_housing_collected ?? 0), 0);
+  const totalNodes = useMemo(() => {
+    return allLogs.reduce((sum, log) => sum + (log.nodes_collected ?? 0), 0);
+  }, [allLogs]);
+
+  const totalAmplifiers = useMemo(() => {
+    return allLogs.reduce(
+      (sum, log) => sum + (log.amplifiers_collected ?? 0),
+      0,
+    );
+  }, [allLogs]);
+
+  const totalExtenders = useMemo(() => {
+    return allLogs.reduce(
+      (sum, log) => sum + (log.extenders_collected ?? 0),
+      0,
+    );
+  }, [allLogs]);
+
+  const totalTSC = useMemo(() => {
+    return allLogs.reduce((sum, log) => sum + (log.tsc_collected ?? 0), 0);
+  }, [allLogs]);
 
   return (
-    <SafeAreaView style={s.root} edges={["top"]}>
-      <DetailModal log={selected} visible={!!selected} onClose={() => setSelected(null)} />
+    <>
+      <Stack.Screen
+        options={{
+          headerShown: false,
+        }}
+      />
 
-      {/* Header */}
-      <View style={s.header}>
-        <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
-          <ChevronLeft size={22} color={SLATE} />
-        </TouchableOpacity>
-        <View style={s.headerMid}>
-          <Text style={s.title} numberOfLines={1}>{date ? fmtDay(date) : "Daily Logs"}</Text>
-          <Text style={s.sub}>{logs.length} teardown{logs.length !== 1 ? "s" : ""}</Text>
-        </View>
-      </View>
-
-      {/* Summary strip */}
-      {!loading && logs.length > 0 && (
-        <View style={s.strip}>
-          <View style={s.stripStat}>
-            <Text style={[s.stripNum, { color: GREEN }]}>{totalCable}m</Text>
-            <Text style={s.stripLbl}>Cable</Text>
-          </View>
-          <View style={s.stripDiv} />
-          <View style={s.stripStat}>
-            <Text style={[s.stripNum, { color: INDIGO }]}>{totalComponents}</Text>
-            <Text style={s.stripLbl}>Components</Text>
-          </View>
-          <View style={s.stripDiv} />
-          <View style={s.stripStat}>
-            <Text style={s.stripNum}>{logs.filter(l => l.status === "backend_approved").length}</Text>
-            <Text style={s.stripLbl}>Approved</Text>
-          </View>
-        </View>
-      )}
-
-      {loading ? (
-        <View style={s.centered}>
-          <ActivityIndicator color={GREEN} size="large" />
-          <Text style={s.loadTxt}>Loading logs…</Text>
-        </View>
-      ) : error ? (
-        <View style={s.centered}>
-          <AlertCircle size={40} color="#EF4444" />
-          <Text style={s.errTxt}>{error}</Text>
-          <TouchableOpacity style={s.retryBtn} onPress={() => { setLoading(true); fetchLogs(); }}>
-            <RefreshCw size={14} color={GREEN} />
-            <Text style={s.retryTxt}>Try Again</Text>
+      <SafeAreaView style={s.container}>
+        <View style={s.header}>
+          <TouchableOpacity onPress={() => router.back()} style={s.backBtn}>
+            <ChevronLeft size={22} color={SLATE} />
           </TouchableOpacity>
+
+          <View style={{ flex: 1 }}>
+            <Text style={s.title}>Daily Report</Text>
+
+            <Text style={s.subtitle}>
+              {date}
+              {backgroundSyncing ? " · updating..." : ""}
+            </Text>
+          </View>
         </View>
-      ) : (
-        <FlatList
-          data={logs}
-          keyExtractor={item => String(item.id)}
-          contentContainerStyle={s.content}
-          showsVerticalScrollIndicator={false}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); fetchLogs(); }} colors={[GREEN]} />}
-          ListEmptyComponent={
-            <View style={s.centered}>
-              <Text style={s.errTxt}>No teardowns found for this date.</Text>
-            </View>
-          }
-          renderItem={({ item }) => <LogCard log={item} onPress={() => setSelected(item)} />}
-        />
-      )}
-    </SafeAreaView>
+
+        {loading ? (
+          <View style={s.loadingWrap}>
+            <ActivityIndicator size="large" color={GREEN} />
+
+            <Text style={s.loadingText}>Loading report...</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={allLogs}
+            keyExtractor={(item) => String(item.id)}
+            contentContainerStyle={s.list}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={() => {
+                  setRefreshing(true);
+                  fetchLogs();
+                }}
+                colors={[GREEN]}
+              />
+            }
+            ListHeaderComponent={
+              <>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    gap: 8,
+                    marginBottom: 20,
+                  }}
+                >
+                  {[
+                    {
+                      label: "Spans",
+                      value: String(allLogs.length),
+                      color: SLATE,
+                    },
+                    {
+                      label: "Poles",
+                      value: String(allLogs.length * 2),
+                      color: ORANGE,
+                    },
+                    {
+                      label: "Cable",
+                      value: `${totalCable}m`,
+                      color: GREEN,
+                    },
+                    {
+                      label: "Subcomps",
+                      value: String(
+                        totalNodes +
+                          totalAmplifiers +
+                          totalExtenders +
+                          totalTSC
+                      ),
+                      color: BLUE,
+                    },
+                  ].map((stat, idx) => (
+                    <View
+                      key={idx}
+                      style={{
+                        flex: 1,
+                        backgroundColor: "#FFFFFF",
+                        paddingVertical: 12,
+                        borderRadius: 14,
+                        borderWidth: 1,
+                        borderColor: BORDER,
+                        alignItems: "center",
+                        elevation: 1,
+                        shadowColor: "#000",
+                        shadowOpacity: 0.04,
+                        shadowRadius: 4,
+                        shadowOffset: { width: 0, height: 2 },
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 15,
+                          fontWeight: "900",
+                          color: stat.color,
+                        }}
+                        numberOfLines={1}
+                      >
+                        {stat.value}
+                      </Text>
+                      <Text
+                        style={{
+                          fontSize: 9,
+                          fontWeight: "700",
+                          color: MUTED,
+                          marginTop: 2,
+                        }}
+                        numberOfLines={1}
+                      >
+                        {stat.label.toUpperCase()}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+
+                <Text style={s.sectionTitle}>TEARDOWN SPANS</Text>
+              </>
+            }
+            renderItem={({ item }) => {
+              const duration =
+                item.start_time && item.end_time
+                  ? `${formatTime(item.start_time)} - ${formatTime(
+                      item.end_time,
+                    )}`
+                  : "--";
+
+              const fromCode = item.span?.fromPole?.pole?.pole_code ?? "--";
+              const toCode = item.span?.toPole?.pole?.pole_code ?? "--";
+              const nodeName = item.span?.node?.name ?? "Unknown Node";
+
+              const fl = item.from_lat ?? item.captured_lat;
+              const fg = item.from_lng ?? item.captured_lng;
+              const tl = item.to_lat ?? fl;
+              const tg = item.to_lng ?? fg;
+
+              const statusMap: Record<
+                string,
+                { label: string; bg: string; color: string; border: string }
+              > = {
+                submitted: {
+                  label: "Completed",
+                  bg: "#ECFDF3",
+                  color: "#0B7A5A",
+                  border: "#A7F3D0",
+                },
+                backend_approved: {
+                  label: "Approved",
+                  bg: "#ECFDF3",
+                  color: "#027A48",
+                  border: "#A7F3D0",
+                },
+                subcon_approved: {
+                  label: "Subcon Approved",
+                  bg: "#ECFDF3",
+                  color: "#0B7A5A",
+                  border: "#A7F3D0",
+                },
+                rejected: {
+                  label: "Rejected",
+                  bg: "#FEF2F2",
+                  color: "#DC2626",
+                  border: "#FECACA",
+                },
+                pending: {
+                  label: "Pending Upload",
+                  bg: "#FFFBEB",
+                  color: "#D97706",
+                  border: "#FDE68A",
+                },
+              };
+              const st = statusMap[item.status?.toLowerCase()] ?? {
+                label: item.status?.toUpperCase() || "COMPLETED",
+                bg: "#ECFDF3",
+                color: "#0B7A5A",
+                border: "#A7F3D0",
+              };
+
+              return (
+                <TouchableOpacity
+                  activeOpacity={0.8}
+                  style={s.card}
+                  onPress={() =>
+                    router.push({
+                      pathname: "/daily-report/preview",
+                      params: { id: item.id },
+                    })
+                  }
+                >
+                  <View style={s.mapCard}>
+                    <SpanVicinityMap
+                      fromLat={fl}
+                      fromLng={fg}
+                      toLat={tl}
+                      toLng={tg}
+                      fromCode={fromCode}
+                      toCode={toCode}
+                      nodeName={nodeName}
+                    />
+                  </View>
+
+                  <View style={{ flexDirection: "row", gap: 10, marginTop: 4 }}>
+                    <View
+                      style={{
+                        flex: 1,
+                        backgroundColor: "#F8FAFC",
+                        paddingVertical: 10,
+                        paddingHorizontal: 12,
+                        borderRadius: 14,
+                        borderWidth: 1,
+                        borderColor: BORDER,
+                        alignItems: "center",
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 9,
+                          fontWeight: "900",
+                          color: MUTED,
+                          letterSpacing: 0.5,
+                        }}
+                      >
+                        COLLECTED
+                      </Text>
+                      <Text
+                        style={{
+                          fontSize: 16,
+                          fontWeight: "900",
+                          color: GREEN,
+                          marginTop: 2,
+                        }}
+                      >
+                        {item.actual_cable ?? 0}m
+                      </Text>
+                    </View>
+
+                    <View
+                      style={{
+                        flex: 1,
+                        backgroundColor: "#F8FAFC",
+                        paddingVertical: 10,
+                        paddingHorizontal: 12,
+                        borderRadius: 14,
+                        borderWidth: 1,
+                        borderColor: BORDER,
+                        alignItems: "center",
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 9,
+                          fontWeight: "900",
+                          color: MUTED,
+                          letterSpacing: 0.5,
+                        }}
+                      >
+                        DURATION
+                      </Text>
+                      <Text
+                        style={{
+                          fontSize: 13,
+                          fontWeight: "800",
+                          color: SLATE,
+                          marginTop: 4,
+                        }}
+                      >
+                        {duration}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                    {[
+                      { label: "Nodes", count: item.nodes_collected ?? 0 },
+                      { label: "Amps", count: item.amplifiers_collected ?? 0 },
+                      { label: "Exts", count: item.extenders_collected ?? 0 },
+                      { label: "TSC", count: item.tsc_collected ?? 0 },
+                    ].map((comp, idx) => (
+                      <View
+                        key={idx}
+                        style={{
+                          flex: 1,
+                          backgroundColor: "#FFFFFF",
+                          paddingVertical: 8,
+                          borderRadius: 12,
+                          borderWidth: 1,
+                          borderColor: BORDER,
+                          alignItems: "center",
+                        }}
+                      >
+                        <Text
+                          style={{
+                            fontSize: 14,
+                            fontWeight: "900",
+                            color: BLUE,
+                          }}
+                        >
+                          {comp.count}
+                        </Text>
+                        <Text
+                          style={{
+                            fontSize: 9,
+                            fontWeight: "700",
+                            color: MUTED,
+                            marginTop: 1,
+                          }}
+                        >
+                          {comp.label.toUpperCase()}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+
+                  <View style={{ alignItems: "center", marginTop: 12 }}>
+                    <View
+                      style={{
+                        backgroundColor: st.bg,
+                        paddingHorizontal: 16,
+                        paddingVertical: 6,
+                        borderRadius: 100,
+                        borderWidth: 1,
+                        borderColor: st.border,
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 11,
+                          fontWeight: "900",
+                          color: st.color,
+                          letterSpacing: 0.5,
+                        }}
+                      >
+                        {st.label.toUpperCase()}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <View style={s.footerRow}>
+                    <Text style={s.teamText}>{item.team?.name ?? "--"}</Text>
+
+                    <Text style={s.linemanText}>
+                      {item.lineman
+                        ? `${item.lineman.first_name} ${item.lineman.last_name}`
+                        : "--"}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            }}
+          />
+        )}
+      </SafeAreaView>
+    </>
   );
 }
 
 const s = StyleSheet.create({
-  root:    { flex: 1, backgroundColor: "#F8FAFC" },
-  header:  { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12, gap: 12 },
-  backBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: "#fff", borderWidth: 1, borderColor: BORDER, alignItems: "center", justifyContent: "center" },
-  headerMid: { flex: 1 },
-  title:   { fontSize: 18, fontWeight: "900", color: SLATE },
-  sub:     { fontSize: 13, color: MUTED, fontWeight: "500", marginTop: 2 },
+  container: {
+    flex: 1,
+    backgroundColor: "#F4F6F8",
+  },
 
-  strip:    { flexDirection: "row", backgroundColor: "#fff", marginHorizontal: 16, borderRadius: 16, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: BORDER, shadowColor: SLATE, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.04, shadowRadius: 6, elevation: 2 },
-  stripStat:{ flex: 1, alignItems: "center" },
-  stripNum: { fontSize: 20, fontWeight: "900", color: SLATE },
-  stripLbl: { fontSize: 10, fontWeight: "600", color: MUTED, marginTop: 2 },
-  stripDiv: { width: 1, backgroundColor: BORDER, marginHorizontal: 4 },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 14,
+    gap: 12,
+  },
 
-  centered: { flex: 1, alignItems: "center", justifyContent: "center", padding: 40 },
-  loadTxt:  { fontSize: 14, color: MUTED, marginTop: 12, fontWeight: "500" },
-  errTxt:   { fontSize: 14, color: "#DC2626", textAlign: "center", marginTop: 12, fontWeight: "600" },
-  retryBtn: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 16, backgroundColor: "#F0FDF4", paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12 },
-  retryTxt: { fontSize: 14, fontWeight: "700", color: GREEN },
+  backBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: BORDER,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 
-  content:  { paddingHorizontal: 16, paddingBottom: 100, paddingTop: 4 },
+  title: {
+    fontSize: 28,
+    fontWeight: "900",
+    color: SLATE,
+  },
+
+  subtitle: {
+    marginTop: 4,
+    fontSize: 13,
+    color: MUTED,
+    fontWeight: "600",
+  },
+
+  loadingWrap: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  loadingText: {
+    marginTop: 14,
+    fontSize: 14,
+    color: MUTED,
+    fontWeight: "600",
+  },
+
+  list: {
+    padding: 16,
+    paddingBottom: 120,
+  },
+
+  sectionTitle: {
+    marginTop: 10,
+    marginBottom: 14,
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#98A2B3",
+    letterSpacing: 1,
+  },
+
+  card: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 28,
+    padding: 16,
+    marginBottom: 18,
+    borderWidth: 1,
+    borderColor: BORDER,
+  },
+
+  mapCard: {
+    borderRadius: 22,
+    overflow: "hidden",
+    marginBottom: 16,
+    marginTop: -28,
+    elevation: 6,
+    shadowColor: "#000",
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    shadowOffset: {
+      width: 0,
+      height: 6,
+    },
+  },
+
+  footerRow: {
+    marginTop: 18,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+
+  teamText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: GREEN,
+  },
+
+  linemanText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: MUTED,
+  },
 });

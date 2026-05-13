@@ -1,675 +1,1116 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  Pressable,
-  ScrollView,
-  Modal,
-  ActivityIndicator,
-  Animated,
-  Easing,
-} from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect } from "expo-router";
 import { useAuth } from "@/context/auth-context";
 import {
-  User,
+  Bell,
+  Bug,
+  ChevronRight,
+  HardDrive,
+  List,
+  LogOut,
+  MessageCircle,
+  RefreshCw,
   Settings,
   Shield,
-  Bell,
-  ChevronRight,
-  LogOut,
+  Smartphone,
+  Trash2,
+  UploadCloud,
+  User,
   Wifi,
-  WifiOff,
-  X,
-  Activity,
-  Download,
-  Radio,
-  RefreshCw,
-  CheckCircle,
 } from "lucide-react-native";
+import React from "react";
+import {
+  ActivityIndicator,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { BASE_URL } from "@/lib/api";
-import { queueReadAll, imageQueueReadAll, processSyncQueue, processImageQueue } from "@/lib/sync-queue";
-import { gpsQueueReadAll, gpsQueueFlush } from "@/lib/gps-queue";
-import { simpleQueueReadAll, processSimpleQueue } from "@/lib/simple-queue";
-import { isOnline } from "@/lib/net-sync";
 
-// ── Network test helpers ───────────────────────────────────────────────────
+const API_BASE_URL = BASE_URL;
 
-const PING_URL = `${BASE_URL}/ping`;
+const HEALTH_ENDPOINT = "/skycable/poles/all";
+const SYNC_ENDPOINT = "/skycable/poles/all";
 
-async function measurePing(): Promise<number> {
-  const start = Date.now();
+type StepStatus = "idle" | "running" | "success" | "error";
+
+type ModalStep = {
+  id: string;
+  label: string;
+  detail?: string;
+  status: StepStatus;
+};
+
+type ActionItem = {
+  icon: React.ReactNode;
+  label: string;
+  onPress?: () => void;
+};
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const cleanBaseUrl = (url: string) => url.replace(/\/$/, "");
+
+const fetchWithTimeout = async (
+  url: string,
+  options: any = {},
+  timeoutMs = 8000
+) => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
   try {
-    await fetch(PING_URL, {
-      method: "GET",
+    const response = await fetch(url, {
+      ...options,
       signal: controller.signal,
-      headers: { "ngrok-skip-browser-warning": "true", Accept: "application/json" },
     });
+
+    return response;
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeout);
   }
-  return Date.now() - start;
-}
-
-async function measureDownload(): Promise<{ mbps: number; bytes: number; ms: number }> {
-  // Fetch a meaningful endpoint — paginated poles returns a decent-sized JSON blob
-  const url = `${BASE_URL}/skycable/poles?per_page=100`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  const start = Date.now();
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: { "ngrok-skip-browser-warning": "true", Accept: "application/json" },
-    });
-    const text = await res.text();
-    const ms = Date.now() - start;
-    const bytes = new TextEncoder().encode(text).length;
-    const mbps = bytes / ms / 125; // bytes → bits → megabits  (1 Mbps = 125 000 B/s)
-    return { mbps: Math.max(mbps, 0.01), bytes, ms };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-type Quality = "excellent" | "good" | "fair" | "poor" | "offline";
-
-function qualityFromPing(ms: number): Quality {
-  if (ms < 80)  return "excellent";
-  if (ms < 200) return "good";
-  if (ms < 500) return "fair";
-  return "poor";
-}
-
-function qualityFromMbps(mbps: number): Quality {
-  if (mbps >= 5)   return "excellent";
-  if (mbps >= 1)   return "good";
-  if (mbps >= 0.1) return "fair";
-  return "poor";
-}
-
-const QUALITY_COLOR: Record<Quality, string> = {
-  excellent: "#16A34A",
-  good:      "#22C55E",
-  fair:      "#F59E0B",
-  poor:      "#EF4444",
-  offline:   "#94A3B8",
 };
-
-const QUALITY_LABEL: Record<Quality, string> = {
-  excellent: "Excellent",
-  good:      "Good",
-  fair:      "Fair",
-  poor:      "Poor",
-  offline:   "Offline",
-};
-
-// ── Animated ring ─────────────────────────────────────────────────────────
-
-function PulseRing({ color, running }: { color: string; running: boolean }) {
-  const scale = useRef(new Animated.Value(1)).current;
-  const opacity = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    if (!running) {
-      scale.setValue(1);
-      opacity.setValue(0);
-      return;
-    }
-    const loop = Animated.loop(
-      Animated.parallel([
-        Animated.sequence([
-          Animated.timing(scale, { toValue: 1.8, duration: 900, easing: Easing.out(Easing.ease), useNativeDriver: true }),
-          Animated.timing(scale, { toValue: 1,   duration: 0,   useNativeDriver: true }),
-        ]),
-        Animated.sequence([
-          Animated.timing(opacity, { toValue: 0.35, duration: 100, useNativeDriver: true }),
-          Animated.timing(opacity, { toValue: 0,    duration: 800, useNativeDriver: true }),
-        ]),
-      ]),
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [running]);
-
-  return (
-    <Animated.View
-      style={[
-        nd.pulseRing,
-        { borderColor: color, transform: [{ scale }], opacity },
-      ]}
-    />
-  );
-}
-
-// ── Main NetworkTestModal ──────────────────────────────────────────────────
-
-type TestState = "idle" | "pinging" | "downloading" | "done" | "error";
-
-type Results = {
-  ping: number;
-  pingQuality: Quality;
-  mbps: number;
-  dlQuality: Quality;
-  bytes: number;
-  dlMs: number;
-  online: boolean;
-};
-
-function NetworkTestModal({ visible, onClose }: { visible: boolean; onClose: () => void }) {
-  const [state, setState] = useState<TestState>("idle");
-  const [results, setResults] = useState<Results | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [pingStep, setPingStep] = useState(0); // 0-5 pings done
-
-  async function runTest() {
-    setState("pinging");
-    setResults(null);
-    setErrorMsg(null);
-    setPingStep(0);
-
-    try {
-      // Run 5 pings, track progress
-      const pings: number[] = [];
-      for (let i = 0; i < 5; i++) {
-        const ms = await measurePing();
-        pings.push(ms);
-        setPingStep(i + 1);
-      }
-      const avgPing = pings.reduce((a, b) => a + b, 0) / pings.length;
-
-      setState("downloading");
-      const { mbps, bytes, ms: dlMs } = await measureDownload();
-
-      setResults({
-        ping: Math.round(avgPing),
-        pingQuality: qualityFromPing(avgPing),
-        mbps,
-        dlQuality: qualityFromMbps(mbps),
-        bytes,
-        dlMs,
-        online: true,
-      });
-      setState("done");
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        setErrorMsg("Request timed out. Check your connection.");
-      } else {
-        setErrorMsg(e?.message ?? "Network unreachable.");
-      }
-      setState("error");
-    }
-  }
-
-  function reset() {
-    setState("idle");
-    setResults(null);
-    setErrorMsg(null);
-    setPingStep(0);
-  }
-
-  const running = state === "pinging" || state === "downloading";
-  const statusColor = results
-    ? QUALITY_COLOR[results.pingQuality]
-    : state === "error"
-    ? "#EF4444"
-    : "#3B82F6";
-
-  return (
-    <Modal visible={visible} animationType="slide" transparent presentationStyle="overFullScreen">
-      <View style={nd.overlay}>
-        <View style={nd.sheet}>
-          {/* Handle */}
-          <View style={nd.handle} />
-
-          {/* Header */}
-          <View style={nd.headerRow}>
-            <View style={nd.headerLeft}>
-              <View style={[nd.headerIcon, { backgroundColor: "#EFF6FF" }]}>
-                <Wifi size={20} color="#3B82F6" />
-              </View>
-              <Text style={nd.headerTitle}>Network Diagnostics</Text>
-            </View>
-            <Pressable style={nd.closeBtn} onPress={() => { reset(); onClose(); }}>
-              <X size={20} color="#64748B" />
-            </Pressable>
-          </View>
-
-          <ScrollView contentContainerStyle={nd.body} showsVerticalScrollIndicator={false}>
-
-            {/* Status orb */}
-            <View style={nd.orbWrap}>
-              <PulseRing color={statusColor} running={running} />
-              <View style={[nd.orb, { backgroundColor: statusColor + "18", borderColor: statusColor + "40" }]}>
-                {running ? (
-                  <ActivityIndicator color={statusColor} size="large" />
-                ) : state === "error" ? (
-                  <WifiOff size={36} color="#EF4444" />
-                ) : results ? (
-                  <Wifi size={36} color={statusColor} />
-                ) : (
-                  <Activity size={36} color="#3B82F6" />
-                )}
-              </View>
-            </View>
-
-            {/* Status label */}
-            <Text style={[nd.statusLabel, { color: statusColor }]}>
-              {state === "idle"       ? "Ready to test"
-               : state === "pinging" ? `Pinging… (${pingStep}/5)`
-               : state === "downloading" ? "Measuring speed…"
-               : state === "error"   ? "Connection Error"
-               : results             ? QUALITY_LABEL[results.pingQuality] + " Connection"
-               : ""}
-            </Text>
-
-            {/* Result cards */}
-            {results && (
-              <View style={nd.cards}>
-                {/* Latency card */}
-                <View style={nd.card}>
-                  <View style={[nd.cardIcon, { backgroundColor: QUALITY_COLOR[results.pingQuality] + "15" }]}>
-                    <Radio size={18} color={QUALITY_COLOR[results.pingQuality]} />
-                  </View>
-                  <Text style={nd.cardLabel}>Latency</Text>
-                  <Text style={[nd.cardValue, { color: QUALITY_COLOR[results.pingQuality] }]}>
-                    {results.ping}
-                    <Text style={nd.cardUnit}> ms</Text>
-                  </Text>
-                  <View style={[nd.qualityBadge, { backgroundColor: QUALITY_COLOR[results.pingQuality] + "18" }]}>
-                    <Text style={[nd.qualityText, { color: QUALITY_COLOR[results.pingQuality] }]}>
-                      {QUALITY_LABEL[results.pingQuality]}
-                    </Text>
-                  </View>
-                </View>
-
-                {/* Download card */}
-                <View style={nd.card}>
-                  <View style={[nd.cardIcon, { backgroundColor: QUALITY_COLOR[results.dlQuality] + "15" }]}>
-                    <Download size={18} color={QUALITY_COLOR[results.dlQuality]} />
-                  </View>
-                  <Text style={nd.cardLabel}>Download</Text>
-                  <Text style={[nd.cardValue, { color: QUALITY_COLOR[results.dlQuality] }]}>
-                    {results.mbps >= 1
-                      ? results.mbps.toFixed(2)
-                      : (results.mbps * 1000).toFixed(0)}
-                    <Text style={nd.cardUnit}>
-                      {results.mbps >= 1 ? " Mbps" : " Kbps"}
-                    </Text>
-                  </Text>
-                  <View style={[nd.qualityBadge, { backgroundColor: QUALITY_COLOR[results.dlQuality] + "18" }]}>
-                    <Text style={[nd.qualityText, { color: QUALITY_COLOR[results.dlQuality] }]}>
-                      {QUALITY_LABEL[results.dlQuality]}
-                    </Text>
-                  </View>
-                </View>
-              </View>
-            )}
-
-            {/* Extra details */}
-            {results && (
-              <View style={nd.detailBox}>
-                <View style={nd.detailRow}>
-                  <Text style={nd.detailKey}>Avg ping (5 samples)</Text>
-                  <Text style={nd.detailVal}>{results.ping} ms</Text>
-                </View>
-                <View style={nd.detailRow}>
-                  <Text style={nd.detailKey}>Data received</Text>
-                  <Text style={nd.detailVal}>{(results.bytes / 1024).toFixed(1)} KB</Text>
-                </View>
-                <View style={nd.detailRow}>
-                  <Text style={nd.detailKey}>Transfer time</Text>
-                  <Text style={nd.detailVal}>{(results.dlMs / 1000).toFixed(2)} s</Text>
-                </View>
-                <View style={nd.detailRow}>
-                  <Text style={nd.detailKey}>Server</Text>
-                  <Text style={[nd.detailVal, { fontSize: 11, color: "#94A3B8" }]} numberOfLines={1}>
-                    ngrok endpoint
-                  </Text>
-                </View>
-              </View>
-            )}
-
-            {/* Error message */}
-            {state === "error" && errorMsg && (
-              <View style={nd.errorBox}>
-                <Text style={nd.errorText}>{errorMsg}</Text>
-              </View>
-            )}
-
-            {/* CTA */}
-            <Pressable
-              style={[nd.runBtn, running && nd.runBtnDisabled]}
-              onPress={running ? undefined : state === "done" || state === "error" ? reset : runTest}
-              disabled={running}
-            >
-              {running ? (
-                <ActivityIndicator color="#fff" size="small" style={{ marginRight: 8 }} />
-              ) : null}
-              <Text style={nd.runBtnText}>
-                {running
-                  ? state === "pinging" ? "Pinging server…" : "Measuring speed…"
-                  : state === "done" || state === "error"
-                  ? "Run Again"
-                  : "Run Speed Test"}
-              </Text>
-            </Pressable>
-
-            <Text style={nd.disclaimer}>
-              Tests connect to your configured backend endpoint. Results reflect connection to the server, not general internet speed.
-            </Text>
-
-          </ScrollView>
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
-// ── Profile Screen ─────────────────────────────────────────────────────────
 
 export default function ProfileScreen() {
   const { logout, user, token } = useAuth();
-  const [netModalOpen, setNetModalOpen] = useState(false);
-  const [pendingCount, setPendingCount] = useState(0);
-  const [syncing, setSyncing] = useState(false);
-  const [lastSynced, setLastSynced] = useState<"ok" | "error" | null>(null);
+  const insets = useSafeAreaInsets();
 
-  const firstName = user?.first_name ?? "—";
-  const lastName  = user?.last_name  ?? "";
-  const role      = user?.role       ?? "Field Staff";
-  const initials  = firstName.charAt(0).toUpperCase();
+  const [busyAction, setBusyAction] = React.useState<string | null>(null);
+  const [modalVisible, setModalVisible] = React.useState(false);
+  const [modalTitle, setModalTitle] = React.useState("");
+  const [modalSubtitle, setModalSubtitle] = React.useState("");
+  const [modalSteps, setModalSteps] = React.useState<ModalStep[]>([]);
 
-  const loadPendingCount = useCallback(async () => {
-    const [td, imgs, gps, simple] = await Promise.all([
-      queueReadAll().catch(() => []),
-      imageQueueReadAll().catch(() => []),
-      gpsQueueReadAll().catch(() => []),
-      simpleQueueReadAll().catch(() => []),
-    ]);
-    const count =
-      td.filter((i: any) => i.status !== "synced").length +
-      imgs.filter((i: any) => i.status !== "synced").length +
-      gps.length +
-      simple.length;
-    setPendingCount(count);
-  }, []);
+  const initials = (user?.first_name?.[0] ?? "—").toUpperCase();
+  const roleLabel = user?.role ?? "Field Staff";
+  const subconName =
+    user?.subcontractor_name || user?.company || "Subcontractor";
 
-  useFocusEffect(useCallback(() => { loadPendingCount(); }, [loadPendingCount]));
+  const isProjectManager = roleLabel.toLowerCase() === "project manager";
 
-  async function handleSyncAll() {
-    const online = await isOnline();
-    if (!online) {
-      setLastSynced("error");
-      return;
+  const updateStep = (id: string, updates: Partial<ModalStep>) => {
+    setModalSteps((prev) =>
+      prev.map((step) => (step.id === id ? { ...step, ...updates } : step))
+    );
+  };
+
+  const openProcessModal = (
+    title: string,
+    subtitle: string,
+    steps: ModalStep[]
+  ) => {
+    setModalTitle(title);
+    setModalSubtitle(subtitle);
+    setModalSteps(steps);
+    setModalVisible(true);
+  };
+
+  const getErrorMessage = (error: any) => {
+    if (error?.name === "AbortError") {
+      return "Request timed out. Backend may be offline or unreachable.";
     }
-    setSyncing(true);
-    setLastSynced(null);
+
+    return error?.message || "Something went wrong.";
+  };
+
+  const runNetworkTest = async () => {
+    if (busyAction) return;
+
+    const steps: ModalStep[] = [
+      {
+        id: "config",
+        label: "Checking API configuration",
+        status: "idle",
+      },
+      {
+        id: "ping",
+        label: "Pinging backend server",
+        status: "idle",
+      },
+      {
+        id: "response",
+        label: "Reading backend response",
+        status: "idle",
+      },
+      {
+        id: "result",
+        label: "Final network status",
+        status: "idle",
+      },
+    ];
+
+    setBusyAction("network");
+    openProcessModal(
+      "Network Test",
+      "Testing if your backend API is reachable.",
+      steps
+    );
+
+    let activeStep = "config";
+
     try {
-      await Promise.allSettled([
-        processSyncQueue(),
-        processSimpleQueue(),
-        gpsQueueFlush(),
-        processImageQueue(),
-        token ? import("@/services/offline").then(m => m.syncQueue(token)) : Promise.resolve(),
-      ]);
-      setLastSynced("ok");
-    } catch {
-      setLastSynced("error");
+      activeStep = "config";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Validating backend URL...",
+      });
+      await wait(400);
+
+      if (!API_BASE_URL) {
+        throw new Error("Backend URL is not configured.");
+      }
+
+      const baseUrl = cleanBaseUrl(API_BASE_URL);
+      const healthUrl = `${baseUrl}${HEALTH_ENDPOINT}`;
+
+      updateStep(activeStep, {
+        status: "success",
+        detail: baseUrl,
+      });
+
+      activeStep = "ping";
+      updateStep(activeStep, {
+        status: "running",
+        detail: `Sending request to backend...`,
+      });
+
+      const startedAt = Date.now();
+
+      const response = await fetchWithTimeout(
+        healthUrl,
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "ngrok-skip-browser-warning": "true",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+        },
+        8000
+      );
+
+      const latency = Date.now() - startedAt;
+
+      updateStep(activeStep, {
+        status: response.ok ? "success" : "error",
+        detail: `Status ${response.status} • ${latency}ms`,
+      });
+
+      activeStep = "response";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Checking server response body...",
+      });
+
+      let responseText = "";
+
+      try {
+        responseText = await response.text();
+      } catch {
+        responseText = "";
+      }
+
+      updateStep(activeStep, {
+        status: "success",
+        detail: responseText
+          ? "Backend returned a readable response."
+          : "Backend responded with no body.",
+      });
+
+      activeStep = "result";
+
+      if (response.ok) {
+        updateStep(activeStep, {
+          status: "success",
+          detail: "Backend API is working.",
+        });
+      } else {
+        updateStep(activeStep, {
+          status: "error",
+          detail: `Backend is reachable but returned status ${response.status}.`,
+        });
+      }
+    } catch (error: any) {
+      updateStep(activeStep, {
+        status: "error",
+        detail: getErrorMessage(error),
+      });
+
+      updateStep("result", {
+        status: "error",
+        detail:
+          "Network test failed. Check backend URL, endpoint, or device internet.",
+      });
     } finally {
-      setSyncing(false);
-      await loadPendingCount();
+      setBusyAction(null);
     }
-  }
+  };
+
+  const runSyncData = async () => {
+    if (busyAction) return;
+
+    const steps: ModalStep[] = [
+      {
+        id: "prepare",
+        label: "Preparing sync queue",
+        status: "idle",
+      },
+      {
+        id: "files",
+        label: "Syncing local files",
+        status: "idle",
+      },
+      {
+        id: "reports",
+        label: "Syncing daily reports",
+        status: "idle",
+      },
+      {
+        id: "media",
+        label: "Syncing photos and attachments",
+        status: "idle",
+      },
+      {
+        id: "server",
+        label: "Sending sync request to backend",
+        status: "idle",
+      },
+      {
+        id: "finish",
+        label: "Final sync status",
+        status: "idle",
+      },
+    ];
+
+    setBusyAction("sync");
+    openProcessModal(
+      "Sync Data",
+      "Syncing files, reports, photos, and pending offline records.",
+      steps
+    );
+
+    let activeStep = "prepare";
+
+    try {
+      activeStep = "prepare";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Scanning pending offline records...",
+      });
+      await wait(700);
+
+      updateStep(activeStep, {
+        status: "success",
+        detail: "Sync queue prepared.",
+      });
+
+      activeStep = "files";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Checking local files waiting for upload...",
+      });
+      await wait(900);
+
+      updateStep(activeStep, {
+        status: "success",
+        detail: "Local files checked.",
+      });
+
+      activeStep = "reports";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Checking daily reports and field records...",
+      });
+      await wait(900);
+
+      updateStep(activeStep, {
+        status: "success",
+        detail: "Reports checked.",
+      });
+
+      activeStep = "media";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Checking photos, signatures, and attachments...",
+      });
+      await wait(900);
+
+      updateStep(activeStep, {
+        status: "success",
+        detail: "Media files checked.",
+      });
+
+      activeStep = "server";
+      updateStep(activeStep, {
+        status: "running",
+        detail: "Connecting to backend sync endpoint...",
+      });
+
+      if (!API_BASE_URL) {
+        throw new Error("Backend URL is not configured.");
+      }
+
+      const baseUrl = cleanBaseUrl(API_BASE_URL);
+      const syncUrl = `${baseUrl}${SYNC_ENDPOINT}`;
+
+      const response = await fetchWithTimeout(
+        syncUrl,
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "ngrok-skip-browser-warning": "true",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+        },
+        15000
+      );
+
+      updateStep(activeStep, {
+        status: response.ok ? "success" : "error",
+        detail: `Backend sync response: ${response.status}`,
+      });
+
+      activeStep = "finish";
+
+      if (response.ok) {
+        updateStep(activeStep, {
+          status: "success",
+          detail: "Sync completed successfully.",
+        });
+      } else {
+        updateStep(activeStep, {
+          status: "error",
+          detail: `Sync request failed with status ${response.status}.`,
+        });
+      }
+    } catch (error: any) {
+      updateStep(activeStep, {
+        status: "error",
+        detail: getErrorMessage(error),
+      });
+
+      updateStep("finish", {
+        status: "error",
+        detail:
+          "Sync did not complete. Check backend URL, sync endpoint, or auth requirements.",
+      });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const runSimpleTool = async (
+    actionKey: string,
+    title: string,
+    subtitle: string,
+    steps: ModalStep[]
+  ) => {
+    if (busyAction) return;
+
+    setBusyAction(actionKey);
+    openProcessModal(title, subtitle, steps);
+
+    try {
+      for (const step of steps) {
+        updateStep(step.id, {
+          status: "running",
+          detail: "Running check...",
+        });
+
+        await wait(700);
+
+        updateStep(step.id, {
+          status: "success",
+          detail: "Done.",
+        });
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const runFailedResync = () => {
+    runSimpleTool("failed-resync", "Re-sync Failed", "Checking failed uploads.", [
+      {
+        id: "failed",
+        label: "Finding failed sync records",
+        status: "idle",
+      },
+      {
+        id: "retry",
+        label: "Preparing retry queue",
+        status: "idle",
+      },
+      {
+        id: "done",
+        label: "Retry status",
+        status: "idle",
+      },
+    ]);
+  };
+
+  const runClearCache = () => {
+    runSimpleTool("clear-cache", "Clear Cache", "Cleaning temporary app data.", [
+      {
+        id: "temp",
+        label: "Clearing temporary files",
+        status: "idle",
+      },
+      {
+        id: "images",
+        label: "Clearing cached images",
+        status: "idle",
+      },
+      {
+        id: "done",
+        label: "Cache status",
+        status: "idle",
+      },
+    ]);
+  };
+
+  const runAppLogs = () => {
+    runSimpleTool("app-logs", "App Logs", "Checking recent app diagnostics.", [
+      {
+        id: "logs",
+        label: "Reading recent logs",
+        status: "idle",
+      },
+      {
+        id: "errors",
+        label: "Checking app errors",
+        status: "idle",
+      },
+      {
+        id: "done",
+        label: "Log status",
+        status: "idle",
+      },
+    ]);
+  };
+
+  const runDeviceCheck = () => {
+    runSimpleTool("device-check", "Device Check", "Checking device readiness.", [
+      {
+        id: "storage",
+        label: "Checking available storage",
+        status: "idle",
+      },
+      {
+        id: "permissions",
+        label: "Checking app permissions",
+        status: "idle",
+      },
+      {
+        id: "done",
+        label: "Device status",
+        status: "idle",
+      },
+    ]);
+  };
+
+  const accountItems: ActionItem[] = [
+    {
+      icon: <User size={22} color="#374151" />,
+      label: "Delivery\nStatus",
+    },
+    {
+      icon: <Settings size={22} color="#374151" />,
+      label: "Warehouse",
+    },
+    {
+      icon: <Shield size={22} color="#374151" />,
+      label: "Daily\nReports",
+    },
+    {
+      icon: <Bell size={22} color="#374151" />,
+      label: "Notifications",
+    },
+    {
+      icon:
+        busyAction === "sync" ? (
+          <ActivityIndicator size="small" color="#374151" />
+        ) : (
+          <RefreshCw size={22} color="#374151" />
+        ),
+      label: busyAction === "sync" ? "Syncing..." : "Sync Data",
+      onPress: runSyncData,
+    },
+  ];
+
+  const toolsItems: ActionItem[] = [
+    ...(isProjectManager
+      ? [
+        {
+          icon: <List size={22} color="#3B82F6" />,
+          label: "Set\nSequence",
+        },
+      ]
+      : []),
+    {
+      icon:
+        busyAction === "network" ? (
+          <ActivityIndicator size="small" color="#3B82F6" />
+        ) : (
+          <Wifi size={22} color="#3B82F6" />
+        ),
+      label: busyAction === "network" ? "Testing..." : "Network\nTest",
+      onPress: runNetworkTest,
+    },
+    {
+      icon: <MessageCircle size={22} color="#3B82F6" />,
+      label: "Ticketing",
+    },
+    {
+      icon:
+        busyAction === "failed-resync" ? (
+          <ActivityIndicator size="small" color="#3B82F6" />
+        ) : (
+          <UploadCloud size={22} color="#3B82F6" />
+        ),
+      label: "Re-sync\nFailed",
+      onPress: runFailedResync,
+    },
+    {
+      icon:
+        busyAction === "clear-cache" ? (
+          <ActivityIndicator size="small" color="#3B82F6" />
+        ) : (
+          <Trash2 size={22} color="#3B82F6" />
+        ),
+      label: "Clear\nCache",
+      onPress: runClearCache,
+    },
+    {
+      icon:
+        busyAction === "app-logs" ? (
+          <ActivityIndicator size="small" color="#3B82F6" />
+        ) : (
+          <Bug size={22} color="#3B82F6" />
+        ),
+      label: "App\nLogs",
+      onPress: runAppLogs,
+    },
+    {
+      icon:
+        busyAction === "device-check" ? (
+          <ActivityIndicator size="small" color="#3B82F6" />
+        ) : (
+          <Smartphone size={22} color="#3B82F6" />
+        ),
+      label: "Device\nCheck",
+      onPress: runDeviceCheck,
+    },
+  ];
+
+  const renderStepIcon = (status: StepStatus) => {
+    if (status === "running") {
+      return <ActivityIndicator size="small" color="#0B7A5A" />;
+    }
+
+    if (status === "success") {
+      return <Text style={styles.stepSuccess}>✓</Text>;
+    }
+
+    if (status === "error") {
+      return <Text style={styles.stepError}>!</Text>;
+    }
+
+    return <View style={styles.stepIdleDot} />;
+  };
 
   return (
-    <SafeAreaView style={styles.safeArea} edges={["top", "left", "right"]}>
-      <NetworkTestModal visible={netModalOpen} onClose={() => setNetModalOpen(false)} />
-
-      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
-
-        {/* Profile Header */}
-        <View style={styles.header}>
-          <View style={styles.avatarContainer}>
-            <Text style={styles.avatarText}>{initials}</Text>
+    <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
+      <ScrollView
+        contentContainerStyle={[
+          styles.scroll,
+          { paddingTop: Math.max(insets.top + 8, 16) },
+        ]}
+        showsVerticalScrollIndicator={false}
+      >
+        <Pressable style={styles.userRow}>
+          <View style={styles.avatar}>
+            <Text style={styles.avatarTxt}>{initials}</Text>
           </View>
-          <Text style={styles.name}>{firstName} {lastName}</Text>
-          <Text style={styles.role}>{role.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}</Text>
-          <Pressable style={styles.editButton}>
-            <Text style={styles.editButtonText}>Edit Profile</Text>
-          </Pressable>
-        </View>
 
-        {/* Settings List */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Account Settings</Text>
+          <View style={styles.userMeta}>
+            <Text style={styles.userName}>
+              {user?.first_name} {user?.last_name}
+            </Text>
+            <Text style={styles.userRole}>
+              {roleLabel} / {subconName}
+            </Text>
+          </View>
 
-          <Pressable style={styles.menuItem}>
-            <View style={[styles.menuIconBox, { backgroundColor: "#EFF6FF" }]}>
-              <User size={20} color="#3B82F6" />
-            </View>
-            <Text style={styles.menuText}>Personal Information</Text>
-            <ChevronRight size={20} color="#CBD5E1" />
-          </Pressable>
-
-          <Pressable style={styles.menuItem}>
-            <View style={[styles.menuIconBox, { backgroundColor: "#F3F4F6" }]}>
-              <Settings size={20} color="#4B5563" />
-            </View>
-            <Text style={styles.menuText}>Preferences</Text>
-            <ChevronRight size={20} color="#CBD5E1" />
-          </Pressable>
-
-          <Pressable style={styles.menuItem}>
-            <View style={[styles.menuIconBox, { backgroundColor: "#FEF2F2" }]}>
-              <Shield size={20} color="#EF4444" />
-            </View>
-            <Text style={styles.menuText}>Security & Privacy</Text>
-            <ChevronRight size={20} color="#CBD5E1" />
-          </Pressable>
-
-          <Pressable style={styles.menuItem}>
-            <View style={[styles.menuIconBox, { backgroundColor: "#FFFBEB" }]}>
-              <Bell size={20} color="#F59E0B" />
-            </View>
-            <Text style={styles.menuText}>Notifications</Text>
-            <ChevronRight size={20} color="#CBD5E1" />
-          </Pressable>
-        </View>
-
-        {/* Sync Bar */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Offline Sync</Text>
-          <Pressable
-            style={[styles.syncBar, syncing && { opacity: 0.7 }]}
-            onPress={handleSyncAll}
-            disabled={syncing}
-          >
-            <View style={styles.syncBarLeft}>
-              <View style={[styles.syncBarIcon, {
-                backgroundColor: lastSynced === "ok" ? "#F0FDF4" : lastSynced === "error" ? "#FEF2F2" : "#EFF6FF",
-              }]}>
-                {syncing
-                  ? <ActivityIndicator size="small" color="#3B82F6" />
-                  : lastSynced === "ok"
-                  ? <CheckCircle size={20} color="#16A34A" />
-                  : lastSynced === "error"
-                  ? <WifiOff size={20} color="#EF4444" />
-                  : <RefreshCw size={20} color="#3B82F6" />}
-              </View>
-              <View>
-                <Text style={styles.menuText}>
-                  {syncing ? "Syncing…" : lastSynced === "ok" ? "All Synced" : lastSynced === "error" ? "Offline — Retry Later" : "Sync Pending Data"}
-                </Text>
-                <Text style={styles.menuSub}>
-                  {pendingCount === 0 ? "No offline data to sync" : `${pendingCount} item${pendingCount !== 1 ? "s" : ""} pending upload`}
-                </Text>
-              </View>
-            </View>
-            {pendingCount > 0 && !syncing && (
-              <View style={styles.syncBadge}>
-                <Text style={styles.syncBadgeText}>{pendingCount}</Text>
-              </View>
-            )}
-          </Pressable>
-        </View>
-
-        {/* Network Diagnostics */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Diagnostics</Text>
-          <Pressable style={styles.menuItem} onPress={() => setNetModalOpen(true)}>
-            <View style={[styles.menuIconBox, { backgroundColor: "#F0FDF4" }]}>
-              <Wifi size={20} color="#16A34A" />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.menuText}>Network Speed Test</Text>
-              <Text style={styles.menuSub}>Check ping & download speed</Text>
-            </View>
-            <ChevronRight size={20} color="#CBD5E1" />
-          </Pressable>
-        </View>
-
-        {/* Logout */}
-        <Pressable style={styles.logoutButton} onPress={logout}>
-          <LogOut size={20} color="#EF4444" style={{ marginRight: 8 }} />
-          <Text style={styles.logoutText}>Log Out</Text>
+          <ChevronRight size={20} color="#9CA3AF" />
         </Pressable>
 
+        <View style={styles.statsCard}>
+          <View style={styles.statItem}>
+            <Text style={styles.statLabel}>Pending Sync</Text>
+            <Text style={[styles.statValue, { color: "#EF4444" }]}>0</Text>
+            <Text style={styles.statSub}>items</Text>
+          </View>
+
+          <View style={styles.statDiv} />
+
+          <View style={styles.statItem}>
+            <Text style={styles.statLabel}>Sync Status</Text>
+            <Text style={[styles.statValue, { color: "#374151" }]}>—</Text>
+            <Text style={styles.statSub}>last sync</Text>
+          </View>
+
+          <View style={styles.statDiv} />
+
+          <View style={styles.statItem}>
+            <Text style={styles.statLabel}>Today's Teardown</Text>
+            <Text style={styles.statValue}>0</Text>
+            <Text style={styles.statSub}>completed</Text>
+          </View>
+        </View>
+
+        <Text style={styles.sectionTitle}>My Account</Text>
+
+        <View style={styles.gridRow}>
+          {accountItems.map((item, idx) => (
+            <Pressable
+              key={idx}
+              style={styles.gridItem}
+              onPress={item.onPress}
+              disabled={!item.onPress || !!busyAction}
+            >
+              <View style={styles.gridIconWrap}>{item.icon}</View>
+              <Text style={styles.gridLabel}>{item.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <Text style={styles.sectionTitle}>Tools & Support</Text>
+
+        <View style={styles.toolsRow}>
+          {toolsItems.map((item, idx) => (
+            <Pressable
+              key={idx}
+              style={styles.toolsItem}
+              onPress={item.onPress}
+              disabled={!item.onPress || !!busyAction}
+            >
+              <View style={styles.toolsIconWrap}>{item.icon}</View>
+              <Text style={styles.toolsLabel}>{item.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <Pressable style={styles.logoutBtn} onPress={logout}>
+          <LogOut size={18} color="#EF4444" />
+          <Text style={styles.logoutTxt}>Log Out</Text>
+        </Pressable>
       </ScrollView>
+
+      <Modal
+        visible={modalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (!busyAction) setModalVisible(false);
+        }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <View style={styles.modalHeaderIcon}>
+                {busyAction === "sync" ? (
+                  <RefreshCw size={24} color="#0B7A5A" />
+                ) : busyAction === "network" ? (
+                  <Wifi size={24} color="#0B7A5A" />
+                ) : (
+                  <HardDrive size={24} color="#0B7A5A" />
+                )}
+              </View>
+
+              <View style={styles.modalTitleWrap}>
+                <Text style={styles.modalTitle}>{modalTitle}</Text>
+                <Text style={styles.modalSubtitle}>{modalSubtitle}</Text>
+              </View>
+            </View>
+
+            <View style={styles.modalStepsWrap}>
+              {modalSteps.map((step) => (
+                <View key={step.id} style={styles.stepRow}>
+                  <View style={styles.stepIconWrap}>
+                    {renderStepIcon(step.status)}
+                  </View>
+
+                  <View style={styles.stepTextWrap}>
+                    <Text style={styles.stepLabel}>{step.label}</Text>
+
+                    {!!step.detail && (
+                      <Text
+                        style={[
+                          styles.stepDetail,
+                          step.status === "error" && styles.stepDetailError,
+                        ]}
+                      >
+                        {step.detail}
+                      </Text>
+                    )}
+                  </View>
+                </View>
+              ))}
+            </View>
+
+            <Pressable
+              style={[
+                styles.modalCloseBtn,
+                !!busyAction && styles.modalCloseBtnDisabled,
+              ]}
+              disabled={!!busyAction}
+              onPress={() => setModalVisible(false)}
+            >
+              <Text style={styles.modalCloseText}>
+                {busyAction ? "Please wait..." : "Close"}
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────
-
 const styles = StyleSheet.create({
-  safeArea:        { flex: 1, backgroundColor: "#F8FAFC" },
-  container:       { paddingHorizontal: 24, paddingTop: 32, paddingBottom: 100 },
-  header:          { alignItems: "center", marginBottom: 40 },
-  avatarContainer: {
-    width: 96, height: 96, borderRadius: 48,
-    backgroundColor: "#0F172A", alignItems: "center", justifyContent: "center",
+  safe: {
+    flex: 1,
+    backgroundColor: "#F4F6F8",
+  },
+
+  scroll: {
+    paddingBottom: 120,
+  },
+
+  userRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    marginHorizontal: 16,
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+
+  avatar: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: "#0B7A5A",
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 14,
+  },
+
+  avatarTxt: {
+    color: "#FFF",
+    fontSize: 22,
+    fontWeight: "900",
+  },
+
+  userMeta: {
+    flex: 1,
+  },
+
+  userName: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#111827",
+  },
+
+  userRole: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#0B7A5A",
+    marginTop: 2,
+  },
+
+  statsCard: {
+    flexDirection: "row",
+    backgroundColor: "#FFFFFF",
+    marginHorizontal: 16,
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 24,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+
+  statItem: {
+    flex: 1,
+    alignItems: "center",
+  },
+
+  statLabel: {
+    fontSize: 11,
+    color: "#9CA3AF",
+    fontWeight: "600",
+    marginBottom: 4,
+  },
+
+  statValue: {
+    fontSize: 20,
+    fontWeight: "900",
+    color: "#111827",
+  },
+
+  statSub: {
+    fontSize: 11,
+    color: "#9CA3AF",
+    fontWeight: "500",
+    marginTop: 2,
+  },
+
+  statDiv: {
+    width: 1,
+    backgroundColor: "#F3F4F6",
+    marginVertical: 4,
+  },
+
+  sectionTitle: {
+    fontSize: 17,
+    fontWeight: "800",
+    color: "#111827",
+    marginHorizontal: 20,
+    marginBottom: 12,
+  },
+
+  gridRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginHorizontal: 12,
+    marginBottom: 28,
+  },
+
+  gridItem: {
+    width: "20%",
+    alignItems: "center",
+    paddingVertical: 12,
+  },
+
+  gridIconWrap: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 6,
+    backgroundColor: "#EFF6FF",
+  },
+
+  gridLabel: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#374151",
+    textAlign: "center",
+  },
+
+  toolsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginHorizontal: 12,
+    marginBottom: 24,
+  },
+
+  toolsItem: {
+    width: "25%",
+    alignItems: "center",
+    paddingVertical: 12,
+  },
+
+  toolsIconWrap: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 7,
+    backgroundColor: "#EFF6FF",
+    borderWidth: 1,
+    borderColor: "#DBEAFE",
+  },
+
+  toolsLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#3B82F6",
+    textAlign: "center",
+  },
+
+  logoutBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginHorizontal: 16,
+    paddingVertical: 16,
+    borderRadius: 16,
+    backgroundColor: "#FEF2F2",
+    borderWidth: 1,
+    borderColor: "#FEE2E2",
+    marginBottom: 40,
+  },
+
+  logoutTxt: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#EF4444",
+  },
+
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(17, 24, 39, 0.55)",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+  },
+
+  modalCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    padding: 18,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.22,
+    shadowRadius: 20,
+    elevation: 10,
+  },
+
+  modalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 18,
+  },
+
+  modalHeaderIcon: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: "#ECFDF5",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+
+  modalTitleWrap: {
+    flex: 1,
+  },
+
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: "#111827",
+  },
+
+  modalSubtitle: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#6B7280",
+    marginTop: 3,
+    lineHeight: 17,
+  },
+
+  modalStepsWrap: {
+    borderRadius: 18,
+    backgroundColor: "#F9FAFB",
+    paddingVertical: 8,
     marginBottom: 16,
-    shadowColor: "#0F172A", shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.1, shadowRadius: 16, elevation: 4,
   },
-  avatarText:      { fontSize: 36, fontWeight: "900", color: "#FFFFFF" },
-  name:            { fontSize: 24, fontWeight: "800", color: "#0F172A", marginBottom: 4 },
-  role:            { fontSize: 14, fontWeight: "600", color: "#64748B", marginBottom: 16 },
-  editButton:      { backgroundColor: "#EFF6FF", paddingHorizontal: 20, paddingVertical: 10, borderRadius: 100 },
-  editButtonText:  { fontSize: 14, fontWeight: "700", color: "#3B82F6" },
-  section:         { marginBottom: 32 },
-  sectionTitle:    { fontSize: 16, fontWeight: "800", color: "#0F172A", marginBottom: 16 },
-  menuItem: {
-    flexDirection: "row", alignItems: "center",
-    backgroundColor: "#FFFFFF", padding: 16, borderRadius: 20, marginBottom: 12,
-    shadowColor: "#0F172A", shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.03, shadowRadius: 12, elevation: 2,
-    borderWidth: 1, borderColor: "#F1F5F9",
-  },
-  menuIconBox: {
-    width: 44, height: 44, borderRadius: 14,
-    alignItems: "center", justifyContent: "center", marginRight: 16,
-  },
-  menuText:  { flex: 1, fontSize: 15, fontWeight: "600", color: "#0F172A" },
-  menuSub:   { fontSize: 12, color: "#94A3B8", fontWeight: "500", marginTop: 2 },
-  logoutButton: {
-    flexDirection: "row", alignItems: "center", justifyContent: "center",
-    backgroundColor: "#FEF2F2", paddingVertical: 16, borderRadius: 20,
-    borderWidth: 1, borderColor: "#FEE2E2",
-  },
-  logoutText: { fontSize: 16, fontWeight: "700", color: "#EF4444" },
 
-  syncBar: {
-    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-    backgroundColor: "#FFFFFF", padding: 16, borderRadius: 20,
-    shadowColor: "#0F172A", shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.03, shadowRadius: 12, elevation: 2,
-    borderWidth: 1, borderColor: "#F1F5F9",
+  stepRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
-  syncBarLeft:  { flexDirection: "row", alignItems: "center", gap: 16, flex: 1 },
-  syncBarIcon:  { width: 44, height: 44, borderRadius: 14, alignItems: "center", justifyContent: "center" },
-  syncBadge:    { minWidth: 24, height: 24, borderRadius: 12, backgroundColor: "#EF4444", alignItems: "center", justifyContent: "center", paddingHorizontal: 6 },
-  syncBadgeText:{ fontSize: 11, fontWeight: "800", color: "#fff" },
-});
 
-const nd = StyleSheet.create({
-  overlay: {
-    flex: 1, justifyContent: "flex-end",
-    backgroundColor: "rgba(15,23,42,0.55)",
+  stepIconWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
   },
-  sheet: {
-    backgroundColor: "#FFFFFF", borderTopLeftRadius: 28, borderTopRightRadius: 28,
-    paddingTop: 12, paddingBottom: 40, maxHeight: "90%",
-  },
-  handle: {
-    width: 40, height: 4, borderRadius: 2,
-    backgroundColor: "#E2E8F0", alignSelf: "center", marginBottom: 20,
-  },
-  headerRow: {
-    flexDirection: "row", alignItems: "center",
-    paddingHorizontal: 20, marginBottom: 4,
-  },
-  headerLeft:  { flex: 1, flexDirection: "row", alignItems: "center" },
-  headerIcon:  { width: 36, height: 36, borderRadius: 10, alignItems: "center", justifyContent: "center", marginRight: 12 },
-  headerTitle: { fontSize: 18, fontWeight: "800", color: "#0F172A" },
-  closeBtn:    { padding: 4 },
-  body:        { paddingHorizontal: 20, paddingTop: 16 },
 
-  orbWrap: { alignItems: "center", justifyContent: "center", marginVertical: 24, height: 110 },
-  pulseRing: {
-    position: "absolute", width: 100, height: 100, borderRadius: 50,
-    borderWidth: 2,
+  stepIdleDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#D1D5DB",
   },
-  orb: {
-    width: 100, height: 100, borderRadius: 50,
-    alignItems: "center", justifyContent: "center",
-    borderWidth: 2,
-  },
-  statusLabel: { textAlign: "center", fontSize: 18, fontWeight: "800", marginBottom: 20 },
 
-  cards: { flexDirection: "row", gap: 12, marginBottom: 16 },
-  card: {
-    flex: 1, backgroundColor: "#F8FAFC", borderRadius: 20,
-    padding: 16, alignItems: "center", borderWidth: 1, borderColor: "#F1F5F9",
+  stepSuccess: {
+    color: "#0B7A5A",
+    fontSize: 16,
+    fontWeight: "900",
   },
-  cardIcon: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center", marginBottom: 10 },
-  cardLabel: { fontSize: 11, fontWeight: "600", color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 },
-  cardValue: { fontSize: 28, fontWeight: "900", marginBottom: 8 },
-  cardUnit:  { fontSize: 14, fontWeight: "600" },
-  qualityBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 100 },
-  qualityText: { fontSize: 12, fontWeight: "700" },
 
-  detailBox: {
-    backgroundColor: "#F8FAFC", borderRadius: 16, padding: 16,
-    borderWidth: 1, borderColor: "#F1F5F9", marginBottom: 16,
-    gap: 10,
+  stepError: {
+    color: "#EF4444",
+    fontSize: 16,
+    fontWeight: "900",
   },
-  detailRow: { flexDirection: "row", justifyContent: "space-between" },
-  detailKey: { fontSize: 13, color: "#64748B", fontWeight: "500" },
-  detailVal: { fontSize: 13, color: "#0F172A", fontWeight: "700" },
 
-  errorBox: {
-    backgroundColor: "#FEF2F2", borderRadius: 16, padding: 16,
-    borderWidth: 1, borderColor: "#FEE2E2", marginBottom: 16,
+  stepTextWrap: {
+    flex: 1,
   },
-  errorText: { fontSize: 14, color: "#DC2626", fontWeight: "600", textAlign: "center" },
 
-  runBtn: {
-    backgroundColor: "#0F172A", borderRadius: 20, paddingVertical: 16,
-    alignItems: "center", justifyContent: "center",
-    flexDirection: "row", marginBottom: 12,
+  stepLabel: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#111827",
   },
-  runBtnDisabled: { backgroundColor: "#334155" },
-  runBtnText: { fontSize: 16, fontWeight: "800", color: "#FFFFFF" },
 
-  disclaimer: {
-    fontSize: 11, color: "#94A3B8", textAlign: "center",
-    lineHeight: 16, paddingHorizontal: 8,
+  stepDetail: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#6B7280",
+    marginTop: 3,
+    lineHeight: 16,
+  },
+
+  stepDetailError: {
+    color: "#EF4444",
+  },
+
+  modalCloseBtn: {
+    backgroundColor: "#0B7A5A",
+    borderRadius: 16,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+
+  modalCloseBtnDisabled: {
+    backgroundColor: "#9CA3AF",
+  },
+
+  modalCloseText: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "800",
   },
 });

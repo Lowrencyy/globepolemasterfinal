@@ -1,4 +1,25 @@
-import { useCallback, useEffect, useState } from "react";
+import { useAuth } from "@/context/auth-context";
+import {
+  gpsQueueFlush,
+  gpsQueueReadAll,
+  gpsQueueRemove,
+} from "@/lib/gps-queue";
+import { isOnline } from "@/lib/net-sync";
+import {
+  processSimpleQueue,
+  simpleQueueReadAll,
+  simpleQueueRemove,
+} from "@/lib/simple-queue";
+import {
+  imageQueueReadAll,
+  imageQueueRemove,
+  processImageQueue,
+  processSyncQueue,
+  queueReadAll,
+  queueRemove,
+} from "@/lib/sync-queue";
+import { getQueue } from "@/services/offline";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,79 +33,220 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { gpsQueueReadAll, gpsQueueFlush, gpsQueueRemove } from "@/lib/gps-queue";
-import { simpleQueueReadAll, simpleQueueRemove, processSimpleQueue } from "@/lib/simple-queue";
-import { queueReadAll, queueRemove, processSyncQueue, imageQueueReadAll, imageQueueRemove, processImageQueue } from "@/lib/sync-queue";
-import { getQueue } from "@/services/offline";
-import { isOnline } from "@/lib/net-sync";
-import { useAuth } from "@/context/auth-context";
 
-const PRIMARY = "#0A5C3B";
-const OFFLINE_BG = "#FFF7ED";
-const OFFLINE_DOT = "#F97316";
-const PENDING_BG = "#EFF6FF";
+const COLORS = {
+  primary: "#0A5C3B",
+  bg: "#F3F6F4",
+  card: "#FFFFFF",
+  ink: "#0F172A",
+  muted: "#64748B",
+  softMuted: "#94A3B8",
+  border: "#E2E8F0",
+  danger: "#DC2626",
+  blue: "#2563EB",
+  purple: "#7C3AED",
+  pink: "#DB2777",
+  orange: "#EA580C",
+  success: "#16A34A",
+};
+
+const SECTION_COLORS = {
+  gps: "#2563EB",
+  teardown: COLORS.primary,
+  simple: "#7C3AED",
+  images: "#DB2777",
+  nap: "#EA580C",
+};
 
 type SectionKey = "gps" | "teardown" | "simple" | "nap" | "images" | "all";
+
+type QueueSectionProps = {
+  title: string;
+  subtitle: string;
+  icon: string;
+  count: number;
+  color: string;
+  retrying: boolean;
+  onRetry: () => void;
+  onClear: () => void;
+  children: React.ReactNode;
+};
 
 function fmtDate(iso: string | number) {
   const d = typeof iso === "number" ? new Date(iso) : new Date(iso);
   return d.toLocaleString("en-PH", {
-    month: "short", day: "numeric",
-    hour: "2-digit", minute: "2-digit", hour12: true,
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
   });
 }
 
-function SectionHeader({
-  label, count, color, onRetry, onClear, retrying,
+function pluralize(count: number, noun: string) {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function Pill({
+  label,
+  color,
+  tone = "light",
 }: {
-  label: string; count: number; color: string;
-  onRetry: () => void; onClear: () => void; retrying: boolean;
+  label: string;
+  color: string;
+  tone?: "light" | "solid";
 }) {
   return (
-    <View style={styles.sectionHeader}>
-      <View style={styles.sectionLeft}>
-        <View style={[styles.sectionDot, { backgroundColor: color }]} />
-        <Text style={styles.sectionTitle}>{label}</Text>
-        <View style={[styles.countBadge, { backgroundColor: count > 0 ? color + "20" : "#F1F5F9" }]}>
-          <Text style={[styles.countText, { color: count > 0 ? color : "#94A3B8" }]}>{count}</Text>
-        </View>
-      </View>
-      {count > 0 && (
-        <View style={styles.sectionActions}>
-          <TouchableOpacity style={styles.retryBtn} onPress={onRetry} disabled={retrying}>
-            {retrying
-              ? <ActivityIndicator size="small" color={color} />
-              : <Text style={[styles.retryText, { color }]}>Retry all</Text>}
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.clearBtn} onPress={onClear}>
-            <Text style={styles.clearText}>Clear</Text>
-          </TouchableOpacity>
-        </View>
-      )}
+    <View
+      style={[
+        styles.pill,
+        {
+          backgroundColor: tone === "solid" ? color : `${color}14`,
+          borderColor: tone === "solid" ? color : `${color}24`,
+        },
+      ]}
+    >
+      <Text
+        style={[
+          styles.pillText,
+          { color: tone === "solid" ? "#FFFFFF" : color },
+        ]}
+      >
+        {label}
+      </Text>
     </View>
   );
 }
 
-function EmptySection() {
+function QueueSection({
+  title,
+  subtitle,
+  icon,
+  count,
+  color,
+  retrying,
+  onRetry,
+  onClear,
+  children,
+}: QueueSectionProps) {
   return (
-    <View style={styles.emptyRow}>
-      <Text style={styles.emptyText}>No pending items</Text>
+    <View style={styles.sectionCard}>
+      <View style={styles.sectionTop}>
+        <View style={[styles.sectionIcon, { backgroundColor: `${color}12` }]}>
+          <Text style={styles.sectionIconText}>{icon}</Text>
+        </View>
+
+        <View style={styles.sectionHeading}>
+          <View style={styles.sectionTitleRow}>
+            <Text style={styles.sectionTitle}>{title}</Text>
+            <Pill label={`${count}`} color={color} />
+          </View>
+          <Text style={styles.sectionSub}>{subtitle}</Text>
+        </View>
+      </View>
+
+      {count > 0 ? (
+        <View style={styles.sectionControls}>
+          <TouchableOpacity
+            style={[styles.softButton, { borderColor: `${color}30` }]}
+            onPress={onRetry}
+            disabled={retrying}
+          >
+            {retrying ? (
+              <ActivityIndicator size="small" color={color} />
+            ) : (
+              <Text style={[styles.softButtonText, { color }]}>Retry all</Text>
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.clearButton} onPress={onClear}>
+            <Text style={styles.clearButtonText}>Clear</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+
+      <View style={styles.listWrap}>{children}</View>
     </View>
+  );
+}
+
+function EmptyState({ label = "No pending items" }: { label?: string }) {
+  return (
+    <View style={styles.emptyState}>
+      <Text style={styles.emptyIcon}>✓</Text>
+      <Text style={styles.emptyText}>{label}</Text>
+    </View>
+  );
+}
+
+function QueueRow({
+  icon,
+  tint,
+  title,
+  subtitle,
+  meta,
+  status,
+  statusColor = COLORS.blue,
+  error,
+  onPress,
+}: {
+  icon: string;
+  tint: string;
+  title: React.ReactNode;
+  subtitle?: React.ReactNode;
+  meta?: string;
+  status?: string;
+  statusColor?: string;
+  error?: string | null;
+  onPress?: () => void;
+}) {
+  const Wrapper = onPress ? TouchableOpacity : View;
+
+  return (
+    <Wrapper
+      style={styles.queueRow}
+      activeOpacity={0.72}
+      onPress={onPress as any}
+    >
+      <View style={[styles.queueIcon, { backgroundColor: `${tint}12` }]}>
+        <Text style={styles.queueIconText}>{icon}</Text>
+      </View>
+
+      <View style={styles.queueBody}>
+        <Text style={styles.queueTitle} numberOfLines={1}>
+          {title}
+        </Text>
+        {subtitle ? (
+          <Text style={styles.queueSub} numberOfLines={1}>
+            {subtitle}
+          </Text>
+        ) : null}
+        {error ? (
+          <Text style={[styles.queueSub, styles.errorText]} numberOfLines={1}>
+            {error}
+          </Text>
+        ) : null}
+      </View>
+
+      <View style={styles.queueRight}>
+        {status ? <Pill label={status} color={statusColor} /> : null}
+        {meta ? <Text style={styles.queueMeta}>{meta}</Text> : null}
+      </View>
+    </Wrapper>
   );
 }
 
 export default function QueueScreen() {
   const { token } = useAuth();
 
-  const [gpsItems,      setGpsItems]      = useState<any[]>([]);
+  const [gpsItems, setGpsItems] = useState<any[]>([]);
   const [teardownItems, setTeardownItems] = useState<any[]>([]);
-  const [simpleItems,   setSimpleItems]   = useState<any[]>([]);
-  const [napItems,      setNapItems]      = useState<any[]>([]);
-  const [imageItems,    setImageItems]    = useState<any[]>([]);
-  const [online,        setOnline]        = useState(true);
-  const [refreshing,    setRefreshing]    = useState(false);
-  const [retrying,      setRetrying]      = useState<SectionKey | null>(null);
-  const [previewItem,   setPreviewItem]   = useState<any | null>(null);
+  const [simpleItems, setSimpleItems] = useState<any[]>([]);
+  const [napItems, setNapItems] = useState<any[]>([]);
+  const [imageItems, setImageItems] = useState<any[]>([]);
+  const [online, setOnline] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [retrying, setRetrying] = useState<SectionKey | null>(null);
+  const [previewItem, setPreviewItem] = useState<any | null>(null);
 
   const load = useCallback(async () => {
     const [gps, td, simple, nap, imgs, net] = await Promise.all([
@@ -95,6 +257,7 @@ export default function QueueScreen() {
       imageQueueReadAll().catch(() => []),
       isOnline().catch(() => false),
     ]);
+
     setGpsItems(gps);
     setTeardownItems(td);
     setSimpleItems(simple);
@@ -103,7 +266,9 @@ export default function QueueScreen() {
     setOnline(net);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -111,14 +276,39 @@ export default function QueueScreen() {
     setRefreshing(false);
   };
 
-  const pendingTeardowns = teardownItems.filter(i => i.status !== "synced");
-  const pendingImages    = imageItems.filter(i => i.status !== "synced");
-  // Count only truly retryable items (not permanently failed) for the sync badge
-  const syncableTeardowns = pendingTeardowns.filter(i => i.status !== "permanently_failed");
-  const syncableImages    = pendingImages.filter(i => i.status !== "permanently_failed");
-  const totalPending      = gpsItems.length + syncableTeardowns.length + simpleItems.length + napItems.length + syncableImages.length;
+  const pendingTeardowns = teardownItems.filter((i) => i.status !== "synced");
+  const pendingImages = imageItems.filter((i) => i.status !== "synced");
+  const syncableTeardowns = pendingTeardowns.filter(
+    (i) => i.status !== "permanently_failed",
+  );
+  const syncableImages = pendingImages.filter(
+    (i) => i.status !== "permanently_failed",
+  );
 
-  // ── Retry handlers ────────────────────────────────────────────────────────
+  const totalPending =
+    gpsItems.length +
+    syncableTeardowns.length +
+    simpleItems.length +
+    napItems.length +
+    syncableImages.length;
+
+  const sectionsWithItems = useMemo(
+    () =>
+      [
+        gpsItems.length,
+        pendingTeardowns.length,
+        simpleItems.length,
+        pendingImages.length,
+        napItems.length,
+      ].filter(Boolean).length,
+    [
+      gpsItems.length,
+      pendingTeardowns.length,
+      simpleItems.length,
+      pendingImages.length,
+      napItems.length,
+    ],
+  );
 
   const retryGps = async () => {
     setRetrying("gps");
@@ -134,22 +324,32 @@ export default function QueueScreen() {
   const retryTeardown = async () => {
     setRetrying("teardown");
     const result = await processSyncQueue().catch((e: any) => ({
-      submitted: 0, failed: pendingTeardowns.length, permanentlyFailed: 0,
+      submitted: 0,
+      failed: pendingTeardowns.length,
+      permanentlyFailed: 0,
       firstError: e?.message ?? "Unknown error",
     }));
+
     await load();
     setRetrying(null);
+
     if (result.permanentlyFailed > 0) {
-      Alert.alert("Upload Error", `${result.permanentlyFailed} item(s) permanently failed (bad data). Please remove them manually.`);
+      Alert.alert(
+        "Upload Error",
+        `${result.permanentlyFailed} item(s) permanently failed. Please remove them manually.`,
+      );
     } else if (result.failed > 0) {
       Alert.alert(
         "Upload Failed",
         result.firstError
           ? `${result.failed} item(s) still pending.\n\nReason: ${result.firstError}`
-          : `${result.failed} item(s) could not upload. Check your connection and try again.`,
+          : `${result.failed} item(s) could not upload.`,
       );
     } else if (result.submitted > 0) {
-      Alert.alert("Uploaded", `${result.submitted} teardown report(s) submitted successfully.`);
+      Alert.alert(
+        "Uploaded",
+        `${result.submitted} teardown report(s) submitted successfully.`,
+      );
     }
   };
 
@@ -193,6 +393,7 @@ export default function QueueScreen() {
       Alert.alert("No offline data to sync", "All items are already synced.");
       return;
     }
+
     setRetrying("all");
     try {
       const [tdResult] = await Promise.allSettled([
@@ -200,12 +401,19 @@ export default function QueueScreen() {
         processSimpleQueue(),
         gpsQueueFlush(),
         processImageQueue(),
-        token ? import("@/services/offline").then(m => m.syncQueue(token)) : Promise.resolve(),
+        token
+          ? import("@/services/offline").then((m) => m.syncQueue(token))
+          : Promise.resolve(),
       ]);
+
       await load();
       const td = tdResult.status === "fulfilled" ? tdResult.value : null;
+
       if (td && td.failed > 0) {
-        Alert.alert("Sync Partial", `${td.failed} item(s) could not upload.\n${td.firstError ?? ""}`);
+        Alert.alert(
+          "Sync Partial",
+          `${td.failed} item(s) could not upload.\n${td.firstError ?? ""}`,
+        );
       } else {
         Alert.alert("Sync Complete", "All pending data has been uploaded.");
       }
@@ -215,8 +423,6 @@ export default function QueueScreen() {
     setRetrying(null);
   };
 
-  // ── Clear handlers ────────────────────────────────────────────────────────
-
   const confirmClear = (label: string, onConfirm: () => void) => {
     Alert.alert(`Clear ${label}?`, "These items will be permanently removed.", [
       { text: "Cancel", style: "cancel" },
@@ -224,244 +430,312 @@ export default function QueueScreen() {
     ]);
   };
 
-  const clearGps = () => confirmClear("GPS queue", async () => {
-    for (const item of gpsItems) await gpsQueueRemove(item.pole_id).catch(() => {});
-    await load();
-  });
+  const clearGps = () =>
+    confirmClear("GPS queue", async () => {
+      for (const item of gpsItems)
+        await gpsQueueRemove(item.pole_id).catch(() => {});
+      await load();
+    });
 
-  const clearTeardown = () => confirmClear("teardown queue", async () => {
-    for (const item of teardownItems) await queueRemove(item.id).catch(() => {});
-    await load();
-  });
+  const clearTeardown = () =>
+    confirmClear("teardown queue", async () => {
+      for (const item of teardownItems)
+        await queueRemove(item.id).catch(() => {});
+      await load();
+    });
 
-  const clearSimple = () => confirmClear("simple queue", async () => {
-    for (const item of simpleItems) await simpleQueueRemove(item.id).catch(() => {});
-    await load();
-  });
+  const clearSimple = () =>
+    confirmClear("simple queue", async () => {
+      for (const item of simpleItems)
+        await simpleQueueRemove(item.id).catch(() => {});
+      await load();
+    });
 
-  const clearNap = () => confirmClear("NAP/Pole queue", async () => {
-    const { removeFromQueue } = await import("@/services/offline");
-    for (const item of napItems) await removeFromQueue(item.id).catch(() => {});
-    await load();
-  });
+  const clearNap = () =>
+    confirmClear("NAP/Pole queue", async () => {
+      const { removeFromQueue } = await import("@/services/offline");
+      for (const item of napItems)
+        await removeFromQueue(item.id).catch(() => {});
+      await load();
+    });
 
-  const clearImages = () => confirmClear("image queue", async () => {
-    for (const item of pendingImages) await imageQueueRemove(item.id).catch(() => {});
-    await load();
-  });
+  const clearImages = () =>
+    confirmClear("image queue", async () => {
+      for (const item of pendingImages)
+        await imageQueueRemove(item.id).catch(() => {});
+      await load();
+    });
 
   return (
     <SafeAreaView style={styles.root} edges={["top"]}>
-      {/* Header */}
-      <View style={styles.header}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.headerTitle}>Pending Queue</Text>
-          <Text style={styles.headerSub}>
-            {totalPending === 0 ? "All synced" : `${totalPending} item${totalPending !== 1 ? "s" : ""} waiting`}
-          </Text>
+      <View style={styles.hero}>
+        <View style={styles.heroTopRow}>
+          <View>
+            <Text style={styles.kicker}>OFFLINE CENTER</Text>
+            <Text style={styles.heroTitle}>Pending Queue</Text>
+          </View>
+
+          <View
+            style={[
+              styles.connectionBadge,
+              { backgroundColor: online ? "#DCFCE7" : "#FFEDD5" },
+            ]}
+          >
+            <View
+              style={[
+                styles.connectionDot,
+                { backgroundColor: online ? COLORS.success : COLORS.orange },
+              ]}
+            />
+            <Text
+              style={[
+                styles.connectionText,
+                { color: online ? "#15803D" : "#C2410C" },
+              ]}
+            >
+              {online ? "Online" : "Offline"}
+            </Text>
+          </View>
         </View>
-        <View style={[styles.netBadge, { backgroundColor: online ? "#DCFCE7" : OFFLINE_BG }]}>
-          <View style={[styles.netDot, { backgroundColor: online ? "#16A34A" : OFFLINE_DOT }]} />
-          <Text style={[styles.netText, { color: online ? "#15803D" : "#C2410C" }]}>
-            {online ? "Online" : "Offline"}
-          </Text>
+
+        <View style={styles.summaryCard}>
+          <View>
+            <Text style={styles.summaryNumber}>{totalPending}</Text>
+            <Text style={styles.summaryLabel}>
+              {totalPending === 0
+                ? "Everything is synced"
+                : "Items waiting to upload"}
+            </Text>
+          </View>
+
+          <TouchableOpacity
+            style={[
+              styles.syncButton,
+              (retrying === "all" || totalPending === 0) &&
+                styles.disabledButton,
+            ]}
+            onPress={syncAll}
+            disabled={retrying === "all" || totalPending === 0}
+          >
+            {retrying === "all" ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.syncButtonText}>Sync all</Text>
+            )}
+          </TouchableOpacity>
         </View>
-        <TouchableOpacity
-          style={[styles.syncAllBtn, (retrying === "all" || totalPending === 0) && { opacity: 0.5 }]}
-          onPress={syncAll}
-          disabled={retrying === "all"}
-        >
-          {retrying === "all"
-            ? <ActivityIndicator size="small" color="#fff" />
-            : <Text style={styles.syncAllText}>↑ Sync All</Text>}
-        </TouchableOpacity>
+
+        {totalPending === 0 ? (
+          <Text style={styles.heroHint}>
+            Pull down to check for new pending data.
+          </Text>
+        ) : null}
       </View>
 
       <ScrollView
+        style={styles.scroll}
         contentContainerStyle={styles.content}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[PRIMARY]} />}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            colors={[COLORS.primary]}
+          />
+        }
         showsVerticalScrollIndicator={false}
       >
-        {totalPending === 0 && !refreshing && (
-          <View style={styles.allClearBox}>
-            <Text style={styles.allClearIcon}>✓</Text>
-            <Text style={styles.allClearTitle}>All synced</Text>
-            <Text style={styles.allClearSub}>No pending uploads. Pull down to refresh.</Text>
+        {totalPending === 0 && !refreshing ? (
+          <View style={styles.allClearCard}>
+            <Text style={styles.allClearMark}>✓</Text>
+            <Text style={styles.allClearTitle}>You’re all caught up</Text>
+            <Text style={styles.allClearSub}>
+              There are no pending uploads on this device.
+            </Text>
           </View>
-        )}
+        ) : null}
 
-        {/* ── GPS Queue ── */}
-        <View style={styles.section}>
-          <SectionHeader
-            label="GPS Updates"
-            count={gpsItems.length}
-            color="#3B82F6"
-            onRetry={retryGps}
-            onClear={clearGps}
-            retrying={retrying === "gps"}
-          />
-          {gpsItems.length === 0 ? <EmptySection /> : gpsItems.map((item, i) => (
-            <View key={item.pole_id + i} style={[styles.row, i < gpsItems.length - 1 && styles.rowBorder]}>
-              <View style={[styles.rowIcon, { backgroundColor: PENDING_BG }]}>
-                <Text style={styles.rowIconText}>📍</Text>
-              </View>
-              <View style={styles.rowBody}>
-                <Text style={styles.rowTitle}>Pole #{item.pole_id}</Text>
-                <Text style={styles.rowSub}>{item.lat?.toFixed(6)}, {item.lng?.toFixed(6)}</Text>
-              </View>
-              <Text style={styles.rowTime}>{fmtDate(item.queuedAt)}</Text>
-            </View>
-          ))}
-        </View>
+        {totalPending > 0 ? (
+          <>
+            <QueueSection
+              title="GPS Updates"
+              subtitle="Pole location changes"
+              icon="📍"
+              count={gpsItems.length}
+              color={SECTION_COLORS.gps}
+              retrying={retrying === "gps"}
+              onRetry={retryGps}
+              onClear={clearGps}
+            >
+              {gpsItems.length === 0 ? (
+                <EmptyState />
+              ) : (
+                gpsItems.map((item, i) => (
+                  <QueueRow
+                    key={`${item.pole_id}-${i}`}
+                    icon="📍"
+                    tint={SECTION_COLORS.gps}
+                    title={`Pole #${item.pole_id}`}
+                    subtitle={`${item.lat?.toFixed(6)}, ${item.lng?.toFixed(6)}`}
+                    meta={fmtDate(item.queuedAt)}
+                  />
+                ))
+              )}
+            </QueueSection>
 
-        {/* ── Teardown Queue ── */}
-        <View style={styles.section}>
-          <SectionHeader
-            label="Teardown Submissions"
-            count={pendingTeardowns.length}
-            color={PRIMARY}
-            onRetry={retryTeardown}
-            onClear={clearTeardown}
-            retrying={retrying === "teardown"}
-          />
-          {pendingTeardowns.length === 0 ? <EmptySection /> : pendingTeardowns.map((item, i) => {
-            const f = item.fields ?? {};
-            const fromCode = f.from_pole_code ?? f.pole_code ?? "—";
-            const toCode   = f.to_pole_code ?? "—";
-            const isPermanent = item.status === "permanently_failed";
-            const isFailed = item.status === "failed" || isPermanent;
-            const statusColor = isPermanent ? "#7C3AED" : isFailed ? "#DC2626" : "#3B82F6";
-            const statusBg    = isPermanent ? "#F5F3FF" : isFailed ? "#FEF2F2" : PENDING_BG;
-            return (
-              <TouchableOpacity
-                key={item.id}
-                style={[styles.row, i < pendingTeardowns.length - 1 && styles.rowBorder]}
-                activeOpacity={0.7}
-                onPress={() => setPreviewItem(item)}
-              >
-                <View style={[styles.rowIcon, { backgroundColor: "#F0FDF4" }]}>
-                  <Text style={styles.rowIconText}>📋</Text>
-                </View>
-                <View style={styles.rowBody}>
-                  <Text style={styles.rowTitle}>
-                    <Text style={{ color: PRIMARY }}>{fromCode}</Text>
-                    {"  →  "}
-                    <Text style={{ color: "#6366F1" }}>{toCode}</Text>
-                  </Text>
-                  <Text style={styles.rowSub}>{fmtDate(item.queuedAt)}</Text>
-                  {isFailed && item.lastError ? <Text style={[styles.rowSub, { color: isPermanent ? "#7C3AED" : "#DC2626" }]} numberOfLines={1}>{item.lastError}</Text> : null}
-                </View>
-                <View style={styles.rowRight}>
-                  <View style={[styles.statusPill, { backgroundColor: statusBg }]}>
-                    <Text style={[styles.statusText, { color: statusColor }]}>
-                      {isPermanent ? "perm. failed" : item.status}
-                    </Text>
-                  </View>
-                  {(item.retryCount ?? 0) > 0 && (
-                    <Text style={styles.rowTime}>attempt {item.retryCount}/5</Text>
-                  )}
-                </View>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
+            <QueueSection
+              title="Teardown Submissions"
+              subtitle="Span reports and collected materials"
+              icon="📋"
+              count={pendingTeardowns.length}
+              color={SECTION_COLORS.teardown}
+              retrying={retrying === "teardown"}
+              onRetry={retryTeardown}
+              onClear={clearTeardown}
+            >
+              {pendingTeardowns.length === 0 ? (
+                <EmptyState />
+              ) : (
+                pendingTeardowns.map((item) => {
+                  const f = item.fields ?? {};
+                  const fromCode = f.from_pole_code ?? f.pole_code ?? "—";
+                  const toCode = f.to_pole_code ?? "—";
+                  const isPermanent = item.status === "permanently_failed";
+                  const isFailed = item.status === "failed" || isPermanent;
+                  const statusColor = isPermanent
+                    ? COLORS.purple
+                    : isFailed
+                      ? COLORS.danger
+                      : COLORS.blue;
 
-        {/* ── Simple Queue ── */}
-        <View style={styles.section}>
-          <SectionHeader
-            label="Field Updates"
-            count={simpleItems.length}
-            color="#8B5CF6"
-            onRetry={retrySimple}
-            onClear={clearSimple}
-            retrying={retrying === "simple"}
-          />
-          {simpleItems.length === 0 ? <EmptySection /> : simpleItems.map((item, i) => (
-            <View key={item.id} style={[styles.row, i < simpleItems.length - 1 && styles.rowBorder]}>
-              <View style={[styles.rowIcon, { backgroundColor: "#F5F3FF" }]}>
-                <Text style={styles.rowIconText}>✏️</Text>
-              </View>
-              <View style={styles.rowBody}>
-                <Text style={styles.rowTitle}>{item.method?.toUpperCase()} {item.url}</Text>
-                <Text style={styles.rowSub} numberOfLines={1}>
-                  {JSON.stringify(item.body)}
-                </Text>
-              </View>
-              <Text style={styles.rowTime}>{fmtDate(item.queuedAt)}</Text>
-            </View>
-          ))}
-        </View>
+                  return (
+                    <QueueRow
+                      key={item.id}
+                      icon="📋"
+                      tint={SECTION_COLORS.teardown}
+                      title={
+                        <>
+                          <Text style={{ color: COLORS.primary }}>
+                            {fromCode}
+                          </Text>
+                          <Text style={{ color: COLORS.softMuted }}> → </Text>
+                          <Text style={{ color: "#4F46E5" }}>{toCode}</Text>
+                        </>
+                      }
+                      subtitle={fmtDate(item.queuedAt)}
+                      status={isPermanent ? "perm. failed" : item.status}
+                      statusColor={statusColor}
+                      meta={
+                        (item.retryCount ?? 0) > 0
+                          ? `try ${item.retryCount}/5`
+                          : undefined
+                      }
+                      error={isFailed ? item.lastError : null}
+                      onPress={() => setPreviewItem(item)}
+                    />
+                  );
+                })
+              )}
+            </QueueSection>
 
-        {/* ── Image Queue ── */}
-        <View style={styles.section}>
-          <SectionHeader
-            label="Pending Images"
-            count={pendingImages.length}
-            color="#EC4899"
-            onRetry={retryImages}
-            onClear={clearImages}
-            retrying={retrying === "images"}
-          />
-          {pendingImages.length === 0 ? <EmptySection /> : pendingImages.map((item, i) => {
-            const isFailed = item.status === "failed";
-            return (
-              <View key={item.id} style={[styles.row, i < pendingImages.length - 1 && styles.rowBorder]}>
-                <View style={[styles.rowIcon, { backgroundColor: "#FDF2F8" }]}>
-                  <Text style={styles.rowIconText}>🖼️</Text>
-                </View>
-                <View style={styles.rowBody}>
-                  <Text style={styles.rowTitle}>{item.fieldName?.replace(/_/g, " ")}</Text>
-                  <Text style={styles.rowSub} numberOfLines={1}>{item.meta?.pole_code ?? "—"} · {item.meta?.image_type ?? "—"}</Text>
-                  {isFailed && item.lastError ? <Text style={[styles.rowSub, { color: "#DC2626" }]} numberOfLines={1}>{item.lastError}</Text> : null}
-                </View>
-                <View style={styles.rowRight}>
-                  <View style={[styles.statusPill, { backgroundColor: isFailed ? "#FEF2F2" : PENDING_BG }]}>
-                    <Text style={[styles.statusText, { color: isFailed ? "#DC2626" : "#3B82F6" }]}>{item.status}</Text>
-                  </View>
-                  <Text style={styles.rowTime}>{fmtDate(item.queuedAt)}</Text>
-                </View>
-              </View>
-            );
-          })}
-        </View>
+            <QueueSection
+              title="Field Updates"
+              subtitle="Small API changes saved offline"
+              icon="✏️"
+              count={simpleItems.length}
+              color={SECTION_COLORS.simple}
+              retrying={retrying === "simple"}
+              onRetry={retrySimple}
+              onClear={clearSimple}
+            >
+              {simpleItems.length === 0 ? (
+                <EmptyState />
+              ) : (
+                simpleItems.map((item) => (
+                  <QueueRow
+                    key={item.id}
+                    icon="✏️"
+                    tint={SECTION_COLORS.simple}
+                    title={`${item.method?.toUpperCase()} ${item.url}`}
+                    subtitle={JSON.stringify(item.body)}
+                    meta={fmtDate(item.queuedAt)}
+                  />
+                ))
+              )}
+            </QueueSection>
 
-        {/* ── NAP / Pole Queue ── */}
-        <View style={[styles.section, { marginBottom: 32 }]}>
-          <SectionHeader
-            label="NAP / Pole Creation"
-            count={napItems.length}
-            color="#F97316"
-            onRetry={retryNap}
-            onClear={clearNap}
-            retrying={retrying === "nap"}
-          />
-          {napItems.length === 0 ? <EmptySection /> : napItems.map((item, i) => (
-            <View key={item.id} style={[styles.row, i < napItems.length - 1 && styles.rowBorder]}>
-              <View style={[styles.rowIcon, { backgroundColor: OFFLINE_BG }]}>
-                <Text style={styles.rowIconText}>{item.type === "CREATE_POLE" ? "🗼" : "📦"}</Text>
-              </View>
-              <View style={styles.rowBody}>
-                <Text style={styles.rowTitle}>{item.type === "CREATE_POLE" ? "New Pole" : "New NAP Box"}</Text>
-                <Text style={styles.rowSub} numberOfLines={1}>
-                  {item.payload?.pole_code ?? item.payload?.nap_code ?? JSON.stringify(item.payload).slice(0, 40)}
-                </Text>
-              </View>
-              <View style={styles.rowRight}>
-                <View style={[styles.statusPill, {
-                  backgroundColor: item.status === "failed" ? "#FEF2F2" : PENDING_BG,
-                }]}>
-                  <Text style={[styles.statusText, {
-                    color: item.status === "failed" ? "#DC2626" : "#3B82F6",
-                  }]}>{item.status}</Text>
-                </View>
-                <Text style={styles.rowTime}>{fmtDate(item.createdAt)}</Text>
-              </View>
-            </View>
-          ))}
-        </View>
+            <QueueSection
+              title="Pending Images"
+              subtitle="Photos waiting for upload"
+              icon="🖼️"
+              count={pendingImages.length}
+              color={SECTION_COLORS.images}
+              retrying={retrying === "images"}
+              onRetry={retryImages}
+              onClear={clearImages}
+            >
+              {pendingImages.length === 0 ? (
+                <EmptyState />
+              ) : (
+                pendingImages.map((item) => {
+                  const isFailed = item.status === "failed";
+                  return (
+                    <QueueRow
+                      key={item.id}
+                      icon="🖼️"
+                      tint={SECTION_COLORS.images}
+                      title={
+                        item.fieldName?.replace(/_/g, " ") ?? "Queued image"
+                      }
+                      subtitle={`${item.meta?.pole_code ?? "—"} · ${item.meta?.image_type ?? "—"}`}
+                      status={item.status}
+                      statusColor={isFailed ? COLORS.danger : COLORS.blue}
+                      meta={fmtDate(item.queuedAt)}
+                      error={isFailed ? item.lastError : null}
+                    />
+                  );
+                })
+              )}
+            </QueueSection>
+
+            <QueueSection
+              title="NAP / Pole Creation"
+              subtitle="New infrastructure records"
+              icon="📦"
+              count={napItems.length}
+              color={SECTION_COLORS.nap}
+              retrying={retrying === "nap"}
+              onRetry={retryNap}
+              onClear={clearNap}
+            >
+              {napItems.length === 0 ? (
+                <EmptyState />
+              ) : (
+                napItems.map((item) => (
+                  <QueueRow
+                    key={item.id}
+                    icon={item.type === "CREATE_POLE" ? "🗼" : "📦"}
+                    tint={SECTION_COLORS.nap}
+                    title={
+                      item.type === "CREATE_POLE" ? "New Pole" : "New NAP Box"
+                    }
+                    subtitle={
+                      item.payload?.pole_code ??
+                      item.payload?.nap_code ??
+                      JSON.stringify(item.payload).slice(0, 40)
+                    }
+                    status={item.status}
+                    statusColor={
+                      item.status === "failed" ? COLORS.danger : COLORS.blue
+                    }
+                    meta={fmtDate(item.createdAt)}
+                  />
+                ))
+              )}
+            </QueueSection>
+          </>
+        ) : null}
       </ScrollView>
 
-      {/* ── Teardown Preview Modal ── */}
       <Modal
         visible={!!previewItem}
         transparent
@@ -470,60 +744,109 @@ export default function QueueScreen() {
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.modalSheet}>
-            {/* Handle */}
             <View style={styles.modalHandle} />
 
-            {/* Header */}
             <View style={styles.modalHeader}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.modalHeaderLabel}>PENDING TEARDOWN</Text>
+              <View style={styles.modalTitleWrap}>
+                <Text style={styles.modalKicker}>PENDING TEARDOWN</Text>
                 <View style={styles.spanRow}>
-                  <Text style={styles.spanFrom}>{previewItem?.fields?.from_pole_code ?? previewItem?.fields?.pole_code ?? "—"}</Text>
+                  <Text style={styles.spanFrom}>
+                    {previewItem?.fields?.from_pole_code ??
+                      previewItem?.fields?.pole_code ??
+                      "—"}
+                  </Text>
                   <Text style={styles.spanArrow}>→</Text>
-                  <Text style={styles.spanTo}>{previewItem?.fields?.to_pole_code ?? "—"}</Text>
+                  <Text style={styles.spanTo}>
+                    {previewItem?.fields?.to_pole_code ?? "—"}
+                  </Text>
                 </View>
               </View>
-              <Pressable onPress={() => setPreviewItem(null)} style={styles.modalClose}>
-                <Text style={{ fontSize: 20, color: "#94A3B8" }}>×</Text>
+              <Pressable
+                onPress={() => setPreviewItem(null)}
+                style={styles.modalClose}
+              >
+                <Text style={styles.modalCloseText}>×</Text>
               </Pressable>
             </View>
 
-            <ScrollView style={{ flexGrow: 0 }} contentContainerStyle={styles.modalBody} showsVerticalScrollIndicator={false}>
-              {/* Cable info */}
+            <ScrollView
+              contentContainerStyle={styles.modalBody}
+              showsVerticalScrollIndicator={false}
+            >
               <View style={styles.previewGrid}>
                 {[
-                  { label: "Collected",  value: `${previewItem?.fields?.collected_cable ?? previewItem?.fields?.recovered_cable ?? "—"}m` },
-                  { label: "Expected",   value: `${previewItem?.fields?.expected_cable ?? "—"}m` },
-                  { label: "All Cable",  value: previewItem?.fields?.did_collect_all_cable === "1" ? "Yes" : "No" },
-                  { label: "Span ID",    value: previewItem?.fields?.pole_span_id ?? "—" },
+                  {
+                    label: "Collected",
+                    value: `${previewItem?.fields?.collected_cable ?? previewItem?.fields?.recovered_cable ?? "—"}m`,
+                  },
+                  {
+                    label: "Expected",
+                    value: `${previewItem?.fields?.expected_cable ?? "—"}m`,
+                  },
+                  {
+                    label: "All Cable",
+                    value:
+                      previewItem?.fields?.did_collect_all_cable === "1"
+                        ? "Yes"
+                        : "No",
+                  },
+                  {
+                    label: "Span ID",
+                    value: previewItem?.fields?.pole_span_id ?? "—",
+                  },
                 ].map(({ label, value }) => (
                   <View key={label} style={styles.previewCell}>
-                    <Text style={styles.previewCellLabel}>{label}</Text>
-                    <Text style={styles.previewCellValue}>{value}</Text>
+                    <Text style={styles.previewLabel}>{label}</Text>
+                    <Text style={styles.previewValue}>{value}</Text>
                   </View>
                 ))}
               </View>
 
-              {/* Components */}
               {(() => {
                 const f = previewItem?.fields ?? {};
                 const comps = [
-                  { label: "Nodes",       value: f.collected_node        ?? f.nodes_collected        ?? 0 },
-                  { label: "Amplifiers",  value: f.collected_amplifier   ?? f.amplifiers_collected   ?? 0 },
-                  { label: "Extenders",   value: f.collected_extender    ?? f.extenders_collected    ?? 0 },
-                  { label: "TSC",         value: f.collected_tsc         ?? f.tsc_collected          ?? 0 },
-                  { label: "Power Sup.",  value: f.collected_powersupply ?? f.powersupply_collected  ?? 0 },
-                  { label: "PS Housing",  value: f.collected_powersupply_housing ?? f.ps_housing_collected ?? 0 },
-                ].filter(c => Number(c.value) > 0);
+                  {
+                    label: "Nodes",
+                    value: f.collected_node ?? f.nodes_collected ?? 0,
+                  },
+                  {
+                    label: "Amplifiers",
+                    value: f.collected_amplifier ?? f.amplifiers_collected ?? 0,
+                  },
+                  {
+                    label: "Extenders",
+                    value: f.collected_extender ?? f.extenders_collected ?? 0,
+                  },
+                  {
+                    label: "TSC",
+                    value: f.collected_tsc ?? f.tsc_collected ?? 0,
+                  },
+                  {
+                    label: "Power Sup.",
+                    value:
+                      f.collected_powersupply ?? f.powersupply_collected ?? 0,
+                  },
+                  {
+                    label: "PS Housing",
+                    value:
+                      f.collected_powersupply_housing ??
+                      f.ps_housing_collected ??
+                      0,
+                  },
+                ].filter((c) => Number(c.value) > 0);
+
                 if (!comps.length) return null;
+
                 return (
                   <View style={styles.previewSection}>
-                    <Text style={styles.previewSectionTitle}>COMPONENTS COLLECTED</Text>
+                    <Text style={styles.previewSectionTitle}>
+                      Components collected
+                    </Text>
                     <View style={styles.previewGrid}>
                       {comps.map(({ label, value }) => (
                         <View key={label} style={styles.previewCell}>
-                          <Text style={styles.previewCellLabel}>{label}</Text>
-                          <Text style={styles.previewCellValue}>{value}</Text>
+                          <Text style={styles.previewLabel}>{label}</Text>
+                          <Text style={styles.previewValue}>{value}</Text>
                         </View>
                       ))}
                     </View>
@@ -531,56 +854,66 @@ export default function QueueScreen() {
                 );
               })()}
 
-              {/* Reason if partial */}
-              {previewItem?.fields?.did_collect_all_cable === "0" && previewItem?.fields?.unrecovered_reason ? (
+              {previewItem?.fields?.did_collect_all_cable === "0" &&
+              previewItem?.fields?.unrecovered_reason ? (
                 <View style={styles.previewSection}>
-                  <Text style={styles.previewSectionTitle}>REASON FOR PARTIAL COLLECTION</Text>
-                  <Text style={styles.previewReasonText}>{previewItem.fields.unrecovered_reason}</Text>
+                  <Text style={styles.previewSectionTitle}>
+                    Reason for partial collection
+                  </Text>
+                  <Text style={styles.reasonBox}>
+                    {previewItem.fields.unrecovered_reason}
+                  </Text>
                 </View>
               ) : null}
 
-              {/* Photos */}
               <View style={styles.previewSection}>
-                <Text style={styles.previewSectionTitle}>PHOTOS ATTACHED</Text>
+                <Text style={styles.previewSectionTitle}>Photos attached</Text>
                 <View style={styles.photoChips}>
-                  {Object.keys(previewItem?.photoPaths ?? {}).map(key => (
+                  {Object.keys(previewItem?.photoPaths ?? {}).map((key) => (
                     <View key={key} style={styles.photoChip}>
-                      <Text style={styles.photoChipText}>{key.replace(/_/g, " ")}</Text>
+                      <Text style={styles.photoChipText}>
+                        {key.replace(/_/g, " ")}
+                      </Text>
                     </View>
                   ))}
-                  {Object.keys(previewItem?.photoPaths ?? {}).length === 0 && (
-                    <Text style={styles.previewCellLabel}>No photos attached</Text>
-                  )}
+                  {Object.keys(previewItem?.photoPaths ?? {}).length === 0 ? (
+                    <Text style={styles.noPhotoText}>No photos attached</Text>
+                  ) : null}
                 </View>
               </View>
 
-              {/* Queued at */}
-              <Text style={styles.queuedAt}>Queued {fmtDate(previewItem?.queuedAt ?? "")}</Text>
+              <Text style={styles.queuedAt}>
+                Queued {fmtDate(previewItem?.queuedAt ?? "")}
+              </Text>
             </ScrollView>
 
-            {/* Actions */}
             <View style={styles.modalActions}>
               <TouchableOpacity
-                style={[styles.modalBtn, { backgroundColor: "#FEF2F2", borderColor: "#FECACA" }]}
+                style={[styles.modalButton, styles.removeButton]}
                 onPress={() => {
                   setPreviewItem(null);
                   confirmClear("this item", async () => {
-                    if (previewItem) await queueRemove(previewItem.id).catch(() => {});
+                    if (previewItem)
+                      await queueRemove(previewItem.id).catch(() => {});
                     await load();
                   });
                 }}
               >
-                <Text style={[styles.modalBtnText, { color: "#DC2626" }]}>Remove</Text>
+                <Text
+                  style={[styles.modalButtonText, { color: COLORS.danger }]}
+                >
+                  Remove
+                </Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.modalBtn, { backgroundColor: PRIMARY, flex: 2 }]}
+                style={[styles.modalButton, styles.retryButton]}
                 disabled={retrying === "teardown"}
                 onPress={async () => {
                   setPreviewItem(null);
                   await retryTeardown();
                 }}
               >
-                <Text style={[styles.modalBtnText, { color: "#fff" }]}>
+                <Text style={[styles.modalButtonText, { color: "#FFFFFF" }]}>
                   {retrying === "teardown" ? "Retrying…" : "Retry Upload"}
                 </Text>
               </TouchableOpacity>
@@ -593,132 +926,485 @@ export default function QueueScreen() {
 }
 
 const styles = StyleSheet.create({
-  root:    { flex: 1, backgroundColor: "#F4F6F8" },
-  header:  { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 20, paddingTop: 12, paddingBottom: 14, backgroundColor: "#fff", borderBottomWidth: 1, borderBottomColor: "#E9EDF2" },
-  headerTitle: { fontSize: 20, fontWeight: "900", color: "#111827", letterSpacing: -0.3 },
-  headerSub:   { fontSize: 12, color: "#6B7280", marginTop: 2, fontWeight: "500" },
-  netBadge:    { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10, paddingVertical: 5, borderRadius: 20 },
-  netDot:      { width: 7, height: 7, borderRadius: 4 },
-  netText:     { fontSize: 12, fontWeight: "700" },
-
-  content: { paddingHorizontal: 16, paddingTop: 16 },
-
-  allClearBox:   { alignItems: "center", paddingVertical: 60 },
-  allClearIcon:  { fontSize: 48, color: "#16A34A", marginBottom: 12 },
-  allClearTitle: { fontSize: 18, fontWeight: "800", color: "#111827", marginBottom: 4 },
-  allClearSub:   { fontSize: 13, color: "#6B7280", textAlign: "center" },
-
-  section: {
-    backgroundColor: "#fff",
-    borderRadius: 16,
-    marginBottom: 12,
+  root: {
+    flex: 1,
+    backgroundColor: COLORS.bg,
+  },
+  scroll: {
+    flex: 1,
+  },
+  hero: {
+    paddingHorizontal: 20,
+    paddingTop: 14,
+    paddingBottom: 18,
+    backgroundColor: COLORS.primary,
+    borderBottomLeftRadius: 28,
+    borderBottomRightRadius: 28,
+  },
+  heroTopRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+  },
+  kicker: {
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 1.4,
+    color: "rgba(255,255,255,0.65)",
+  },
+  heroTitle: {
+    marginTop: 4,
+    fontSize: 28,
+    fontWeight: "900",
+    letterSpacing: -0.8,
+    color: "#FFFFFF",
+  },
+  connectionBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+  },
+  connectionDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+  connectionText: {
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  summaryCard: {
+    marginTop: 20,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: 16,
+    borderRadius: 24,
+    backgroundColor: "rgba(255,255,255,0.12)",
     borderWidth: 1,
-    borderColor: "#E9EDF2",
-    overflow: "hidden",
-    shadowColor: "#0F172A",
-    shadowOpacity: 0.04,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 2,
+    borderColor: "rgba(255,255,255,0.18)",
   },
-  sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 14, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#F1F5F9" },
-  sectionLeft:   { flexDirection: "row", alignItems: "center", gap: 8 },
-  sectionDot:    { width: 8, height: 8, borderRadius: 4 },
-  sectionTitle:  { fontSize: 13, fontWeight: "800", color: "#111827" },
-  countBadge:    { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 10 },
-  countText:     { fontSize: 11, fontWeight: "800" },
-  sectionActions:{ flexDirection: "row", gap: 8, alignItems: "center" },
-  retryBtn:      { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8, backgroundColor: "#F8FAFC", borderWidth: 1, borderColor: "#E2E8F0" },
-  retryText:     { fontSize: 11, fontWeight: "700" },
-  clearBtn:      { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8, backgroundColor: "#FEF2F2" },
-  clearText:     { fontSize: 11, fontWeight: "700", color: "#DC2626" },
-
-  emptyRow:  { paddingHorizontal: 14, paddingVertical: 14, alignItems: "center" },
-  emptyText: { fontSize: 12, color: "#94A3B8", fontStyle: "italic" },
-
-  row:        { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 12 },
-  rowBorder:  { borderBottomWidth: 1, borderBottomColor: "#F8FAFC" },
-  rowIcon:    { width: 36, height: 36, borderRadius: 10, alignItems: "center", justifyContent: "center" },
-  rowIconText:{ fontSize: 16 },
-  rowBody:    { flex: 1, minWidth: 0 },
-  rowTitle:   { fontSize: 13, fontWeight: "700", color: "#111827" },
-  rowSub:     { fontSize: 11, color: "#6B7280", marginTop: 2 },
-  rowRight:   { alignItems: "flex-end", gap: 4 },
-  rowTime:    { fontSize: 10, color: "#9CA3AF" },
-  statusPill: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 8 },
-  statusText: { fontSize: 10, fontWeight: "700" },
-
-  // ── Teardown preview modal ──────────────────────────────────────────────────
-  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" },
-  modalSheet: {
-    backgroundColor: "#fff",
-    borderTopLeftRadius: 28,
-    borderTopRightRadius: 28,
-    paddingBottom: 32,
-    maxHeight: "88%",
+  summaryNumber: {
+    fontSize: 36,
+    fontWeight: "900",
+    color: "#FFFFFF",
+    letterSpacing: -1,
   },
-  modalHandle: { width: 40, height: 4, borderRadius: 2, backgroundColor: "#E2E8F0", alignSelf: "center", marginTop: 10, marginBottom: 4 },
-  modalHeader: {
-    flexDirection: "row", alignItems: "flex-start", gap: 12,
-    paddingHorizontal: 20, paddingTop: 16, paddingBottom: 14,
-    borderBottomWidth: 1, borderBottomColor: "#F1F5F9",
+  summaryLabel: {
+    marginTop: 2,
+    fontSize: 13,
+    fontWeight: "700",
+    color: "rgba(255,255,255,0.74)",
   },
-  modalHeaderLabel: { fontSize: 10, fontWeight: "800", color: "#94A3B8", letterSpacing: 1.5, marginBottom: 6 },
-  spanRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
-  spanFrom: { fontSize: 18, fontWeight: "900", color: "#0A5C3B", fontFamily: "monospace" },
-  spanArrow: { fontSize: 16, fontWeight: "700", color: "#CBD5E1" },
-  spanTo:   { fontSize: 18, fontWeight: "900", color: "#6366F1", fontFamily: "monospace" },
-  modalClose: { width: 32, height: 32, borderRadius: 16, backgroundColor: "#F1F5F9", alignItems: "center", justifyContent: "center" },
-
-  modalBody: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 8, gap: 16 },
-
-  previewGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
-  previewCell: {
-    width: "47%", backgroundColor: "#F8FAFC",
-    borderRadius: 14, borderWidth: 1, borderColor: "#E9EDF2",
-    paddingHorizontal: 14, paddingVertical: 10,
-  },
-  previewCellLabel: { fontSize: 10, fontWeight: "700", color: "#94A3B8", letterSpacing: 0.8, textTransform: "uppercase" },
-  previewCellValue: { fontSize: 16, fontWeight: "900", color: "#111827", marginTop: 3 },
-
-  previewSection: { gap: 8 },
-  previewSectionTitle: { fontSize: 10, fontWeight: "800", color: "#94A3B8", letterSpacing: 1.5 },
-  previewReasonText: {
-    fontSize: 13, color: "#374151", fontWeight: "500",
-    backgroundColor: "#FFFBEB", borderRadius: 10, padding: 12,
-    borderWidth: 1, borderColor: "#FDE68A",
-  },
-
-  photoChips: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  photoChip: {
-    backgroundColor: "#F0FDF4", borderRadius: 8, borderWidth: 1,
-    borderColor: "#BBF7D0", paddingHorizontal: 10, paddingVertical: 4,
-  },
-  photoChipText: { fontSize: 11, fontWeight: "700", color: "#059669" },
-
-  queuedAt: { fontSize: 11, color: "#9CA3AF", textAlign: "center", paddingTop: 4 },
-
-  modalActions: {
-    flexDirection: "row", gap: 10,
-    paddingHorizontal: 20, paddingTop: 16,
-    borderTopWidth: 1, borderTopColor: "#F1F5F9",
-  },
-  modalBtn: {
-    flex: 1, alignItems: "center", justifyContent: "center",
-    paddingVertical: 14, borderRadius: 16,
-    borderWidth: 1, borderColor: "transparent",
-  },
-  modalBtnText: { fontSize: 14, fontWeight: "800" },
-
-  syncAllBtn: {
-    marginLeft: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 20,
-    backgroundColor: PRIMARY,
+  syncButton: {
+    minWidth: 104,
     alignItems: "center",
     justifyContent: "center",
-    minWidth: 88,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    borderRadius: 999,
+    backgroundColor: "#FFFFFF",
   },
-  syncAllText: { fontSize: 12, fontWeight: "800", color: "#fff" },
+  disabledButton: {
+    opacity: 0.55,
+  },
+  syncButtonText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: COLORS.primary,
+  },
+  heroHint: {
+    textAlign: "center",
+    marginTop: 16,
+    fontSize: 12,
+    fontWeight: "600",
+    color: "rgba(255,255,255,0.68)",
+  },
+  content: {
+    flexGrow: 1,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 140,
+    justifyContent: "center",
+  },
+  allClearCard: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+    paddingBottom: 90,
+  },
+  allClearMark: {
+    fontSize: 48,
+    color: COLORS.success,
+    marginBottom: 14,
+    fontWeight: "900",
+  },
+  allClearTitle: {
+    fontSize: 22,
+    fontWeight: "900",
+    color: COLORS.ink,
+    textAlign: "center",
+    letterSpacing: -0.8,
+  },
+  allClearSub: {
+    marginTop: 8,
+    fontSize: 14,
+    lineHeight: 22,
+    fontWeight: "600",
+    color: COLORS.muted,
+    textAlign: "center",
+    maxWidth: 280,
+  },
+  sectionCard: {
+    marginBottom: 14,
+    padding: 12,
+    borderRadius: 24,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.06,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 3,
+  },
+  sectionTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  sectionIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sectionIconText: {
+    fontSize: 20,
+  },
+  sectionHeading: {
+    flex: 1,
+    minWidth: 0,
+  },
+  sectionTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  sectionTitle: {
+    flexShrink: 1,
+    fontSize: 15,
+    fontWeight: "900",
+    color: COLORS.ink,
+  },
+  sectionSub: {
+    marginTop: 2,
+    fontSize: 12,
+    fontWeight: "500",
+    color: COLORS.muted,
+  },
+  sectionControls: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 12,
+  },
+  softButton: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 38,
+    borderRadius: 14,
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+  },
+  softButtonText: {
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  clearButton: {
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 38,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+    backgroundColor: "#FEF2F2",
+  },
+  clearButtonText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: COLORS.danger,
+  },
+  listWrap: {
+    marginTop: 10,
+    overflow: "hidden",
+    borderRadius: 18,
+    backgroundColor: "#F8FAFC",
+  },
+  emptyState: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 18,
+  },
+  emptyIcon: {
+    fontSize: 18,
+    color: COLORS.success,
+    marginBottom: 4,
+  },
+  emptyText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.softMuted,
+  },
+  queueRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: "#EEF2F7",
+  },
+  queueIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  queueIconText: {
+    fontSize: 17,
+  },
+  queueBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  queueTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: COLORS.ink,
+  },
+  queueSub: {
+    marginTop: 3,
+    fontSize: 11,
+    fontWeight: "500",
+    color: COLORS.muted,
+  },
+  errorText: {
+    color: COLORS.danger,
+    fontWeight: "700",
+  },
+  queueRight: {
+    alignItems: "flex-end",
+    gap: 5,
+    maxWidth: 104,
+  },
+  queueMeta: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: COLORS.softMuted,
+  },
+  pill: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  pillText: {
+    fontSize: 10,
+    fontWeight: "900",
+    textTransform: "capitalize",
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(15,23,42,0.55)",
+    justifyContent: "flex-end",
+  },
+  modalSheet: {
+    maxHeight: "88%",
+    paddingBottom: 28,
+    borderTopLeftRadius: 30,
+    borderTopRightRadius: 30,
+    backgroundColor: COLORS.card,
+  },
+  modalHandle: {
+    width: 44,
+    height: 5,
+    marginTop: 10,
+    marginBottom: 6,
+    borderRadius: 999,
+    backgroundColor: COLORS.border,
+    alignSelf: "center",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F1F5F9",
+  },
+  modalTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  modalKicker: {
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 1.5,
+    color: COLORS.softMuted,
+    marginBottom: 7,
+  },
+  spanRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  spanFrom: {
+    fontSize: 20,
+    fontWeight: "900",
+    color: COLORS.primary,
+    fontFamily: "monospace",
+  },
+  spanArrow: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: "#CBD5E1",
+  },
+  spanTo: {
+    fontSize: 20,
+    fontWeight: "900",
+    color: "#4F46E5",
+    fontFamily: "monospace",
+  },
+  modalClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F1F5F9",
+  },
+  modalCloseText: {
+    fontSize: 22,
+    color: COLORS.softMuted,
+    lineHeight: 24,
+  },
+  modalBody: {
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 8,
+    gap: 16,
+  },
+  previewGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+  },
+  previewCell: {
+    width: "47%",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 18,
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  previewLabel: {
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+    color: COLORS.softMuted,
+  },
+  previewValue: {
+    marginTop: 4,
+    fontSize: 17,
+    fontWeight: "900",
+    color: COLORS.ink,
+  },
+  previewSection: {
+    gap: 9,
+  },
+  previewSectionTitle: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: COLORS.ink,
+  },
+  reasonBox: {
+    padding: 13,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#FDE68A",
+    backgroundColor: "#FFFBEB",
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#374151",
+  },
+  photoChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  photoChip: {
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+    backgroundColor: "#F0FDF4",
+  },
+  photoChipText: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#047857",
+  },
+  noPhotoText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: COLORS.softMuted,
+  },
+  queuedAt: {
+    paddingTop: 2,
+    textAlign: "center",
+    fontSize: 11,
+    fontWeight: "700",
+    color: COLORS.softMuted,
+  },
+  modalActions: {
+    flexDirection: "row",
+    gap: 10,
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: "#F1F5F9",
+  },
+  modalButton: {
+    minHeight: 50,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 18,
+    borderWidth: 1,
+  },
+  removeButton: {
+    flex: 1,
+    backgroundColor: "#FEF2F2",
+    borderColor: "#FECACA",
+  },
+  retryButton: {
+    flex: 2,
+    backgroundColor: COLORS.primary,
+    borderColor: COLORS.primary,
+  },
+  modalButtonText: {
+    fontSize: 14,
+    fontWeight: "900",
+  },
 });

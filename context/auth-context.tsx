@@ -3,6 +3,7 @@ import { loginGlobe, logoutGlobe, type GlobeUser } from "@/services/auth";
 import { tokenStore } from "@/lib/token";
 import { setBridgeToken } from "@/lib/token-bridge";
 import { startNetSync, stopNetSync, setNetSyncToken } from "@/lib/net-sync";
+import { startLocationTracking, stopLocationTracking } from "@/lib/location-tracker";
 
 type AuthContextType = {
   isLoggedIn: boolean;
@@ -37,6 +38,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setBridgeToken(saved);
         setNetSyncToken(saved);
         startNetSync();
+        startLocationTracking();
       }
     });
     tokenStore.getUser().then(saved => {
@@ -56,6 +58,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setBridgeToken(res.token);
     setNetSyncToken(res.token);
     startNetSync();
+    startLocationTracking();
     await tokenStore.set(res.token);
     await tokenStore.setUser(res.user);
     return { mustChangePassword: needsReset };
@@ -72,6 +75,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   async function logout() {
     if (token) await logoutGlobe(token).catch(() => {});
     stopNetSync();
+    stopLocationTracking();
     setNetSyncToken(null);
     setToken(null);
     setUser(null);

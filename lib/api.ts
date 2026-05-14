@@ -1,5 +1,6 @@
 import { getBridgeToken } from "@/lib/token-bridge";
 import { tokenStore } from "@/lib/token";
+import { cacheWebTime } from "@/lib/display-time";
 
 export const BASE_URL =
   "https://disguisedly-enarthrodial-kristi.ngrok-free.dev/api/v1";
@@ -34,6 +35,11 @@ async function buildHeaders(
 }
 
 async function handleResponse(response: Response) {
+  const dateHeader = response.headers.get("date");
+  if (dateHeader) {
+    cacheWebTime(dateHeader).catch(() => {});
+  }
+
   const text = await response.text();
   let data: any = {};
   try {
@@ -103,6 +109,18 @@ const api = {
 
     const response = await fetchWithTimeout(finalUrl, {
       method: "PUT",
+      headers,
+      body: JSON.stringify(body),
+    });
+    return handleResponse(response);
+  },
+  patch: async (url: string, body: any) => {
+    const headers = await buildHeaders();
+    const finalUrl = `${BASE_URL}${url}`;
+    console.log("PATCH URL:", finalUrl);
+
+    const response = await fetchWithTimeout(finalUrl, {
+      method: "PATCH",
       headers,
       body: JSON.stringify(body),
     });

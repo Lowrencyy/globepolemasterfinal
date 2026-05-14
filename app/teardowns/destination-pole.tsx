@@ -126,60 +126,6 @@ function fmtDuration(sec: number): string {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-function buildPoleMapHtml(lat: number, lng: number, accentColor: string) {
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;}
-html,body,#map{width:100%;height:100%;background:#f0f4f8;}
-.leaflet-div-icon{background:none!important;border:none!important;}
-.pin-pulse{
-  width:20px;height:20px;border-radius:50%;
-  background:${accentColor};
-  box-shadow:0 0 0 0 ${accentColor}66;
-  animation:pulse 1.8s infinite;
-}
-@keyframes pulse{
-  0%{box-shadow:0 0 0 0 ${accentColor}66;}
-  70%{box-shadow:0 0 0 14px ${accentColor}00;}
-  100%{box-shadow:0 0 0 0 ${accentColor}00;}
-}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-var map=L.map('map',{
-  zoomControl:true,
-  scrollWheelZoom:false,
-  dragging:true,
-  doubleClickZoom:false,
-  touchZoom:true
-}).setView([${lat},${lng}],17);
-
-L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{
-  subdomains:'abcd',
-  maxZoom:20
-}).addTo(map);
-
-var icon=L.divIcon({
-  className:'',
-  html:'<div class="pin-pulse"></div>',
-  iconSize:[20,20],
-  iconAnchor:[10,10]
-});
-
-L.marker([${lat},${lng}],{icon:icon}).addTo(map);
-
-setTimeout(function(){map.invalidateSize();},100);
-</script>
-</body>
-</html>`;
-}
 
 function TrackerMini({ done, label }: { done: boolean; label: string }) {
   return (
@@ -502,23 +448,39 @@ export default function DestinationPoleScreen() {
   async function handleStartPoleTeardown() {
     if (!token || poleStarting) return;
     setPoleStarting(true);
-    try {
-      const now = getPHTNow();
-      await startPoleTeardown(Number(params.node_id), Number(params.to_pole_id), token, now);
-      setPoleStartedAt(now);
-      // Patch the cached poles list so poles.tsx reflects the change
-      const cached = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`);
-      if (cached?.length) {
-        const updated = cached.map(p =>
-          String(p.pole_id) === String(params.to_pole_id) ? { ...p, date_start: now } : p
-        );
-        await cacheSet(`sitemap_poles_${params.node_id}`, updated);
-      }
-    } catch {
-      Alert.alert("Error", "Could not start pole teardown. Check your connection and try again.");
-    } finally {
-      setPoleStarting(false);
+    const now = getPHTNow();
+
+    // 1. Immediately update local state & cached list to unblock offline progression instantly
+    setPoleStartedAt(now);
+    const cached = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`).catch(() => null);
+    if (cached?.length) {
+      const updated = cached.map(p =>
+        String(p.pole_id) === String(params.to_pole_id) ? { ...p, date_start: now } : p
+      );
+      await cacheSet(`sitemap_poles_${params.node_id}`, updated).catch(() => {});
     }
+
+    // 2. Transmit active state patch to server; queue payload if connectivity drops
+    try {
+      await api.patch(`/skycable/nodes/${params.node_id}/poles/sync`, {
+        pole_id: Number(params.to_pole_id),
+        date_start: now,
+        status: "in_progress",
+      });
+    } catch (err: any) {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "patch",
+          url: `/skycable/nodes/${params.node_id}/poles/sync`,
+          body: {
+            pole_id: Number(params.to_pole_id),
+            date_start: now,
+            status: "in_progress",
+          },
+        }).catch(() => {});
+      }
+    }
+    setPoleStarting(false);
   }
 
   const timerStartRef = useRef(Date.now());
@@ -535,8 +497,6 @@ export default function DestinationPoleScreen() {
   const infoComplete = hasGps && !!slot && !!landmark.trim();
 
   // Always allow starting — don't block the user with "complete required fields first"
-  // Missing fields will be indicated by the progress tracker but won't block navigation
-  const canProceed = true;
 
   const progress = useMemo(
     () =>
@@ -750,6 +710,7 @@ export default function DestinationPoleScreen() {
     F.after,
     F.tag,
     params.node_id,
+    params.from_pole_id,
     params.pole_code,
     params.to_pole_code,
     params.to_pole_id,
@@ -968,7 +929,7 @@ export default function DestinationPoleScreen() {
     const version = Date.now();
     return {
       uri: `${displayUri}?v=${version}`,
-      fileUri: dest,
+      fileUri: displayUri,
       name: fileName,
       type: "image/jpeg",
       version,
@@ -1291,7 +1252,7 @@ export default function DestinationPoleScreen() {
             ) : (
               <View style={styles.noGpsPlaceholder}>
                 <Image
-                  source={require("../../assets/images/logo.png")}
+                  source={require("../../assets/images/telcovantage-logo.png")}
                   style={styles.noGpsLogo}
                   resizeMode="contain"
                 />
@@ -1576,20 +1537,46 @@ export default function DestinationPoleScreen() {
                     : photoQuality >= 50 ? "#f97316"
                     : "#ef4444";
                   return (
-                    <Pressable style={StyleSheet.absoluteFillObject} onPress={clearPhoto}>
-                      <ExpoImage source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="cover" />
-                      <View style={styles.cameraRetakeBadge}>
-                        <Text style={styles.cameraRetakeText}>Tap to retake</Text>
-                      </View>
-                      <View style={styles.photoQualityBadgeWrap}>
-                        <View style={[styles.photoQualityBadge, { backgroundColor: badgeColor }]}>
-                          <Text style={styles.photoQualityBadgeLabel}>HD QUALITY</Text>
-                          <Text style={styles.photoQualityBadgePercent}>
-                            {photoQuality !== null ? `${photoQuality}%` : "—"}
-                          </Text>
+                    <View style={{ flex: 1, backgroundColor: "#000" }}>
+                      <Pressable style={StyleSheet.absoluteFillObject} onPress={clearPhoto}>
+                        <ExpoImage source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="contain" />
+                        <View style={styles.cameraRetakeBadge}>
+                          <Text style={styles.cameraRetakeText}>Tap to retake</Text>
                         </View>
-                      </View>
-                    </Pressable>
+                        <View style={styles.photoQualityBadgeWrap}>
+                          <View style={[styles.photoQualityBadge, { backgroundColor: badgeColor }]}>
+                            <Text style={styles.photoQualityBadgeLabel}>HD QUALITY</Text>
+                            <Text style={styles.photoQualityBadgePercent}>
+                              {photoQuality !== null ? `${photoQuality}%` : "—"}
+                            </Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                      {capturedGps?.lat && capturedGps?.lng && (
+                        <View
+                          style={{
+                            position: "absolute",
+                            bottom: 24,
+                            left: 16,
+                            right: 16,
+                            backgroundColor: "rgba(13, 17, 23, 0.85)",
+                            borderRadius: 12,
+                            paddingVertical: 10,
+                            paddingHorizontal: 14,
+                            flexDirection: "row",
+                            alignItems: "center",
+                            borderWidth: 1,
+                            borderColor: "rgba(255,255,255,0.15)"
+                          }}
+                        >
+                          <Text style={{ fontSize: 16, marginRight: 8 }}>📍</Text>
+                          <View>
+                            <Text style={{ color: "#FFF", fontSize: 12, fontWeight: "600" }}>Geotag Location</Text>
+                            <Text style={{ color: "#9CA3AF", fontSize: 11 }}>{capturedGps.lat.toFixed(6)}, {capturedGps.lng.toFixed(6)}</Text>
+                          </View>
+                        </View>
+                      )}
+                    </View>
                   );
                 }
                 if (cameraPermission?.granted) {

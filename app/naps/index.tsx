@@ -70,7 +70,7 @@ function NapDetailModal({ box, onClose }: { box: NapBox; onClose: () => void }) 
       .then(setPorts)
       .catch(() => {})
       .finally(() => setPortsLoading(false));
-  }, [box.id]);
+  }, [box.id, box.ports, token]);
 
   const usedSlots = countUsedPorts(ports);
   const freeSlots = totalSlots - usedSlots;
@@ -334,7 +334,7 @@ function NapDetailModal({ box, onClose }: { box: NapBox; onClose: () => void }) 
   );
 }
 
-const PORT_COUNTS: Array<"8" | "12" | "16" | "32"> = ["8", "12", "16", "32"];
+const PORT_COUNTS: ("8" | "12" | "16" | "32")[] = ["8", "12", "16", "32"];
 
 function AddPoleModal({
   visible,
@@ -653,7 +653,7 @@ function AddNapBoxModal({
     }
   };
 
-  const loadPoles = async (q: string, pg: number, replace: boolean) => {
+  const loadPoles = useCallback(async (q: string, pg: number, replace: boolean) => {
     if (pg === 1) setPolesLoading(true); else setPolesLoadingMore(true);
     try {
       const res = await getPoles(token, { search: q.trim() || undefined, page: pg });
@@ -665,7 +665,7 @@ function AddNapBoxModal({
       setPolesLoading(false);
       setPolesLoadingMore(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     if (visible) {
@@ -673,7 +673,7 @@ function AddNapBoxModal({
       setPoleSearch("");
       loadPoles("", 1, true);
     }
-  }, [visible]);
+  }, [visible, loadPoles]);
 
   const handleOpenDropdown = () => {
     setDropdownOpen(true);

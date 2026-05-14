@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -51,14 +51,14 @@ export default function AuditScreen() {
       .then(setPorts)
       .catch(() => Alert.alert("Error", "Failed to load port data."))
       .finally(() => setLoading(false));
-  }, [boxId]);
+  }, [boxId, token]);
 
-  const getPortStatus = (portNum: number): PortStatus => {
+  const getPortStatus = useCallback((portNum: number): PortStatus => {
     if (overrides[portNum] !== undefined) return overrides[portNum];
     const port = ports.find((p) => p.port_number === portNum);
     if (!port) return "free";
     return port.status as PortStatus;
-  };
+  }, [overrides, ports]);
 
   const togglePort = (portNum: number) => {
     const current = getPortStatus(portNum);
@@ -84,7 +84,7 @@ export default function AuditScreen() {
       result[getPortStatus(i)]++;
     }
     return result;
-  }, [overrides, ports, totalPorts]);
+  }, [getPortStatus, totalPorts]);
 
   const utilPct = Math.round(((counts.active + counts.inactive) / totalPorts) * 100);
   const cols = Math.ceil(totalPorts / 2);

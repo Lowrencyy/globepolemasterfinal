@@ -108,7 +108,7 @@ function AreaCard({ area, onPress }: { area: SkycableArea; onPress: () => void }
         {hasMap ? (
           <VicinityMap locs={locs} />
         ) : (
-          <Image source={require("../../assets/images/logo.png")} style={s.noGpsLogo} resizeMode="contain" />
+          <Image source={require("../../assets/images/telcovantage-logo.png")} style={s.noGpsLogo} resizeMode="contain" />
         )}
         {hasMap && (
           <View style={s.mapAreaLabel}>

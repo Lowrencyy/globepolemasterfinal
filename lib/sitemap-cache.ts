@@ -2,7 +2,7 @@
  * Sitemap prefetch — downloads areas → nodes → poles → spans and caches all.
  * Called as part of every sync so the full teardown flow works offline.
  */
-import { cacheSet } from "./cache";
+import { cacheGet, cacheSet } from "./cache";
 import { getAreas, getNodes, getNodePoles } from "@/services/skycable";
 import api from "./api";
 
@@ -34,8 +34,22 @@ async function fetchAndCacheSpans(nodeId: number): Promise<void> {
   } catch {}
 }
 
-export async function prefetchSitemap(token: string): Promise<void> {
+let _isPrefetching = false;
+
+export async function prefetchSitemap(token: string, force = false): Promise<void> {
+  if (_isPrefetching) return;
+
   try {
+    if (!force) {
+      const lastSynced = await cacheGet<number>("sitemap_last_synced_at").catch(() => null);
+      // Skip heavy prefetch loop if successfully synced within the last 4 hours
+      if (lastSynced && Date.now() - lastSynced < 4 * 60 * 60 * 1000) {
+        return;
+      }
+    }
+
+    _isPrefetching = true;
+
     const areas = await getAreas(token);
     await cacheSet("sitemap_areas", areas);
 
@@ -59,5 +73,9 @@ export async function prefetchSitemap(token: string): Promise<void> {
         } catch {}
       }),
     );
-  } catch {}
+
+    await cacheSet("sitemap_last_synced_at", Date.now()).catch(() => {});
+  } catch {} finally {
+    _isPrefetching = false;
+  }
 }

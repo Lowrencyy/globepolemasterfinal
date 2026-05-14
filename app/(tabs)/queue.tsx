@@ -19,7 +19,7 @@ import {
   queueRemove,
 } from "@/lib/sync-queue";
 import { getQueue } from "@/services/offline";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -83,9 +83,6 @@ function fmtDate(iso: string | number) {
   });
 }
 
-function pluralize(count: number, noun: string) {
-  return `${count} ${noun}${count === 1 ? "" : "s"}`;
-}
 
 function Pill({
   label,
@@ -292,23 +289,6 @@ export default function QueueScreen() {
     napItems.length +
     syncableImages.length;
 
-  const sectionsWithItems = useMemo(
-    () =>
-      [
-        gpsItems.length,
-        pendingTeardowns.length,
-        simpleItems.length,
-        pendingImages.length,
-        napItems.length,
-      ].filter(Boolean).length,
-    [
-      gpsItems.length,
-      pendingTeardowns.length,
-      simpleItems.length,
-      pendingImages.length,
-      napItems.length,
-    ],
-  );
 
   const retryGps = async () => {
     setRetrying("gps");

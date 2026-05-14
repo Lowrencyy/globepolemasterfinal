@@ -1,10 +1,12 @@
 import { Redirect, router } from "expo-router";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useAuth } from "@/context/auth-context";
+import OnboardingScreen, { isOnboardingDone } from "./onboarding";
 import {
   Alert,
   Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -15,16 +17,30 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-const LOGO = require("@/assets/images/logo.png");
+const LOGO = require("@/assets/images/telcovantage-logo.png");
 
 export default function LoginScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [needsOnboarding, setNeedsOnboarding] = useState(false);
+  const [checkingOnboarding, setCheckingOnboarding] = useState(true);
   const { login, isLoggedIn, mustChangePassword } = useAuth();
+
+  useEffect(() => {
+    isOnboardingDone().then((done) => {
+      if (!done) {
+        setNeedsOnboarding(true);
+      }
+      setCheckingOnboarding(false);
+    });
+  }, []);
 
   if (isLoggedIn && mustChangePassword) return <Redirect href="/change-password" />;
   if (isLoggedIn) return <Redirect href="/(tabs)" />;
+
+  if (checkingOnboarding) return null;
+
 
   const handleLogin = async () => {
     if (!email.trim() || !password.trim()) {
@@ -120,6 +136,15 @@ export default function LoginScreen() {
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <Modal
+        transparent
+        visible={needsOnboarding}
+        animationType="fade"
+        onRequestClose={() => {}}
+      >
+        <OnboardingScreen onFinish={() => setNeedsOnboarding(false)} />
+      </Modal>
     </SafeAreaView>
   );
 }

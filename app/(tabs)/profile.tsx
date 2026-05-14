@@ -3,15 +3,14 @@ import {
   Bell,
   Bug,
   ChevronRight,
+  MessageCircle,
   HardDrive,
   List,
   LogOut,
-  MessageCircle,
   RefreshCw,
   Settings,
   Shield,
   Smartphone,
-  Trash2,
   UploadCloud,
   User,
   Wifi,
@@ -29,6 +28,7 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { BASE_URL } from "@/lib/api";
+import { useRouter } from "expo-router";
 
 const API_BASE_URL = BASE_URL;
 
@@ -78,6 +78,7 @@ const fetchWithTimeout = async (
 };
 
 export default function ProfileScreen() {
+  const router = useRouter();
   const { logout, user, token } = useAuth();
   const insets = useSafeAreaInsets();
 
@@ -456,26 +457,6 @@ export default function ProfileScreen() {
     ]);
   };
 
-  const runClearCache = () => {
-    runSimpleTool("clear-cache", "Clear Cache", "Cleaning temporary app data.", [
-      {
-        id: "temp",
-        label: "Clearing temporary files",
-        status: "idle",
-      },
-      {
-        id: "images",
-        label: "Clearing cached images",
-        status: "idle",
-      },
-      {
-        id: "done",
-        label: "Cache status",
-        status: "idle",
-      },
-    ]);
-  };
-
   const runAppLogs = () => {
     runSimpleTool("app-logs", "App Logs", "Checking recent app diagnostics.", [
       {
@@ -565,10 +546,6 @@ export default function ProfileScreen() {
       onPress: runNetworkTest,
     },
     {
-      icon: <MessageCircle size={22} color="#3B82F6" />,
-      label: "Ticketing",
-    },
-    {
       icon:
         busyAction === "failed-resync" ? (
           <ActivityIndicator size="small" color="#3B82F6" />
@@ -577,16 +554,6 @@ export default function ProfileScreen() {
         ),
       label: "Re-sync\nFailed",
       onPress: runFailedResync,
-    },
-    {
-      icon:
-        busyAction === "clear-cache" ? (
-          <ActivityIndicator size="small" color="#3B82F6" />
-        ) : (
-          <Trash2 size={22} color="#3B82F6" />
-        ),
-      label: "Clear\nCache",
-      onPress: runClearCache,
     },
     {
       icon:
@@ -670,7 +637,7 @@ export default function ProfileScreen() {
           <View style={styles.statDiv} />
 
           <View style={styles.statItem}>
-            <Text style={styles.statLabel}>Today's Teardown</Text>
+            <Text style={styles.statLabel}>Today&apos;s Teardown</Text>
             <Text style={styles.statValue}>0</Text>
             <Text style={styles.statSub}>completed</Text>
           </View>
@@ -707,6 +674,14 @@ export default function ProfileScreen() {
             </Pressable>
           ))}
         </View>
+
+        <Pressable
+          style={styles.ticketingBtn}
+          onPress={() => router.push("/tickets" as any)}
+        >
+          <MessageCircle size={18} color="#3B82F6" />
+          <Text style={styles.ticketingTxt}>Ticketing</Text>
+        </Pressable>
 
         <Pressable style={styles.logoutBtn} onPress={logout}>
           <LogOut size={18} color="#EF4444" />
@@ -956,6 +931,26 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#3B82F6",
     textAlign: "center",
+  },
+
+  ticketingBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginHorizontal: 16,
+    paddingVertical: 16,
+    borderRadius: 16,
+    backgroundColor: "#EFF6FF",
+    borderWidth: 1,
+    borderColor: "#DBEAFE",
+    marginBottom: 12,
+  },
+
+  ticketingTxt: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#3B82F6",
   },
 
   logoutBtn: {

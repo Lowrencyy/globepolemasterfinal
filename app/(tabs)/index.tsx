@@ -26,7 +26,7 @@ import {
   useSafeAreaInsets,
 } from "react-native-safe-area-context";
 
-import { saveDisplayTime } from "@/lib/display-time";
+import { saveDisplayTime, getWebTimeOffset } from "@/lib/display-time";
 
 import {
   Box,
@@ -94,6 +94,7 @@ export default function HomeScreen() {
   const horizontalScrollRef = useRef<ScrollView>(null);
 
   const [now, setNow] = useState(new Date());
+  const [webOffset, setWebOffset] = useState(0);
   const [activeSlide, setActiveSlide] = useState(0);
 
   const [weather, setWeather] = useState<WeatherState>({
@@ -113,10 +114,12 @@ export default function HomeScreen() {
 
   useEffect(() => {
     saveDisplayTime();
+    getWebTimeOffset().then((off) => setWebOffset(off ?? 0));
 
     const sub = AppState.addEventListener("change", (state) => {
       if (state === "active") {
         saveDisplayTime();
+        getWebTimeOffset().then((off) => setWebOffset(off ?? 0));
       }
     });
 
@@ -191,7 +194,10 @@ export default function HomeScreen() {
     loadWeather();
   }, []);
 
-  const pht = useMemo(() => new Date(now.getTime() + 8 * 3600 * 1000), [now]);
+  const pht = useMemo(
+    () => new Date(now.getTime() + webOffset + 8 * 3600 * 1000),
+    [now, webOffset],
+  );
 
   const greeting = useMemo(() => {
     const hour = pht.getUTCHours();

@@ -11,6 +11,38 @@
 import { cacheGet, cacheSet } from "./cache";
 
 const KEY = "display_time_snapshot";
+const OFFSET_KEY = "web_time_offset_ms";
+
+let memoryOffset = 0;
+
+// Load cached offset immediately on module import if available
+cacheGet<number>(OFFSET_KEY)
+  .then((off) => {
+    if (typeof off === "number" && !isNaN(off)) {
+      memoryOffset = off;
+    }
+  })
+  .catch(() => {});
+
+/** Get the currently cached web time offset in milliseconds. */
+export async function getWebTimeOffset(): Promise<number> {
+  const off = await cacheGet<number>(OFFSET_KEY).catch(() => null);
+  if (typeof off === "number" && !isNaN(off)) {
+    memoryOffset = off;
+    return off;
+  }
+  return memoryOffset;
+}
+
+/** Save the offset between web server time and local device clock */
+export async function cacheWebTime(serverDateStr?: string | null): Promise<void> {
+  if (!serverDateStr) return;
+  const serverMs = Date.parse(serverDateStr);
+  if (isNaN(serverMs)) return;
+  const offset = serverMs - Date.now();
+  memoryOffset = offset;
+  await cacheSet(OFFSET_KEY, offset).catch(() => {});
+}
 
 /** Convert a ms-since-epoch value to a PHT ISO string (UTC+8 offset). */
 function toPHTIso(ms: number): string {
@@ -20,17 +52,17 @@ function toPHTIso(ms: number): string {
 
 /** Get the current PHT time synchronously as an ISO string. */
 export function getPHTNow(): string {
-  return toPHTIso(Date.now());
+  return toPHTIso(Date.now() + memoryOffset);
 }
 
 /** Get the current PHT date as YYYY-MM-DD (for API date queries). */
 export function getPHTToday(): string {
-  return toPHTIso(Date.now()).split("T")[0];
+  return toPHTIso(Date.now() + memoryOffset).split("T")[0];
 }
 
 /** Save the current device time. Called by the home screen on mount/focus. */
 export async function saveDisplayTime(): Promise<void> {
-  await cacheSet(KEY, Date.now()).catch(() => {});
+  await cacheSet(KEY, Date.now() + memoryOffset).catch(() => {});
 }
 
 /**
@@ -39,5 +71,6 @@ export async function saveDisplayTime(): Promise<void> {
  */
 export async function getDisplayTime(): Promise<string> {
   const cached = await cacheGet<number>(KEY).catch(() => null);
-  return toPHTIso(cached ?? Date.now());
+  const currentOffset = await getWebTimeOffset();
+  return toPHTIso(cached ?? (Date.now() + currentOffset));
 }

@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -7,66 +7,23 @@ import {
   TouchableOpacity,
   Image,
   StatusBar,
+  Modal,
+  Pressable,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import { ChevronLeft, Camera } from "lucide-react-native";
-import { FAKE_LOGS, SpanVicinityMap, TeardownLog } from "./[date]";
+import { ChevronLeft } from "lucide-react-native";
+import { FAKE_LOGS, SpanVicinityMap } from "./[date]";
 
 const GREEN = "#0B7A5A";
 const BLUE = "#6366F1";
-const ORANGE = "#F59E0B";
 const SLATE = "#111827";
 const MUTED = "#667085";
 const BORDER = "#E7ECF2";
 
-function PhotoCard({
-  title,
-  subtitle,
-  imageUri,
-  tagCode,
-}: {
-  title: string;
-  subtitle?: string;
-  imageUri?: string;
-  tagCode?: string;
-}) {
-  return (
-    <View style={s.photoCard}>
-      <View style={s.photoHeader}>
-        <View style={{ flex: 1 }}>
-          <Text style={s.photoTitle}>{title}</Text>
-          {subtitle ? <Text style={s.photoSubtitle}>{subtitle}</Text> : null}
-        </View>
-        {tagCode ? (
-          <View style={s.tagBadge}>
-            <Text style={s.tagBadgeText}>{tagCode}</Text>
-          </View>
-        ) : null}
-      </View>
-
-      <View style={s.imageShell}>
-        <Image
-          source={
-            imageUri
-              ? { uri: imageUri }
-              : require("../../assets/images/logo.png")
-          }
-          style={s.photoImg}
-          resizeMode={imageUri ? "cover" : "contain"}
-        />
-        {!imageUri && (
-          <View style={s.placeholderOverlay}>
-            <Camera size={28} color="#94A3B8" />
-            <Text style={s.placeholderText}>Field Photo Preview</Text>
-          </View>
-        )}
-      </View>
-    </View>
-  );
-}
-
 export default function SpanPreviewScreen() {
+  const [viewerUri, setViewerUri] = useState<string | null>(null);
+  const [viewerTitle, setViewerTitle] = useState("");
   const router = useRouter();
   const { id } = useLocalSearchParams();
 
@@ -100,6 +57,46 @@ export default function SpanPreviewScreen() {
   // Simulate remote field image assets if present, fallback gracefully to placeholders
   const samplePhotoUrl =
     "https://images.unsplash.com/photo-1599580661902-1718bc321c17?auto=format&fit=crop&w=600&q=80";
+
+  const getImgUrl = (val: unknown): string => {
+    if (!val) return "";
+    if (typeof val === "string" && val.trim()) return val.trim();
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        const found = getImgUrl(item);
+        if (found) return found;
+      }
+    }
+    if (typeof val === "object") {
+      const rec = val as Record<string, any>;
+      const possible = [rec.url, rec.uri, rec.path, rec.src, rec.image_url, rec.photo_url, rec.file_url];
+      for (const c of possible) {
+        if (typeof c === "string" && c.trim()) return c.trim();
+      }
+    }
+    return "";
+  };
+
+  const extractPhoto = (keys: string[]): string => {
+    const rec = logItem as Record<string, any>;
+    for (const k of keys) {
+      const u = getImgUrl(rec[k]);
+      if (u) return u;
+    }
+    return samplePhotoUrl;
+  };
+
+  const fromPhotos = [
+    { label: "Before", uri: getImgUrl((logItem as any).photos?.from_before) || extractPhoto(["from_before", "from_before_photo", "before_photo", "before_image", "before_photo_url"]) },
+    { label: "After", uri: getImgUrl((logItem as any).photos?.from_after) || extractPhoto(["from_after", "from_after_photo"]) },
+    { label: "Tag", uri: getImgUrl((logItem as any).photos?.from_tag) || extractPhoto(["from_tag", "from_pole_tag", "from_tag_photo", "from_pole_photo"]) },
+  ];
+
+  const toPhotos = [
+    { label: "Before", uri: getImgUrl((logItem as any).photos?.to_before) || extractPhoto(["to_before", "to_before_photo"]) },
+    { label: "After", uri: getImgUrl((logItem as any).photos?.to_after) || extractPhoto(["to_after", "to_after_photo", "after_photo", "after_image", "after_photo_url"]) },
+    { label: "Tag", uri: getImgUrl((logItem as any).photos?.to_tag) || extractPhoto(["to_tag", "to_pole_tag", "to_tag_photo"]) },
+  ];
 
   return (
     <>
@@ -170,33 +167,59 @@ export default function SpanPreviewScreen() {
           {/* Comprehensive Captured Media Reports */}
           <Text style={s.sectionTitle}>CAPTURED FIELD PHOTOS</Text>
 
-          {/* Before Picture */}
-          <PhotoCard
-            title="Before Teardown"
-            subtitle="Initial baseline view prior to unlashing"
-            imageUri={samplePhotoUrl}
-          />
+          {/* FROM POLE PHOTOS ROW */}
+          <View style={s.photoSectionCard}>
+            <Text style={s.photoSectionTitle}>From Pole ({fromCode})</Text>
+            <View style={s.photoGridRow}>
+              {fromPhotos.map((p, idx) => (
+                <Pressable
+                  key={idx}
+                  style={({ pressed }) => [
+                    s.photoThumbWrap,
+                    pressed && { opacity: 0.85 },
+                  ]}
+                  onPress={() => {
+                    setViewerUri(p.uri);
+                    setViewerTitle(`From Pole - ${p.label}`);
+                  }}
+                >
+                  <Image
+                    source={{ uri: p.uri }}
+                    style={s.thumbImage}
+                    resizeMode="cover"
+                  />
+                  <Text style={s.thumbLabel}>{p.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
 
-          {/* After Picture */}
-          <PhotoCard
-            title="After Teardown"
-            subtitle="Final clean span view after post-harvest recovery"
-            imageUri={samplePhotoUrl}
-          />
-
-          {/* From Pole Tag */}
-          <PhotoCard
-            title="From Pole Tag"
-            subtitle="Destination code sticker attachment verification"
-            tagCode={fromCode}
-          />
-
-          {/* To Pole Tag */}
-          <PhotoCard
-            title="To Pole Tag"
-            subtitle="Destination code sticker attachment verification"
-            tagCode={toCode}
-          />
+          {/* TO POLE PHOTOS ROW */}
+          <View style={s.photoSectionCard}>
+            <Text style={s.photoSectionTitle}>To Pole ({toCode})</Text>
+            <View style={s.photoGridRow}>
+              {toPhotos.map((p, idx) => (
+                <Pressable
+                  key={idx}
+                  style={({ pressed }) => [
+                    s.photoThumbWrap,
+                    pressed && { opacity: 0.85 },
+                  ]}
+                  onPress={() => {
+                    setViewerUri(p.uri);
+                    setViewerTitle(`To Pole - ${p.label}`);
+                  }}
+                >
+                  <Image
+                    source={{ uri: p.uri }}
+                    style={s.thumbImage}
+                    resizeMode="cover"
+                  />
+                  <Text style={s.thumbLabel}>{p.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
 
           {/* Lineman Accountability Footer */}
           <View style={s.footerBlock}>
@@ -209,6 +232,39 @@ export default function SpanPreviewScreen() {
             <Text style={s.teamLbl}>{logItem.team?.name ?? "Team Alpha"}</Text>
           </View>
         </ScrollView>
+
+        {/* Lightbox Image Viewer Modal */}
+        <Modal
+          visible={!!viewerUri}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setViewerUri(null)}
+        >
+          <View style={s.viewerBackdrop}>
+            <Pressable
+              style={StyleSheet.absoluteFill}
+              onPress={() => setViewerUri(null)}
+            />
+            <View style={s.viewerCard}>
+              <View style={s.viewerHeader}>
+                <Text style={s.viewerTitle}>{viewerTitle}</Text>
+                <Pressable
+                  onPress={() => setViewerUri(null)}
+                  style={s.viewerClose}
+                >
+                  <Text style={s.viewerCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {viewerUri ? (
+                <Image
+                  source={{ uri: viewerUri }}
+                  style={s.viewerImage}
+                  resizeMode="cover"
+                />
+              ) : null}
+            </View>
+          </View>
+        </Modal>
       </SafeAreaView>
     </>
   );
@@ -344,77 +400,50 @@ const s = StyleSheet.create({
     marginTop: 2,
   },
 
-  photoCard: {
+  photoSectionCard: {
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
     padding: 16,
     marginBottom: 16,
     borderWidth: 1,
     borderColor: BORDER,
+    elevation: 1,
+    shadowColor: "#000",
+    shadowOpacity: 0.04,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
   },
-
-  photoHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-
-  photoTitle: {
-    fontSize: 15,
+  photoSectionTitle: {
+    fontSize: 13,
     fontWeight: "900",
     color: SLATE,
+    marginBottom: 12,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
   },
-
-  photoSubtitle: {
-    fontSize: 11,
-    color: MUTED,
-    fontWeight: "600",
-    marginTop: 2,
+  photoGridRow: {
+    flexDirection: "row",
+    gap: 10,
+    justifyContent: "space-between",
   },
-
-  tagBadge: {
-    backgroundColor: "#EFF6FF",
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#BFDBFE",
+  photoThumbWrap: {
+    flex: 1,
+    alignItems: "center",
   },
-
-  tagBadgeText: {
-    fontSize: 11,
-    fontWeight: "900",
-    color: "#2563EB",
-  },
-
-  imageShell: {
-    height: 180,
-    borderRadius: 14,
+  thumbImage: {
+    width: "100%",
+    aspectRatio: 1,
+    borderRadius: 12,
     backgroundColor: "#F8FAFC",
-    overflow: "hidden",
     borderWidth: 1,
     borderColor: BORDER,
-    position: "relative",
   },
-
-  photoImg: {
-    width: "100%",
-    height: "100%",
-  },
-
-  placeholderOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(248, 250, 252, 0.85)",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  placeholderText: {
+  thumbLabel: {
     fontSize: 11,
-    fontWeight: "700",
-    color: "#94A3B8",
+    fontWeight: "800",
+    color: MUTED,
     marginTop: 6,
+    textAlign: "center",
   },
 
   footerBlock: {
@@ -447,4 +476,38 @@ const s = StyleSheet.create({
     color: SLATE,
     marginTop: 2,
   },
+
+  viewerBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.75)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 20,
+  },
+  viewerCard: {
+    width: "100%",
+    backgroundColor: "#fff",
+    borderRadius: 20,
+    overflow: "hidden",
+    elevation: 5,
+  },
+  viewerHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: BORDER,
+  },
+  viewerTitle: { fontSize: 15, fontWeight: "900", color: SLATE },
+  viewerClose: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#F1F5F9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewerCloseText: { fontSize: 14, fontWeight: "800", color: MUTED },
+  viewerImage: { width: "100%", height: 340 },
 });

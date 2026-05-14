@@ -509,85 +509,7 @@ export default function TeardownComponentsScreen() {
     return () => clearInterval(id);
   }, []);
 
-  useFocusEffect(
-    useCallback(() => {
-      loadPhotos();
-    }, []),
-  );
-
-  useEffect(() => {
-    captureGps();
-    if (params.from_pole_id) {
-      cacheGet<boolean>(`pole_submitted_${params.from_pole_id}`)
-        .then((v) => setPolePreSubmitted(!!v))
-        .catch(() => {});
-    }
-  }, [params.from_pole_id]);
-
-  const formDraftPath = draftDir + "form_state.json";
-
-  // Load persisted form state on mount
-  useEffect(() => {
-    FileSystem.readAsStringAsync(formDraftPath)
-      .then((raw) => {
-        const saved = JSON.parse(raw);
-        if (saved.collectedAll !== undefined)
-          setCollectedAll(saved.collectedAll);
-        if (saved.recoveredCable !== undefined)
-          setRecoveredCable(saved.recoveredCable);
-        if (saved.cableReason !== undefined) setCableReason(saved.cableReason);
-        if (saved.actualRuns !== undefined) setActualRuns(saved.actualRuns);
-        if (saved.collectedNode !== undefined)
-          setCollectedNode(saved.collectedNode);
-        if (saved.collectedAmp !== undefined)
-          setCollectedAmp(saved.collectedAmp);
-        if (saved.collectedExt !== undefined)
-          setCollectedExt(saved.collectedExt);
-        if (saved.collectedTsc !== undefined)
-          setCollectedTsc(saved.collectedTsc);
-        if (saved.collectedPs !== undefined) setCollectedPs(saved.collectedPs);
-        if (saved.collectedPsh !== undefined)
-          setCollectedPsh(saved.collectedPsh);
-        if (saved.step !== undefined) setStep(saved.step);
-      })
-      .catch(() => {});
-  }, []);
-
-  // Save form state whenever it changes
-  useEffect(() => {
-    const state = {
-      collectedAll,
-      recoveredCable,
-      cableReason,
-      actualRuns,
-      collectedNode,
-      collectedAmp,
-      collectedExt,
-      collectedTsc,
-      collectedPs,
-      collectedPsh,
-      step,
-    };
-    FileSystem.makeDirectoryAsync(draftDir, { intermediates: true })
-      .then(() =>
-        FileSystem.writeAsStringAsync(formDraftPath, JSON.stringify(state)),
-      )
-      .catch(() => {});
-  }, [
-    collectedAll,
-    recoveredCable,
-    cableReason,
-    actualRuns,
-    collectedNode,
-    collectedAmp,
-    collectedExt,
-    collectedTsc,
-    collectedPs,
-    collectedPsh,
-    step,
-  ]);
-
-  async function loadPhotos() {
+  const loadPhotos = useCallback(async () => {
     const fromPoleFiles: Record<string, { dir: string; file: string }> = {
       from_before: {
         dir: poleDraftDir,
@@ -657,7 +579,87 @@ export default function TeardownComponentsScreen() {
         ).toISOString();
       }
     }
-  }
+  }, [draftDir, fromCode, params.from_pole_id, params.to_pole_id, poleDraftDir, toCode]);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadPhotos();
+    }, [loadPhotos]),
+  );
+
+  useEffect(() => {
+    captureGps();
+    if (params.from_pole_id) {
+      cacheGet<boolean>(`pole_submitted_${params.from_pole_id}`)
+        .then((v) => setPolePreSubmitted(!!v))
+        .catch(() => {});
+    }
+  }, [params.from_pole_id]);
+
+  const formDraftPath = draftDir + "form_state.json";
+
+  // Load persisted form state on mount
+  useEffect(() => {
+    FileSystem.readAsStringAsync(formDraftPath)
+      .then((raw) => {
+        const saved = JSON.parse(raw);
+        if (saved.collectedAll !== undefined)
+          setCollectedAll(saved.collectedAll);
+        if (saved.recoveredCable !== undefined)
+          setRecoveredCable(saved.recoveredCable);
+        if (saved.cableReason !== undefined) setCableReason(saved.cableReason);
+        if (saved.actualRuns !== undefined) setActualRuns(saved.actualRuns);
+        if (saved.collectedNode !== undefined)
+          setCollectedNode(saved.collectedNode);
+        if (saved.collectedAmp !== undefined)
+          setCollectedAmp(saved.collectedAmp);
+        if (saved.collectedExt !== undefined)
+          setCollectedExt(saved.collectedExt);
+        if (saved.collectedTsc !== undefined)
+          setCollectedTsc(saved.collectedTsc);
+        if (saved.collectedPs !== undefined) setCollectedPs(saved.collectedPs);
+        if (saved.collectedPsh !== undefined)
+          setCollectedPsh(saved.collectedPsh);
+        if (saved.step !== undefined) setStep(saved.step);
+      })
+      .catch(() => {});
+  }, [formDraftPath]);
+
+  // Save form state whenever it changes
+  useEffect(() => {
+    const state = {
+      collectedAll,
+      recoveredCable,
+      cableReason,
+      actualRuns,
+      collectedNode,
+      collectedAmp,
+      collectedExt,
+      collectedTsc,
+      collectedPs,
+      collectedPsh,
+      step,
+    };
+    FileSystem.makeDirectoryAsync(draftDir, { intermediates: true })
+      .then(() =>
+        FileSystem.writeAsStringAsync(formDraftPath, JSON.stringify(state)),
+      )
+      .catch(() => {});
+  }, [
+    collectedAll,
+    recoveredCable,
+    cableReason,
+    actualRuns,
+    collectedNode,
+    collectedAmp,
+    collectedExt,
+    collectedTsc,
+    collectedPs,
+    collectedPsh,
+    step,
+    draftDir,
+    formDraftPath,
+  ]);
 
   async function captureGps() {
     try {
@@ -726,7 +728,7 @@ export default function TeardownComponentsScreen() {
     }
   }
 
-  function canProceed() {
+  const canProceed = useCallback(() => {
     if (step === 0) {
       return collectedAll !== null && recoveredCable.trim() !== "";
     }
@@ -739,7 +741,7 @@ export default function TeardownComponentsScreen() {
       !!photos.to_tag &&
       collectedAll !== null
     );
-  }
+  }, [step, collectedAll, recoveredCable, polePreSubmitted, photos]);
 
   function goNext() {
     if (step < STEPS.length - 1) {
@@ -758,8 +760,17 @@ export default function TeardownComponentsScreen() {
   }
 
   async function buildFields(): Promise<Record<string, string>> {
-    const finishedAt = new Date().toISOString(); // ISO for accurate duration computation
+    // 1. Single source of truth for time: prioritize device photo metadata capture times in PHT
+    const photoTsList = Object.values(photoTimestamps.current).filter(Boolean).sort();
+    const phtNow = getPHTNow();
+    const actualStartedAt = photoTsList.length > 0 ? photoTsList[0] : startedAt.current || phtNow;
+    const actualFinishedAt = photoTsList.length > 0 ? photoTsList[photoTsList.length - 1] : phtNow;
+
     const user = await tokenStore.getUser();
+
+    // 2. Extract true device-originated EXIF coordinates captured at origin
+    const fromGpsCache = params.from_pole_id ? await cacheGet<{ lat: number | string; lng: number | string }>(`pole_gps_${params.from_pole_id}`).catch(() => null) : null;
+    const toGpsCache = params.to_pole_id ? await cacheGet<{ lat: number | string; lng: number | string }>(`pole_gps_${params.to_pole_id}`).catch(() => null) : null;
 
     const didCollectComponents =
       collectedNode > 0 ||
@@ -788,9 +799,9 @@ export default function TeardownComponentsScreen() {
       expected_amplifier: params.expected_amplifier || "0",
       expected_extender: params.expected_extender || "0",
       expected_tsc: params.expected_tsc || "0",
-      started_at: startedAt.current,
-      finished_at: finishedAt,
-      submitted_at: finishedAt,
+      started_at: actualStartedAt,
+      finished_at: actualFinishedAt,
+      submitted_at: actualFinishedAt,
     };
 
     if (!collectedAll) {
@@ -826,15 +837,16 @@ export default function TeardownComponentsScreen() {
     const teamVal = (user as any)?.team_name ?? (user as any)?.team;
     if (teamVal) fields.team = teamVal;
 
-    const paramLat = params.from_pole_latitude;
-    const paramLng = params.from_pole_longitude;
+    // Coordinate binding: prioritize device-embedded metadata cache over web parameters
+    const trueFromLat = fromGpsCache?.lat ? String(fromGpsCache.lat) : params.from_pole_latitude;
+    const trueFromLng = fromGpsCache?.lng ? String(fromGpsCache.lng) : params.from_pole_longitude;
     const gps = gpsRef.current;
 
-    if (paramLat && paramLng) {
-      fields.gps_latitude = paramLat;
-      fields.gps_longitude = paramLng;
-      fields.from_pole_latitude = paramLat;
-      fields.from_pole_longitude = paramLng;
+    if (trueFromLat && trueFromLng) {
+      fields.gps_latitude = trueFromLat;
+      fields.gps_longitude = trueFromLng;
+      fields.from_pole_latitude = trueFromLat;
+      fields.from_pole_longitude = trueFromLng;
       if (params.from_pole_gps_captured_at) {
         fields.from_pole_gps_captured_at = params.from_pole_gps_captured_at;
       }
@@ -847,15 +859,18 @@ export default function TeardownComponentsScreen() {
       fields.from_pole_gps_captured_at = gps.capturedAt;
     }
 
-    fields.captured_at_device = startedAt.current;
+    fields.captured_at_device = actualStartedAt;
 
     for (const [key, ts] of Object.entries(photoTimestamps.current)) {
       fields[`${key}_captured_at`] = ts;
     }
 
-    if (params.to_pole_latitude) {
-      fields.to_pole_latitude = params.to_pole_latitude;
-      fields.to_pole_longitude = params.to_pole_longitude;
+    const trueToLat = toGpsCache?.lat ? String(toGpsCache.lat) : params.to_pole_latitude;
+    const trueToLng = toGpsCache?.lng ? String(toGpsCache.lng) : params.to_pole_longitude;
+
+    if (trueToLat && trueToLng) {
+      fields.to_pole_latitude = trueToLat;
+      fields.to_pole_longitude = trueToLng;
       if (params.to_pole_gps_captured_at) {
         fields.to_pole_gps_captured_at = params.to_pole_gps_captured_at;
       }
@@ -1162,7 +1177,7 @@ export default function TeardownComponentsScreen() {
       total: 4,
       percent: Math.round((completed / 4) * 100),
     };
-  }, [cableStepDone, step, requiredPhotosDone, componentsTotal]);
+  }, [cableStepDone, step, requiredPhotosDone, componentsTotal, canProceed]);
 
   const spanLabel = params.span_code || `Span #${params.span_id}`;
 

@@ -2,7 +2,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import { Image as ExpoImage } from "expo-image";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import { ChevronLeft } from "lucide-react-native";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Modal,
   Pressable,
@@ -95,11 +95,7 @@ export default function TeardownCompleteScreen() {
   const [viewerUri, setViewerUri] = useState<string | null>(null);
   const [viewerLabel, setViewerLabel] = useState("");
 
-  useEffect(() => {
-    loadPhotos();
-  }, []);
-
-  async function loadPhotos() {
+  const loadPhotos = useCallback(async () => {
     const toCode = to_code_sanitized || sanitize(to_pole_code);
     const fromCode = sanitize(from_pole_code);
     const poleDir = pole_draft_dir || "";
@@ -126,7 +122,13 @@ export default function TeardownCompleteScreen() {
       const cableInfo = await FileSystem.getInfoAsync(tdDir + `${fromCode}_cable.jpg`).catch(() => ({ exists: false }));
       if (cableInfo.exists) setCablePhotoUri((cableInfo as any).uri);
     }
-  }
+  }, [from_pole_code, from_pole_id, pole_draft_dir, teardown_draft_dir, to_code_sanitized, to_pole_code]);
+
+  useEffect(() => {
+    loadPhotos();
+  }, [loadPhotos]);
+
+
 
   function goToNext() {
     router.replace({

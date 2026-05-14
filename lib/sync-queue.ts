@@ -15,7 +15,14 @@
 import * as FileSystem from "expo-file-system/legacy";
 import api from "./api";
 import { cacheSet } from "./cache";
-import { refreshPendingCount } from "./pending-store";
+// Break circular dependency with dynamic module resolution at runtime
+function triggerRefreshPendingCount() {
+  setTimeout(() => {
+    try {
+      require("./pending-store").refreshPendingCount().catch(() => {});
+    } catch {}
+  }, 0);
+}
 
 const QUEUE_FILE    = `${FileSystem.documentDirectory}sync_queue.json`;
 const IMAGES_FILE   = `${FileSystem.documentDirectory}sync_images.json`;
@@ -129,7 +136,7 @@ export async function queuePush(
   });
   await writeQueue(entries);
   console.log("[OFFLINE_CACHE_SAVED]", local_id);
-  refreshPendingCount().catch(() => {});
+  triggerRefreshPendingCount();
   return local_id;
 }
 
@@ -291,7 +298,7 @@ export async function processSyncQueue(): Promise<SyncResult> {
   }
 
   await writeQueue(final);
-  refreshPendingCount().catch(() => {});
+  triggerRefreshPendingCount();
 
   const failedCount = final.filter(e => e.status === "failed").length;
   console.log(`[OFFLINE_SYNC_COMPLETED] submitted=${submitted} failed=${failedCount} permanent=${permanentlyFailed}`);

@@ -1,8 +1,9 @@
 import { useAuth } from "@/context/auth-context";
 import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
+import { getAreas, getNodes, getNodePoles } from "@/services/skycable";
 import { useFocusEffect } from "expo-router";
-import { ChevronDown, X, Search, MapPin } from "lucide-react-native";
+import { ChevronDown, MapPin, Search, X } from "lucide-react-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -14,10 +15,10 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 
-const CACHE_KEY = "pole_map_pins_v1";
+const CACHE_KEY = "pole_map_pins_v2";
 
 type PolePin = {
   id: number;
@@ -30,6 +31,8 @@ type PolePin = {
   node: string | null;
 };
 
+type NormalizedStatus = "completed" | "pending";
+
 const STATUS_FILTERS = [
   { key: "all", label: "All Status" },
   { key: "pending", label: "Pending" },
@@ -38,63 +41,409 @@ const STATUS_FILTERS = [
 
 type StatusFilter = (typeof STATUS_FILTERS)[number]["key"];
 
-function normalizeStatus(s: string | null): "completed" | "pending" {
+type NodeCentroid = {
+  node: string;
+  lat: number;
+  lng: number;
+  total: number;
+  completed: number;
+  pending: number;
+};
+
+type SearchNodeSummary = {
+  node: string;
+  siteKey: string;
+  siteLabel: string;
+  total: number;
+  completed: number;
+  pending: number;
+  lat: number;
+  lng: number;
+  hasGps: boolean;
+};
+
+const LAT_KEYS = [
+  "lat",
+  "latitude",
+  "gps_lat",
+  "gpsLat",
+  "gpsLatitude",
+  "pole_lat",
+  "poleLat",
+  "location_lat",
+  "locationLat",
+  "map_lat",
+  "mapLat",
+  "y",
+  "Y",
+];
+
+const LNG_KEYS = [
+  "lng",
+  "lon",
+  "long",
+  "longitude",
+  "gps_lng",
+  "gps_lon",
+  "gpsLng",
+  "gpsLon",
+  "gpsLongitude",
+  "pole_lng",
+  "pole_lon",
+  "poleLng",
+  "poleLon",
+  "location_lng",
+  "location_lon",
+  "locationLng",
+  "locationLon",
+  "map_lng",
+  "map_lon",
+  "mapLng",
+  "mapLon",
+  "x",
+  "X",
+];
+
+const PAIR_KEYS = [
+  "gps",
+  "gps_location",
+  "gpsLocation",
+  "coordinates",
+  "coordinate",
+  "coords",
+  "latlng",
+  "lat_lng",
+  "location",
+  "geo",
+  "geometry",
+];
+
+function cleanString(value: any): string | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function pickFirst(source: any, keys: string[]): any {
+  if (!source || typeof source !== "object") return null;
+
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+
+    const value = source[key];
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string" && value.trim() === "") continue;
+
+    return value;
+  }
+
+  return null;
+}
+
+function toCoord(value: any): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+
+  const n = typeof value === "string" ? Number(value.trim()) : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function isValidLatLng(lat: number, lng: number): boolean {
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lng >= -180 &&
+    lng <= 180 &&
+    !(Math.abs(lat) < 0.000001 && Math.abs(lng) < 0.000001)
+  );
+}
+
+function normalizeLatLngPair(
+  first: number | null,
+  second: number | null,
+): { lat: number; lng: number } | null {
+  if (first === null || second === null) return null;
+
+  let lat = first;
+  let lng = second;
+
+  // Common issue: GeoJSON / database sometimes stores [lng, lat]
+  if (Math.abs(lat) > 90 && Math.abs(lng) <= 90) {
+    [lat, lng] = [lng, lat];
+  }
+
+  if (isValidLatLng(lat, lng)) {
+    return { lat, lng };
+  }
+
+  // Last attempt: swap them.
+  if (isValidLatLng(second, first)) {
+    return { lat: second, lng: first };
+  }
+
+  return null;
+}
+
+function parsePairFromString(
+  value: string,
+): { lat: number; lng: number } | null {
+  const nums = value.match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+  if (nums.length < 2) return null;
+
+  return normalizeLatLngPair(nums[0], nums[1]);
+}
+
+function parsePairValue(value: any): { lat: number; lng: number } | null {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    // Try JSON first.
+    if (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    ) {
+      try {
+        return parsePairValue(JSON.parse(trimmed));
+      } catch {
+        return parsePairFromString(trimmed);
+      }
+    }
+
+    return parsePairFromString(trimmed);
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length < 2) return null;
+    return normalizeLatLngPair(toCoord(value[0]), toCoord(value[1]));
+  }
+
+  if (typeof value === "object") {
+    const directLat = toCoord(pickFirst(value, LAT_KEYS));
+    const directLng = toCoord(pickFirst(value, LNG_KEYS));
+    const directPair = normalizeLatLngPair(directLat, directLng);
+
+    if (directPair) return directPair;
+
+    if (Array.isArray(value.coordinates)) {
+      return parsePairValue(value.coordinates);
+    }
+  }
+
+  return null;
+}
+
+function extractCoordinates(row: any): { lat: number; lng: number } | null {
+  const directLat = toCoord(pickFirst(row, LAT_KEYS));
+  const directLng = toCoord(pickFirst(row, LNG_KEYS));
+  const directPair = normalizeLatLngPair(directLat, directLng);
+
+  if (directPair) return directPair;
+
+  for (const key of PAIR_KEYS) {
+    const parsed = parsePairValue(row?.[key]);
+    if (parsed) return parsed;
+  }
+
+  return null;
+}
+
+function normalizeStatus(value: string | null): NormalizedStatus {
+  const s = cleanString(value)?.toLowerCase().replace(/\s+/g, "_");
+
   if (!s) return "pending";
-  if (s === "cleared" || s === "completed" || s === "in_progress") {
+
+  if (
+    [
+      "cleared",
+      "completed",
+      "complete",
+      "done",
+      "verified",
+      "approved",
+      "in_progress",
+    ].includes(s)
+  ) {
     return "completed";
   }
+
   return "pending";
 }
 
-// ─── MAP HTML BUILDER LOGIC ──────────────────────────────────────────────────
+function safeJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+function mapApiPoleToPin(row: any, index: number): PolePin {
+  const coords = extractCoordinates(row);
+
+  const idRaw = pickFirst(row, ["id", "pole_id", "poleId", "ID"]);
+  const idNum = Number(idRaw);
+
+  const poleCode =
+    cleanString(
+      row?.pole_code ??
+        row?.poleCode ??
+        row?.code ??
+        row?.pole_id ??
+        row?.poleId ??
+        row?.name,
+    ) ?? `POLE-${index + 1}`;
+
+  const barangay = cleanString(
+    row?.barangay ??
+      row?.site ??
+      row?.site_name ??
+      row?.siteName ??
+      row?.area ??
+      row?.area_name ??
+      row?.location_barangay,
+  );
+
+  const node = cleanString(
+    row?.node ??
+      row?.node_id ??
+      row?.nodeId ??
+      row?.node_code ??
+      row?.nodeCode ??
+      row?.node_name ??
+      row?.nodeName,
+  );
+
+  const status =
+    cleanString(
+      row?.skycable_status ??
+        row?.status ??
+        row?.completion_status ??
+        row?.inspection_status,
+    ) ?? "pending";
+
+  return {
+    id: Number.isFinite(idNum) ? idNum : index + 1,
+    pole_code: poleCode,
+    lat: coords?.lat ?? null,
+    lng: coords?.lng ?? null,
+    has_gps: !!coords,
+    status,
+    barangay,
+    node,
+  };
+}
+
 function buildMapHtml(
   mode: "nodes" | "poles",
-  payloadJson: string,
-  boundsJson: string
+  payload: unknown[],
+  bounds: number[][],
 ): string {
+  const modeJson = safeJson(mode);
+  const payloadJson = safeJson(payload);
+  const boundsJson = safeJson(bounds);
+
   return `<!DOCTYPE html>
 <html>
 <head>
+<meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
-html,body,#map{width:100%;height:100%;background:#f8fafc;}
-.leaflet-container{background:#f8fafc;}
-
-/* Pole Marker Pin */
-.pp{
-  width:12px;
-  height:12px;
-  border-radius:50%;
-  border:2px solid rgba(255,255,255,0.95);
-  box-shadow:0 0 8px rgba(0,0,0,0.35);
+html,body,#map{
+  width:100%;
+  height:100%;
+  overflow:hidden;
+  background:#f8fafc;
 }
-
-/* Node Centroid Pill */
+.leaflet-container{
+  width:100%;
+  height:100%;
+  background:#f8fafc;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+#fallback{
+  position:absolute;
+  inset:0;
+  z-index:999;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:24px;
+  background:#f8fafc;
+  color:#64748b;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-size:13px;
+  font-weight:800;
+  pointer-events:none;
+}
+#fallback.ready{
+  display:none;
+}
+.pp{
+  width:13px;
+  height:13px;
+  border-radius:50%;
+  border:2px solid rgba(255,255,255,0.98);
+  box-shadow:0 0 0 1px rgba(15,23,42,0.15),0 5px 12px rgba(0,0,0,0.35);
+}
 .node-pill{
-  background:#4F46E5;
+  background:#4f46e5;
   color:#ffffff;
   font-size:11px;
   font-weight:900;
-  padding:4px 10px;
-  border-radius:100px;
+  padding:5px 11px;
+  border-radius:999px;
   border:2px solid #ffffff;
-  box-shadow:0 6px 14px rgba(0,0,0,0.25);
+  box-shadow:0 8px 18px rgba(0,0,0,0.26);
   display:flex;
   align-items:center;
-  gap:5px;
+  gap:6px;
   white-space:nowrap;
   cursor:pointer;
-  font-family:system-ui,-apple-system,sans-serif;
 }
-
 .node-pill-dot{
-  width:6px;
-  height:6px;
-  border-radius:3px;
+  width:7px;
+  height:7px;
+  border-radius:999px;
+  flex:none;
 }
-
+.popup-wrap{
+  min-width:175px;
+}
+.popup-title{
+  font-size:13px;
+  font-weight:900;
+  color:#111827;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+}
+.popup-node{
+  font-size:11px;
+  color:#2563eb;
+  margin-top:4px;
+  font-weight:800;
+}
+.popup-sub{
+  font-size:11px;
+  color:#6b7280;
+  margin-top:2px;
+  font-weight:700;
+}
+.popup-badge{
+  margin-top:8px;
+  display:inline-block;
+  padding:4px 9px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:900;
+}
 .leaflet-popup-content-wrapper{
   border-radius:16px;
   background:#ffffff;
@@ -102,300 +451,435 @@ html,body,#map{width:100%;height:100%;background:#f8fafc;}
   border:1px solid rgba(15,23,42,0.08);
   box-shadow:0 12px 28px rgba(0,0,0,0.16);
 }
-
 .leaflet-popup-content{
   margin:12px 14px;
-  font-family:system-ui,-apple-system,sans-serif;
 }
-
-.leaflet-popup-tip{background:#ffffff;}
-.leaflet-popup-close-button{color:#64748b!important;}
+.leaflet-popup-tip{
+  background:#ffffff;
+}
+.leaflet-popup-close-button{
+  color:#64748b!important;
+}
 </style>
 </head>
 
 <body>
 <div id="map"></div>
-
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<div id="fallback">Loading map...</div>
 
 <script>
-var MODE="${mode}";
-var PAYLOAD=${payloadJson};
-var BOUNDS=${boundsJson};
-var PH_CENTER=[12.8797,121.7740];
+(function(){
+  var MODE = ${modeJson};
+  var PAYLOAD = ${payloadJson};
+  var BOUNDS = ${boundsJson};
+  var PH_CENTER = [12.8797,121.7740];
 
-var map=L.map('map',{
-  zoomControl:false,
-  attributionControl:false,
-  zoomSnap:0.25
-});
-
-L.tileLayer(
-  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-  { maxZoom:19 }
-).addTo(map);
-
-L.tileLayer(
-  'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
-  { maxZoom:19, opacity:1 }
-).addTo(map);
-
-function label(s){
-  return s === 'completed' ? 'Completed' : 'Pending';
-}
-
-if(MODE === "nodes"){
-  // RENDER AGGREGATED NODE CENTROIDS
-  PAYLOAD.forEach(function(item){
-    var hasPending = item.pending > 0;
-    var dotColor = hasPending ? '#F59E0B' : '#10B981';
-    
-    var icon = L.divIcon({
-      className:'',
-      html:'<div class="node-pill" onclick="selectNode(\''+item.node+'\')">' +
-             '<span class="node-pill-dot" style="background:'+dotColor+'"></span>' +
-             item.node +
-           '</div>',
-      iconSize:null
-    });
-
-    L.marker([item.lat,item.lng],{icon:icon}).addTo(map);
-  });
-} else {
-  // RENDER INDIVIDUAL POLES
-  PAYLOAD.forEach(function(p){
-    var c = p.status === 'completed' ? '#10b981' : '#f59e0b';
-
-    var icon = L.divIcon({
-      className:'',
-      html:'<div class="pp" style="background:'+c+'"></div>',
-      iconSize:[12,12],
-      iconAnchor:[6,6]
-    });
-
-    var m = L.marker([p.lat,p.lng],{icon:icon}).addTo(map);
-
-    m.bindPopup(
-      '<div style="min-width:170px">'+
-        '<div style="font-size:13px;font-weight:900;color:#111827;font-family:monospace">'+p.pole_code+'</div>'+
-        (p.node ? '<div style="font-size:11px;color:#2563eb;margin-top:4px;font-weight:700">'+p.node+'</div>' : '')+
-        (p.barangay ? '<div style="font-size:11px;color:#6b7280;margin-top:2px">'+p.barangay+'</div>' : '')+
-        '<div style="margin-top:8px;display:inline-block;padding:4px 9px;border-radius:999px;background:'+c+'22;color:'+c+';font-size:10px;font-weight:800">'+label(p.status)+'</div>'+
-      '</div>'
-    );
-  });
-}
-
-// Intercept inline HTML button taps to notify React Native Webview
-function selectNode(nodeName){
-  if(window.ReactNativeWebView){
-    window.ReactNativeWebView.postMessage(JSON.stringify({ type: "SELECT_NODE", node: nodeName }));
+  function post(data){
+    try{
+      if(window.ReactNativeWebView){
+        window.ReactNativeWebView.postMessage(JSON.stringify(data));
+      }
+    }catch(e){}
   }
-}
 
-// Auto fit bounds
-if(BOUNDS && BOUNDS.length > 0){
-  try{
-    map.fitBounds(BOUNDS,{padding:[48,48],maxZoom:17});
-  }catch(e){
-    map.setView(PH_CENTER,6);
+  function fallbackText(text){
+    var el = document.getElementById("fallback");
+    if(el) el.innerHTML = text;
   }
-}else{
-  map.setView(PH_CENTER,6);
-}
 
-setTimeout(function(){
-  map.invalidateSize();
-},150);
+  function hideFallback(){
+    var el = document.getElementById("fallback");
+    if(el) el.className = "ready";
+  }
+
+  function safe(value){
+    var text = String(value === null || value === undefined ? "" : value);
+    var lookup = {
+      "&":"&amp;",
+      "<":"&lt;",
+      ">":"&gt;",
+      '"':"&quot;",
+      "'":"&#39;"
+    };
+    return text.replace(/[&<>"']/g,function(ch){ return lookup[ch]; });
+  }
+
+  function validLatLng(lat,lng){
+    lat = Number(lat);
+    lng = Number(lng);
+    return Number.isFinite(lat) &&
+      Number.isFinite(lng) &&
+      lat >= -90 &&
+      lat <= 90 &&
+      lng >= -180 &&
+      lng <= 180 &&
+      !(Math.abs(lat) < 0.000001 && Math.abs(lng) < 0.000001);
+  }
+
+  function statusLabel(status){
+    return status === "completed" ? "Completed" : "Pending";
+  }
+
+  function selectNode(nodeName){
+    post({ type:"SELECT_NODE", node:nodeName });
+  }
+
+  window.leafletFailed = function(){
+    fallbackText("Map library failed to load. Check device internet permission / connection.");
+    post({ type:"MAP_ERROR", message:"Leaflet failed to load. Check internet permission or connection." });
+  };
+
+  window.bootMap = function(){
+    if(!window.L){
+      window.leafletFailed();
+      return;
+    }
+
+    try{
+      var map = L.map("map",{
+        zoomControl:false,
+        attributionControl:false,
+        zoomSnap:0.25,
+        preferCanvas:true
+      });
+
+      var tileErrorSent = false;
+
+      var base = L.tileLayer(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        {
+          maxZoom:19,
+          attribution:"Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
+          crossOrigin:true
+        }
+      );
+
+      base.on("tileerror",function(){
+        if(tileErrorSent) return;
+        tileErrorSent = true;
+        post({ type:"TILE_ERROR", message:"Base map tiles failed to load." });
+      });
+
+      base.addTo(map);
+
+      if(Array.isArray(PAYLOAD)){
+        if(MODE === "nodes"){
+          PAYLOAD.forEach(function(item){
+            if(!validLatLng(item.lat,item.lng)) return;
+
+            var hasPending = Number(item.pending || 0) > 0;
+            var dotColor = hasPending ? "#f59e0b" : "#10b981";
+            var nodeLabel = safe(item.node || "Node");
+
+            var icon = L.divIcon({
+              className:"",
+              html:
+                '<div class="node-pill">' +
+                  '<span class="node-pill-dot" style="background:'+dotColor+'"></span>' +
+                  '<span>'+nodeLabel+'</span>' +
+                '</div>',
+              iconSize:null
+            });
+
+            var marker = L.marker([Number(item.lat),Number(item.lng)],{ icon:icon }).addTo(map);
+
+            marker.on("click",function(){
+              selectNode(item.node);
+            });
+
+            marker.bindPopup(
+              '<div class="popup-wrap">' +
+                '<div class="popup-title">'+nodeLabel+'</div>' +
+                '<div class="popup-sub">'+Number(item.total || 0)+' GPS poles</div>' +
+                '<div class="popup-sub" style="color:#10b981">'+Number(item.completed || 0)+' completed</div>' +
+                '<div class="popup-sub" style="color:#f59e0b">'+Number(item.pending || 0)+' pending</div>' +
+              '</div>'
+            );
+          });
+        }else{
+          PAYLOAD.forEach(function(p){
+            if(!validLatLng(p.lat,p.lng)) return;
+
+            var status = p.status === "completed" ? "completed" : "pending";
+            var color = status === "completed" ? "#10b981" : "#f59e0b";
+
+            var icon = L.divIcon({
+              className:"",
+              html:'<div class="pp" style="background:'+color+'"></div>',
+              iconSize:[13,13],
+              iconAnchor:[6,6]
+            });
+
+            var marker = L.marker([Number(p.lat),Number(p.lng)],{ icon:icon }).addTo(map);
+
+            marker.bindPopup(
+              '<div class="popup-wrap">' +
+                '<div class="popup-title">'+safe(p.pole_code || "Pole")+'</div>' +
+                (p.node ? '<div class="popup-node">'+safe(p.node)+'</div>' : '') +
+                (p.barangay ? '<div class="popup-sub">'+safe(p.barangay)+'</div>' : '') +
+                '<div class="popup-badge" style="background:'+color+'22;color:'+color+'">'+statusLabel(status)+'</div>' +
+              '</div>'
+            );
+          });
+        }
+      }
+
+      var fitBounds = [];
+
+      if(Array.isArray(BOUNDS)){
+        BOUNDS.forEach(function(pair){
+          if(Array.isArray(pair) && pair.length >= 2 && validLatLng(pair[0],pair[1])){
+            fitBounds.push([Number(pair[0]),Number(pair[1])]);
+          }
+        });
+      }
+
+      if(fitBounds.length === 1){
+        map.setView(fitBounds[0],17);
+      }else if(fitBounds.length > 1){
+        map.fitBounds(fitBounds,{ padding:[48,48], maxZoom:17 });
+      }else{
+        map.setView(PH_CENTER,6);
+      }
+
+      setTimeout(function(){
+        map.invalidateSize(true);
+      },100);
+
+      setTimeout(function(){
+        map.invalidateSize(true);
+        hideFallback();
+        post({
+          type:"MAP_READY",
+          mode:MODE,
+          count:Array.isArray(PAYLOAD) ? PAYLOAD.length : 0
+        });
+      },350);
+    }catch(e){
+      fallbackText("Map failed to render.");
+      post({ type:"MAP_ERROR", message:String(e && e.message ? e.message : e) });
+    }
+  };
+})();
+</script>
+
+<script
+  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  onload="bootMap()"
+  onerror="leafletFailed()">
 </script>
 </body>
 </html>`;
 }
 
-// ─── MAIN DASHBOARD SCREEN COMPONENT ─────────────────────────────────────────
 export default function PoleMapScreen() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const insets = useSafeAreaInsets();
   const webRef = useRef<WebView>(null);
+  const didInitialFetch = useRef(false);
 
-  // Raw fetched API dataset
   const [pins, setPins] = useState<PolePin[]>([]);
   const [loading, setLoading] = useState(true);
   const [fetching, setFetching] = useState(false);
+  const [mapIssue, setMapIssue] = useState<string | null>(null);
 
-  // Hierarchical Tiers State
   const [selectedSite, setSelectedSite] = useState<string>("all");
   const [selectedNode, setSelectedNode] = useState<string>("all");
   const [selectedStatus, setSelectedStatus] = useState<StatusFilter>("all");
 
-  // Search States
   const [searchNode, setSearchNode] = useState("");
-  const [searchedNodeObj, setSearchedNodeObj] = useState<{
-    node: string;
-    site: string;
-    total: number;
-    completed: number;
-    pending: number;
-    lat: number;
-    lng: number;
-  } | null>(null);
+  const [searchedNodeObj, setSearchedNodeObj] =
+    useState<SearchNodeSummary | null>(null);
 
-  // Overlay Modals
   const [siteModalVisible, setSiteModalVisible] = useState(false);
   const [nodeModalVisible, setNodeModalVisible] = useState(false);
   const [statusModalVisible, setStatusModalVisible] = useState(false);
   const [searchModalVisible, setSearchModalVisible] = useState(false);
 
-  // Live web map payload cache
-  const [mapHtml, setMapHtml] = useState(() =>
-    buildMapHtml("nodes", "[]", "[]")
-  );
+  const [mapHtml, setMapHtml] = useState(() => buildMapHtml("poles", [], []));
 
-  // Fetch logic
   const fetchPins = useCallback(
     async (bustCache = false) => {
-      if (!token) return;
+      if (!token) {
+        setLoading(false);
+        return;
+      }
+
+      const teamId = user?.team_id ?? null;
+      const activeCacheKey = teamId ? `pole_map_pins_team_${teamId}` : CACHE_KEY;
 
       if (bustCache) {
-        await cacheSet(CACHE_KEY, null);
+        try { await cacheSet(activeCacheKey, null); } catch {}
       }
 
-      const cached = await cacheGet<PolePin[]>(CACHE_KEY);
-
-      if (cached && cached.length > 0) {
-        setPins(cached);
-        setLoading(false);
-      }
+      try {
+        const cached = await cacheGet<PolePin[]>(activeCacheKey);
+        if (cached && cached.length > 0) {
+          setPins(cached);
+          setLoading(false);
+        }
+      } catch {}
 
       setFetching(true);
 
       try {
-        const { data } = await api.get("/skycable/poles/all");
-        const rows: any[] = Array.isArray(data) ? data : data?.data ?? [];
+        let all: PolePin[] = [];
 
-        const all: PolePin[] = rows.map((p) => {
-          const lat = p.lat ? Number(p.lat) : null;
-          const lng = p.lng ? Number(p.lng) : null;
+        if (teamId) {
+          const areas = await getAreas(token, teamId);
 
-          return {
-            id: p.id,
-            pole_code: p.pole_code,
-            lat,
-            lng,
-            has_gps:
-              typeof lat === "number" &&
-              typeof lng === "number" &&
-              !Number.isNaN(lat) &&
-              !Number.isNaN(lng),
-            status: p.skycable_status ?? "pending",
-            barangay: p.barangay ?? null,
-            node: p.node ?? null,
-          };
-        });
+          const allNodes = (
+            await Promise.all(
+              areas.map((area) =>
+                getNodes(area.id, token, teamId)
+                  .then((res) => res.data ?? [])
+                  .catch(() => []),
+              ),
+            )
+          ).flat();
+
+          const poleLists = await Promise.all(
+            allNodes.map((node) =>
+              getNodePoles(node.id, token)
+                .then((poles) =>
+                  poles.map((sp): PolePin => {
+                    const lat = sp.pole?.lat ? parseFloat(sp.pole.lat) : null;
+                    const lng = sp.pole?.lng ? parseFloat(sp.pole.lng) : null;
+                    const validCoords =
+                      lat !== null &&
+                      lng !== null &&
+                      isValidLatLng(lat, lng);
+                    return {
+                      id: sp.pole?.id ?? sp.pole_id,
+                      pole_code: sp.pole?.pole_code ?? `POLE-${sp.pole_id}`,
+                      lat: validCoords ? lat : null,
+                      lng: validCoords ? lng : null,
+                      has_gps: validCoords,
+                      status: sp.pole?.skycable_status ?? "pending",
+                      barangay: node.barangay_name ?? null,
+                      node: node.name ?? null,
+                    };
+                  }),
+                )
+                .catch(() => []),
+            ),
+          );
+
+          all = poleLists.flat();
+        } else {
+          const { data } = await api.get("/skycable/poles/all");
+          const rows: any[] = Array.isArray(data) ? data : (data?.data ?? []);
+          all = rows.map(mapApiPoleToPin);
+        }
+
+        if (__DEV__) {
+          console.log("PoleMap total pins:", all.length);
+          console.log("PoleMap GPS:", all.filter((p) => p.has_gps).length,
+            "without GPS:", all.filter((p) => !p.has_gps).length);
+        }
 
         setPins(all);
-        await cacheSet(CACHE_KEY, all);
-      } catch {
-        // preserve cached values upon failure
+        await cacheSet(activeCacheKey, all);
+      } catch (error) {
+        if (__DEV__) console.log("PoleMap fetch failed:", error);
       } finally {
         setFetching(false);
         setLoading(false);
       }
     },
-    [token]
+    [token, user],
   );
-
-  useEffect(() => {
-    fetchPins();
-  }, [fetchPins]);
 
   useFocusEffect(
     useCallback(() => {
-      fetchPins(true);
-    }, [fetchPins])
+      fetchPins(didInitialFetch.current);
+      didInitialFetch.current = true;
+    }, [fetchPins]),
   );
 
-  // ─── TIER 1 COMPUTATIONS: SITES ────────────────────────────────────────────
   const sitesList = useMemo(() => {
     const unique = Array.from(
       new Set(
         pins
           .map((p) => p.barangay)
-          .filter((b): b is string => typeof b === "string" && b.trim().length > 0)
-      )
+          .filter(
+            (b): b is string => typeof b === "string" && b.trim().length > 0,
+          ),
+      ),
     ).sort((a, b) => a.localeCompare(b));
 
     return ["all", ...unique];
   }, [pins]);
 
-  // ─── TIER 2 COMPUTATIONS: NODES ────────────────────────────────────────────
   const nodesList = useMemo(() => {
-    if (selectedSite === "all") return ["all"];
+    const sourcePins =
+      selectedSite === "all"
+        ? pins
+        : pins.filter((p) => p.barangay === selectedSite);
 
-    const sitePins = pins.filter((p) => p.barangay === selectedSite);
     const unique = Array.from(
       new Set(
-        sitePins
+        sourcePins
           .map((p) => p.node)
-          .filter((n): n is string => typeof n === "string" && n.trim().length > 0)
-      )
+          .filter(
+            (n): n is string => typeof n === "string" && n.trim().length > 0,
+          ),
+      ),
     ).sort((a, b) => a.localeCompare(b));
 
     return ["all", ...unique];
   }, [pins, selectedSite]);
 
-  // Handle dynamic Site selection -> reset internal Node and Status parameters
-  const handleSelectSite = (siteName: string) => {
-    setSelectedSite(siteName);
-    setSelectedNode("all");
-    setSelectedStatus("all");
-    setSiteModalVisible(false);
-  };
-
-  // ─── TIER 3 COMPUTATIONS: VISIBILITY STATS & CENTROIDS ─────────────────────
-  // Active Scoped Pins matching active Site and Node parameters
   const activeScopedPins = useMemo(() => {
     let result = pins;
+
     if (selectedSite !== "all") {
       result = result.filter((p) => p.barangay === selectedSite);
     }
+
     if (selectedNode !== "all") {
       result = result.filter((p) => p.node === selectedNode);
     }
+
     return result;
   }, [pins, selectedSite, selectedNode]);
 
-  // GPS and No-GPS counts
+  const statusScopedPins = useMemo(() => {
+    if (selectedStatus === "all") return activeScopedPins;
+
+    return activeScopedPins.filter(
+      (p) => normalizeStatus(p.status) === selectedStatus,
+    );
+  }, [activeScopedPins, selectedStatus]);
+
   const gpsPoles = useMemo(
-    () => activeScopedPins.filter((p) => p.has_gps),
-    [activeScopedPins]
+    () =>
+      statusScopedPins.filter(
+        (p) => p.has_gps && p.lat !== null && p.lng !== null,
+      ),
+    [statusScopedPins],
   );
+
   const noGpsPoles = useMemo(
-    () => activeScopedPins.filter((p) => !p.has_gps),
-    [activeScopedPins]
+    () => statusScopedPins.filter((p) => !p.has_gps),
+    [statusScopedPins],
   );
 
   const completedNoGps = useMemo(
     () =>
       noGpsPoles.filter((p) => normalizeStatus(p.status) === "completed")
         .length,
-    [noGpsPoles]
+    [noGpsPoles],
   );
+
   const pendingNoGps = useMemo(
     () =>
       noGpsPoles.filter((p) => normalizeStatus(p.status) === "pending").length,
-    [noGpsPoles]
+    [noGpsPoles],
   );
 
-  const visibleCount = useMemo(() => {
-    if (selectedStatus === "all") return gpsPoles.length;
-    return gpsPoles.filter((p) => normalizeStatus(p.status) === selectedStatus)
-      .length;
-  }, [gpsPoles, selectedStatus]);
-
-  // Aggregate Node Centroids (Used when selectedNode === 'all')
-  const nodeCentroids = useMemo(() => {
-    if (selectedSite === "all") return [];
+  const nodeCentroids = useMemo<NodeCentroid[]>(() => {
+    if (selectedSite === "all" || selectedNode !== "all") return [];
 
     const groups: Record<
       string,
@@ -408,14 +892,12 @@ export default function PoleMapScreen() {
       }
     > = {};
 
-    const targetPins = pins.filter((p) => p.barangay === selectedSite);
+    statusScopedPins.forEach((p) => {
+      if (!p.node || !p.node.trim()) return;
+      if (!p.has_gps || p.lat === null || p.lng === null) return;
 
-    targetPins.forEach((p) => {
-      const n = p.node;
-      if (!n || !n.trim()) return;
-
-      if (!groups[n]) {
-        groups[n] = {
+      if (!groups[p.node]) {
+        groups[p.node] = {
           latSum: 0,
           lngSum: 0,
           total: 0,
@@ -423,21 +905,22 @@ export default function PoleMapScreen() {
           pending: 0,
         };
       }
-      if (p.has_gps && p.lat && p.lng) {
-        groups[n].latSum += p.lat;
-        groups[n].lngSum += p.lng;
-        groups[n].total += 1;
-        if (normalizeStatus(p.status) === "completed") {
-          groups[n].completed += 1;
-        } else {
-          groups[n].pending += 1;
-        }
+
+      groups[p.node].latSum += p.lat;
+      groups[p.node].lngSum += p.lng;
+      groups[p.node].total += 1;
+
+      if (normalizeStatus(p.status) === "completed") {
+        groups[p.node].completed += 1;
+      } else {
+        groups[p.node].pending += 1;
       }
     });
 
     return Object.entries(groups)
       .map(([nodeName, stats]) => {
-        if (stats.total === 0) return null;
+        if (stats.total <= 0) return null;
+
         return {
           node: nodeName,
           lat: stats.latSum / stats.total,
@@ -447,115 +930,118 @@ export default function PoleMapScreen() {
           pending: stats.pending,
         };
       })
-      .filter(Boolean);
-  }, [pins, selectedSite]);
+      .filter((x): x is NodeCentroid => x !== null);
+  }, [selectedSite, selectedNode, statusScopedPins]);
 
-  // Re-generate MapView bundle payload
   useEffect(() => {
-    if (selectedSite === "all") {
-      // MODE: Classic View - render all status colored Pole pins across the whole region
-      const filteredPoles =
-        selectedStatus === "all"
-          ? gpsPoles
-          : gpsPoles.filter(
-              (p) => normalizeStatus(p.status) === selectedStatus
-            );
-
-      const normalizedPayload = filteredPoles.map((p) => ({
-        ...p,
-        status: normalizeStatus(p.status),
-      }));
-
-      const bounds = filteredPoles.map((p) => [p.lat, p.lng]);
-      setMapHtml(
-        buildMapHtml(
-          "poles",
-          JSON.stringify(normalizedPayload),
-          JSON.stringify(bounds)
-        )
-      );
-    } else if (selectedNode === "all") {
-      // MODE: Render aggregated distinct Node centroid cards
+    if (selectedSite !== "all" && selectedNode === "all") {
       const bounds = nodeCentroids.map((c) => [c.lat, c.lng]);
-      setMapHtml(
-        buildMapHtml(
-          "nodes",
-          JSON.stringify(nodeCentroids),
-          JSON.stringify(bounds)
-        )
-      );
-    } else {
-      // MODE: Render explicit targeted status colored Pole pins
-      const filteredPoles =
-        selectedStatus === "all"
-          ? gpsPoles
-          : gpsPoles.filter(
-              (p) => normalizeStatus(p.status) === selectedStatus
-            );
 
-      const normalizedPayload = filteredPoles.map((p) => ({
-        ...p,
+      setMapHtml(buildMapHtml("nodes", nodeCentroids, bounds));
+      return;
+    }
+
+    const mappablePoles = gpsPoles
+      .filter((p) => p.lat !== null && p.lng !== null)
+      .map((p) => ({
+        id: p.id,
+        pole_code: p.pole_code,
+        lat: p.lat as number,
+        lng: p.lng as number,
         status: normalizeStatus(p.status),
+        barangay: p.barangay,
+        node: p.node,
       }));
 
-      const bounds = filteredPoles.map((p) => [p.lat, p.lng]);
-      setMapHtml(
-        buildMapHtml(
-          "poles",
-          JSON.stringify(normalizedPayload),
-          JSON.stringify(bounds)
-        )
-      );
-    }
-  }, [selectedSite, selectedNode, selectedStatus, gpsPoles, nodeCentroids]);
+    const bounds = mappablePoles.map((p) => [p.lat, p.lng]);
 
-  // Intercept messages triggered by inline HTML WebView tap events
-  const onWebViewMessage = (event: any) => {
-    try {
-      const parsed = JSON.parse(event.nativeEvent.data);
-      if (parsed.type === "SELECT_NODE" && parsed.node) {
-        setSelectedNode(parsed.node);
-      }
-    } catch {}
+    setMapHtml(buildMapHtml("poles", mappablePoles, bounds));
+  }, [selectedSite, selectedNode, gpsPoles, nodeCentroids]);
+
+  const handleSelectSite = (siteName: string) => {
+    setSelectedSite(siteName);
+    setSelectedNode("all");
+    setSelectedStatus("all");
+    setSiteModalVisible(false);
   };
 
-  // ─── DEBOUNCED SEARCH LISTENER LOGIC ───────────────────────────────────────
+  const onWebViewMessage = useCallback((event: any) => {
+    try {
+      const parsed = JSON.parse(event.nativeEvent.data);
+
+      if (parsed.type === "SELECT_NODE" && parsed.node) {
+        setSelectedNode(parsed.node);
+        return;
+      }
+
+      if (parsed.type === "MAP_READY") {
+        setMapIssue(null);
+        return;
+      }
+
+      if (parsed.type === "MAP_ERROR") {
+        setMapIssue(parsed.message || "Map failed to render.");
+        return;
+      }
+
+      if (parsed.type === "TILE_ERROR") {
+        setMapIssue(
+          (current) =>
+            current ?? "Base map tiles are not loading. Check device internet.",
+        );
+      }
+    } catch {}
+  }, []);
+
   useEffect(() => {
     const timer = setTimeout(() => {
       const q = searchNode.trim().toUpperCase();
+
       if (!q) {
         setSearchedNodeObj(null);
         return;
       }
 
-      // Discover an explicit node whose code matches the search input query exactly
       const matchedPin = pins.find(
-        (p) => p.node && p.node.toUpperCase().includes(q)
+        (p) => p.node && p.node.toUpperCase().includes(q),
       );
 
-      if (matchedPin && matchedPin.node) {
-        const subPoles = pins.filter((p) => (p.node || "") === matchedPin.node);
-        const comp = subPoles.filter(
-          (p) => normalizeStatus(p.status) === "completed"
-        ).length;
-
-        // Obtain an active valid GPS reference if one exists to enable zoom routing
-        const gpsRef = subPoles.find((p) => p.has_gps && p.lat && p.lng);
-
-        setSearchedNodeObj({
-          node: matchedPin.node,
-          site: matchedPin.barangay || "Unassigned",
-          total: subPoles.length,
-          completed: comp,
-          pending: subPoles.length - comp,
-          lat: gpsRef?.lat ?? 12.8797,
-          lng: gpsRef?.lng ?? 121.774,
-        });
-        setSearchModalVisible(true);
-      } else {
+      if (!matchedPin || !matchedPin.node) {
         setSearchedNodeObj(null);
+        return;
       }
-    }, 450);
+
+      const siteKey = matchedPin.barangay || "all";
+      const siteLabel = matchedPin.barangay || "Unassigned / All Sites";
+
+      const subPoles = pins.filter((p) => {
+        const sameNode = (p.node || "") === matchedPin.node;
+        const sameSite = siteKey === "all" || p.barangay === siteKey;
+        return sameNode && sameSite;
+      });
+
+      const completed = subPoles.filter(
+        (p) => normalizeStatus(p.status) === "completed",
+      ).length;
+
+      const gpsRef = subPoles.find(
+        (p) => p.has_gps && p.lat !== null && p.lng !== null,
+      );
+
+      setSearchedNodeObj({
+        node: matchedPin.node,
+        siteKey,
+        siteLabel,
+        total: subPoles.length,
+        completed,
+        pending: subPoles.length - completed,
+        lat: gpsRef?.lat ?? 12.8797,
+        lng: gpsRef?.lng ?? 121.774,
+        hasGps: !!gpsRef,
+      });
+
+      setSearchModalVisible(true);
+    }, 400);
 
     return () => clearTimeout(timer);
   }, [searchNode, pins]);
@@ -563,55 +1049,84 @@ export default function PoleMapScreen() {
   const selectedStatusLabel =
     STATUS_FILTERS.find((s) => s.key === selectedStatus)?.label ?? "All Status";
 
+  const mapSummaryLabel =
+    selectedSite !== "all" && selectedNode === "all"
+      ? `${nodeCentroids.length} nodes`
+      : `${gpsPoles.length} markers`;
+
+  const mapKey = `${selectedSite}|${selectedNode}|${selectedStatus}|${pins.length}|${gpsPoles.length}|${nodeCentroids.length}`;
+
   return (
     <View style={s.rootContainer}>
-      {/* ── 1. Full Screen Immersive Map Canvas ── */}
       <View style={StyleSheet.absoluteFillObject}>
         {loading ? (
           <View style={s.loader}>
-            <ActivityIndicator size="large" color="#8b5cf6" />
-            <Text style={s.loaderText}>Loading GIS Map Data…</Text>
+            <ActivityIndicator size="large" color="#00856F" />
+            <Text style={s.loaderText}>Loading Site Map Data...</Text>
           </View>
         ) : (
           <WebView
+            key={mapKey}
             ref={webRef}
-            source={{ html: mapHtml }}
+            source={{
+              html: mapHtml,
+              baseUrl: "https://gis-pole-map.local/",
+            }}
             style={s.map}
             originWhitelist={["*"]}
             scrollEnabled={false}
             javaScriptEnabled
+            domStorageEnabled
+            mixedContentMode="always"
+            allowFileAccess
+            allowUniversalAccessFromFileURLs
+            cacheEnabled={false}
+            androidLayerType="hardware"
+            textZoom={100}
+            setSupportMultipleWindows={false}
             onMessage={onWebViewMessage}
+            onLoadStart={() => setMapIssue(null)}
+            onError={(e) => {
+              if (__DEV__) console.log("WEBVIEW ERROR:", e.nativeEvent);
+              setMapIssue("WebView failed to load the map.");
+            }}
+            onHttpError={(e) => {
+              if (__DEV__) console.log("WEBVIEW HTTP ERROR:", e.nativeEvent);
+            }}
           />
         )}
       </View>
 
-      {/* ── 2. Premium Elevated Header Filter Cards ── */}
       <View style={[s.floatingTopCard, { top: Math.max(insets.top + 8, 12) }]}>
         <View style={s.headerTopRow}>
           <View style={s.titleWrap}>
-            <Text style={s.title}>GIS Pole Map</Text>
+            <Text style={s.title}>Site Pole Map Preview</Text>
             <Text style={s.subtitle}>
               {loading
-                ? "Indexing poles…"
-                : `${visibleCount} markers · ${activeScopedPins.length} scoped`}
+                ? "Indexing poles..."
+                : `${mapSummaryLabel} · ${activeScopedPins.length} scoped`}
               {fetching && !loading ? "  ↻" : ""}
             </Text>
           </View>
 
-          {/* Right Aligned Modern Search Bar Container */}
           <View style={s.searchContainer}>
             <Search size={14} color="#64748B" style={s.searchIcon} />
             <TextInput
               style={s.searchInput}
-              placeholder="Search Node ID…"
+              placeholder="Search Node ID..."
               placeholderTextColor="#94A3B8"
               value={searchNode}
               onChangeText={setSearchNode}
               autoCapitalize="characters"
+              returnKeyType="search"
             />
             {!!searchNode && (
               <Pressable
-                onPress={() => setSearchNode("")}
+                onPress={() => {
+                  setSearchNode("");
+                  setSearchedNodeObj(null);
+                  setSearchModalVisible(false);
+                }}
                 style={s.clearSearch}
               >
                 <X size={12} color="#64748B" />
@@ -620,9 +1135,7 @@ export default function PoleMapScreen() {
           </View>
         </View>
 
-        {/* Tiered Hierarchical Selections Row */}
         <View style={s.dropdownRow}>
-          {/* Site Selection */}
           <Pressable
             style={s.dropdown}
             onPress={() => setSiteModalVisible(true)}
@@ -634,7 +1147,6 @@ export default function PoleMapScreen() {
             <ChevronDown size={14} color="#64748B" />
           </Pressable>
 
-          {/* Node Selection */}
           <Pressable
             style={s.dropdown}
             onPress={() => setNodeModalVisible(true)}
@@ -646,7 +1158,6 @@ export default function PoleMapScreen() {
             <ChevronDown size={14} color="#64748B" />
           </Pressable>
 
-          {/* Status Visibility Selection */}
           <Pressable
             style={s.dropdown}
             onPress={() => setStatusModalVisible(true)}
@@ -660,7 +1171,16 @@ export default function PoleMapScreen() {
         </View>
       </View>
 
-      {/* ── 3. Bottom Layered Without-GPS Counters ── */}
+      {!loading && mapIssue && (
+        <View
+          pointerEvents="none"
+          style={[s.mapIssueCard, { top: Math.max(insets.top + 118, 128) }]}
+        >
+          <Text style={s.mapIssueTitle}>Map notice</Text>
+          <Text style={s.mapIssueText}>{mapIssue}</Text>
+        </View>
+      )}
+
       {!loading && noGpsPoles.length > 0 && (
         <View pointerEvents="none" style={s.floatingNoGpsCard}>
           <Text style={s.floatingTitle}>{noGpsPoles.length} without GPS</Text>
@@ -670,7 +1190,7 @@ export default function PoleMapScreen() {
               <View
                 style={[
                   s.glassBadge,
-                  { backgroundColor: "rgba(255, 251, 235, 0.88)" },
+                  { backgroundColor: "rgba(255, 251, 235, 0.92)" },
                 ]}
               >
                 <View style={[s.badgeDot, { backgroundColor: "#f59e0b" }]} />
@@ -684,7 +1204,7 @@ export default function PoleMapScreen() {
               <View
                 style={[
                   s.glassBadge,
-                  { backgroundColor: "rgba(236, 253, 245, 0.88)" },
+                  { backgroundColor: "rgba(236, 253, 245, 0.92)" },
                 ]}
               >
                 <View style={[s.badgeDot, { backgroundColor: "#10b981" }]} />
@@ -697,9 +1217,6 @@ export default function PoleMapScreen() {
         </View>
       )}
 
-      {/* ─── MODALS DIALOG SECTION ────────────────────────────────────────── */}
-
-      {/* 1. SITES MODAL */}
       <Modal
         visible={siteModalVisible}
         transparent
@@ -722,9 +1239,14 @@ export default function PoleMapScreen() {
             </View>
 
             {sitesList.length <= 1 ? (
-              <Text style={s.noResultText}>No available site for you right now</Text>
+              <Text style={s.noResultText}>
+                No available site for you right now
+              </Text>
             ) : (
-              <ScrollView style={s.itemList} showsVerticalScrollIndicator={false}>
+              <ScrollView
+                style={s.itemList}
+                showsVerticalScrollIndicator={false}
+              >
                 {sitesList.map((site) => {
                   const active = selectedSite === site;
                   const label = site === "all" ? "All Sites Overview" : site;
@@ -750,7 +1272,6 @@ export default function PoleMapScreen() {
         </View>
       </Modal>
 
-      {/* 2. NODES MODAL */}
       <Modal
         visible={nodeModalVisible}
         transparent
@@ -775,7 +1296,7 @@ export default function PoleMapScreen() {
             <ScrollView style={s.itemList} showsVerticalScrollIndicator={false}>
               {nodesList.map((node) => {
                 const active = selectedNode === node;
-                const label = node === "all" ? "All Nodes Aggregated" : node;
+                const label = node === "all" ? "All Nodes" : node;
 
                 return (
                   <Pressable
@@ -800,7 +1321,6 @@ export default function PoleMapScreen() {
         </View>
       </Modal>
 
-      {/* 3. STATUS FILTERS MODAL */}
       <Modal
         visible={statusModalVisible}
         transparent
@@ -812,7 +1332,7 @@ export default function PoleMapScreen() {
             <View style={s.modalHeader}>
               <View>
                 <Text style={s.modalTitle}>Filter Completion Status</Text>
-                <Text style={s.modalSub}>Filter scoped active child pins</Text>
+                <Text style={s.modalSub}>Filter active scoped pins</Text>
               </View>
               <Pressable
                 style={s.modalClose}
@@ -826,7 +1346,7 @@ export default function PoleMapScreen() {
               const active = selectedStatus === item.key;
               const color =
                 item.key === "all"
-                  ? "#8b5cf6"
+                  ? "#00856F"
                   : item.key === "completed"
                     ? "#10b981"
                     : "#f59e0b";
@@ -856,7 +1376,6 @@ export default function PoleMapScreen() {
         </View>
       </Modal>
 
-      {/* 4. SEARCH NODE SUMMARY PREVIEW MODAL */}
       <Modal
         visible={searchModalVisible}
         transparent
@@ -881,11 +1400,16 @@ export default function PoleMapScreen() {
             {searchedNodeObj ? (
               <View style={s.searchModalBody}>
                 <View style={s.metaCard}>
-                  <Text style={s.metaLabel}>TARGET NODE ID</Text>
+                  <Text style={s.metaLabel}>Target Node ID</Text>
                   <Text style={s.metaValue}>{searchedNodeObj.node}</Text>
                   <Text style={s.metaSub}>
-                    Parent Assigned Site: {searchedNodeObj.site}
+                    Parent Assigned Site: {searchedNodeObj.siteLabel}
                   </Text>
+                  {!searchedNodeObj.hasGps && (
+                    <Text style={[s.metaSub, { color: "#f59e0b" }]}>
+                      This node has no valid GPS pole yet.
+                    </Text>
+                  )}
                 </View>
 
                 <View style={s.statsGrid}>
@@ -907,11 +1431,10 @@ export default function PoleMapScreen() {
                   </View>
                 </View>
 
-                {/* Directive Action: View on Map */}
                 <Pressable
                   style={s.viewMapBtn}
                   onPress={() => {
-                    setSelectedSite(searchedNodeObj.site);
+                    setSelectedSite(searchedNodeObj.siteKey);
                     setSelectedNode(searchedNodeObj.node);
                     setSelectedStatus("all");
                     setSearchModalVisible(false);
@@ -938,7 +1461,6 @@ export default function PoleMapScreen() {
   );
 }
 
-// ─── CENTRALIZED COMPONENT STYLESHEETS ───────────────────────────────────────
 const s = StyleSheet.create({
   rootContainer: {
     flex: 1,
@@ -962,7 +1484,7 @@ const s = StyleSheet.create({
 
   map: {
     flex: 1,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: "#F8FAFC",
   },
 
   floatingTopCard: {
@@ -972,9 +1494,9 @@ const s = StyleSheet.create({
     borderRadius: 22,
     paddingHorizontal: 16,
     paddingVertical: 14,
-    backgroundColor: "rgba(255, 255, 255, 0.82)",
+    backgroundColor: "rgba(255, 255, 255, 0.88)",
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.86)",
+    borderColor: "rgba(255, 255, 255, 0.9)",
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.12,
@@ -1014,7 +1536,7 @@ const s = StyleSheet.create({
     height: 34,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "flex-end", // Aligned perfectly to the right side
+    justifyContent: "flex-end",
     backgroundColor: "#F1F5F9",
     borderRadius: 100,
     paddingHorizontal: 10,
@@ -1074,6 +1596,32 @@ const s = StyleSheet.create({
     textAlign: "center",
   },
 
+  mapIssueCard: {
+    position: "absolute",
+    left: 20,
+    right: 20,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: "rgba(255, 251, 235, 0.94)",
+    borderWidth: 1,
+    borderColor: "rgba(245, 158, 11, 0.28)",
+    zIndex: 9,
+  },
+
+  mapIssueTitle: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#92400E",
+    marginBottom: 2,
+  },
+
+  mapIssueText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#B45309",
+  },
+
   floatingNoGpsCard: {
     position: "absolute",
     left: 16,
@@ -1082,15 +1630,16 @@ const s = StyleSheet.create({
     borderRadius: 22,
     paddingHorizontal: 14,
     paddingVertical: 12,
-    backgroundColor: "rgba(255, 255, 255, 0.82)",
+    backgroundColor: "rgba(255, 255, 255, 0.88)",
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.86)",
+    borderColor: "rgba(255, 255, 255, 0.9)",
     alignItems: "center",
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.12,
     shadowRadius: 18,
     elevation: 7,
+    zIndex: 8,
   },
 
   floatingTitle: {
@@ -1130,7 +1679,7 @@ const s = StyleSheet.create({
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(17, 24, 39, 0.55)",
-    justifyContent: "center", // Displayed centrally
+    justifyContent: "center",
     paddingHorizontal: 20,
   },
 
@@ -1196,8 +1745,8 @@ const s = StyleSheet.create({
   },
 
   optionRowActive: {
-    backgroundColor: "#EEF2FF",
-    borderColor: "#8B5CF6",
+    backgroundColor: "#ECFDF5",
+    borderColor: "#00856F",
   },
 
   optionLeft: {
@@ -1219,14 +1768,14 @@ const s = StyleSheet.create({
   },
 
   optionTitleActive: {
-    color: "#6D28D9",
+    color: "#006B59",
   },
 
   activeDot: {
     width: 10,
     height: 10,
     borderRadius: 5,
-    backgroundColor: "#8B5CF6",
+    backgroundColor: "#00856F",
   },
 
   searchModalBody: {
@@ -1245,7 +1794,7 @@ const s = StyleSheet.create({
   metaLabel: {
     fontSize: 9,
     fontWeight: "800",
-    color: "#8B5CF6",
+    color: "#00856F",
     textTransform: "uppercase",
   },
 
@@ -1296,10 +1845,10 @@ const s = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#8B5CF6",
+    backgroundColor: "#00856F",
     borderRadius: 16,
     height: 48,
-    shadowColor: "#8B5CF6",
+    shadowColor: "#00856F",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.25,
     shadowRadius: 10,

@@ -1,12 +1,7 @@
 import api from "@/lib/api";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import {
-  Cable,
-  ChevronLeft,
-  Cpu,
-  Route
-} from "lucide-react-native";
+import { ChevronLeft } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -21,7 +16,6 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 
 const GREEN = "#0B7A5A";
-const GREEN_LIGHT = "#ECFDF3";
 const BLUE = "#6366F1";
 const ORANGE = "#F59E0B";
 const SLATE = "#111827";

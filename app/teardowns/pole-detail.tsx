@@ -7,7 +7,6 @@ import * as FileSystem from "expo-file-system/legacy";
 import { Image as ExpoImage } from "expo-image";
 import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
 import { CameraView, useCameraPermissions } from "expo-camera";
-import * as ImagePicker from "expo-image-picker";
 import * as Location from "expo-location";
 import * as MediaLibrary from "expo-media-library";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
@@ -65,7 +64,7 @@ type Span = {
   status?: string;
   from_pole: SpanPoleRef;
   to_pole: SpanPoleRef;
-  components?: Array<{ component_type: string; expected_count: number }>;
+  components?: { component_type: string; expected_count: number }[];
 };
 
 function getExpected(span: Span, type: string) {
@@ -139,11 +138,6 @@ html,body,#map{width:100%;height:100%;background:#0d1117;}
   border:2.5px solid #fff;
   box-shadow:0 2px 8px rgba(0,0,0,0.5);
 }
-.pin-line{
-  width:2px;height:12px;
-  background:linear-gradient(${accentColor},transparent);
-  margin-top:-1px;
-}
 @keyframes ring-pulse{
   0%{box-shadow:0 0 0 0 ${accentColor}55;}
   70%{box-shadow:0 0 0 16px ${accentColor}00;}
@@ -168,14 +162,17 @@ L.tileLayer('${tileUrl}',{${tileOpts}}).addTo(map);
 
 var icon=L.divIcon({
   className:'',
-  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div><div class="pin-line"></div></div>',
-  iconSize:[36,60],
-  iconAnchor:[18,60]
+  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div></div>',
+  iconSize:[36,36],
+  iconAnchor:[18,18]
 });
 
 L.marker([${lat},${lng}],{icon:icon}).addTo(map);
 
-setTimeout(function(){map.invalidateSize();},80);
+setTimeout(function(){
+  map.invalidateSize();
+  map.setView([${lat},${lng}],18);
+}, 250);
 </script>
 </body>
 </html>`;
@@ -187,6 +184,7 @@ function sanitize(s?: string) {
     .trim()
     .replace(/[^a-z0-9_-]/g, "_");
 }
+
 
 function getCompletionState({
   hasGps,
@@ -369,8 +367,12 @@ function PhotoTile({
           </>
         ) : (
           <View style={styles.photoTilePlaceholder}>
-            <Text style={styles.photoTilePlaceholderIcon}>📷</Text>
-            <Text style={styles.photoTilePlaceholderText}>Tap</Text>
+            <Image
+              source={require("../../assets/images/telco-mainlogo.png")}
+              style={styles.photoTilePlaceholderLogo}
+              resizeMode="contain"
+            />
+            <Text style={styles.photoTilePlaceholderText}>Not yet captured</Text>
           </View>
         )}
       </View>
@@ -407,6 +409,106 @@ window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
 <\/script></body></html>`;
 
 const STAMP_HTML = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#000"><canvas id="c"></canvas><script>
+function rr(ctx,x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);
+  ctx.closePath();
+}
+
+function drawStamp(ctx,img,lines,mapB64){
+  var W=img.width,H=img.height;
+  var gap=Math.round(W*0.012);          // ~6px on 500px wide, scales with resolution
+  var fSize=Math.min(
+    Math.max(14,Math.round(W*0.020)),
+    Math.floor((H*0.22)/(lines.length*1.55+1.5))
+  );
+  var lh=Math.round(fSize*1.55);
+  var vPad=Math.round(fSize*0.9);
+  var hPad=Math.round(fSize*0.75);
+  var panelH=lines.length*lh+vPad*2;
+  var r=Math.round(panelH*0.14);        // corner radius
+
+  // Map panel: square, same height as text panel
+  var mapSize=mapB64?panelH:0;
+  // Text panel width fills remaining space
+  var textW=W-gap*2-mapSize-(mapSize?gap:0);
+
+  // Panel Y position: gap from bottom
+  var panelY=H-panelH-gap;
+
+  // Subtle gradient fade behind both panels
+  var fadeH=panelH+gap*4;
+  var grad=ctx.createLinearGradient(0,H-fadeH,0,H);
+  grad.addColorStop(0,'rgba(0,0,0,0)');
+  grad.addColorStop(1,'rgba(0,0,0,0.38)');
+  ctx.fillStyle=grad;
+  ctx.fillRect(0,H-fadeH,W,fadeH);
+
+  function drawTextPanel(){
+    // Semi-transparent pill behind text
+    ctx.save();
+    rr(ctx,gap,panelY,textW,panelH,r);
+    ctx.fillStyle='rgba(0,0,0,0.52)';
+    ctx.fill();
+    ctx.restore();
+
+    // Text — vertically centered in panel
+    ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=3;
+    var textBlockH=lines.length*lh;
+    var startY=panelY+(panelH-textBlockH)/2;
+    lines.forEach(function(line,i){
+      var y=startY+(i+0.78)*lh;
+      var maxW=textW-hPad*2;
+      if(i===0){ctx.font='bold '+Math.round(fSize*1.05)+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
+      else if(i===lines.length-1){ctx.font=Math.round(fSize*0.84)+'px Arial,sans-serif';ctx.fillStyle='rgba(255,255,255,0.72)';}
+      else{ctx.font='bold '+fSize+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
+      var txt=line;
+      while(ctx.measureText(txt).width>maxW&&txt.length>4)txt=txt.slice(0,-2);
+      if(txt!==line)txt=txt.slice(0,-1)+'…';
+      ctx.fillText(txt,gap+hPad,y);
+    });
+    ctx.shadowBlur=0;
+  }
+
+  function drawMapPanel(mapImg){
+    var mx=gap+textW+gap;
+    var my=panelY;
+    ctx.save();
+    rr(ctx,mx,my,mapSize,mapSize,r);
+    ctx.clip();
+    // tile fills square
+    var scale=Math.max(mapSize/256,mapSize/256);
+    var tw=256*scale,th=256*scale;
+    ctx.drawImage(mapImg,mx+(mapSize-tw)/2,my+(mapSize-th)/2,tw,th);
+    // subtle vignette on map
+    ctx.fillStyle='rgba(0,0,0,0.18)';ctx.fillRect(mx,my,mapSize,mapSize);
+    // GPS dot centered
+    var dotR=Math.round(mapSize*0.07);
+    ctx.beginPath();ctx.arc(mx+mapSize/2,my+mapSize/2,dotR,0,2*Math.PI);
+    ctx.fillStyle='#EF4444';ctx.fill();
+    ctx.strokeStyle='#FFFFFF';ctx.lineWidth=Math.max(2,Math.round(dotR*0.35));ctx.stroke();
+    ctx.restore();
+  }
+
+  function finish(){
+    var b64=document.getElementById('c').toDataURL('image/jpeg',0.93).split(',')[1];
+    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
+  }
+
+  if(mapB64&&mapSize>0){
+    var mapImg=new Image();
+    mapImg.onload=function(){drawTextPanel();drawMapPanel(mapImg);finish();};
+    mapImg.onerror=function(){drawTextPanel();finish();};
+    mapImg.src='data:image/jpeg;base64,'+mapB64;
+  }else{
+    drawTextPanel();finish();
+  }
+}
+
 function stamp(payload){
   var data;try{data=JSON.parse(payload);}catch(ex){window.ReactNativeWebView.postMessage(JSON.stringify({error:'parse'}));return;}
   var img=new Image();
@@ -415,42 +517,7 @@ function stamp(payload){
     c.width=img.width;c.height=img.height;
     var ctx=c.getContext('2d');
     ctx.drawImage(img,0,0);
-    var lines=data.lines;
-    // Scale font so stamp never exceeds ~28% of image height regardless of line count
-    var maxStampH=img.height*0.28;
-    var fSize=Math.min(
-      Math.max(16, Math.round(img.width*0.020)),
-      Math.floor(maxStampH/(lines.length*1.55+1.8))
-    );
-    var lh=Math.round(fSize*1.55);
-    var pad=Math.round(fSize*0.85);
-    var totalH=lines.length*lh+pad*2;
-    var grad=ctx.createLinearGradient(0,img.height-totalH-40,0,img.height);
-    grad.addColorStop(0,'rgba(0,0,0,0)');
-    grad.addColorStop(0.3,'rgba(0,0,0,0.60)');
-    grad.addColorStop(1,'rgba(0,0,0,0.85)');
-    ctx.fillStyle=grad;
-    ctx.fillRect(0,img.height-totalH-40,img.width,totalH+40);
-    ctx.shadowColor='rgba(0,0,0,0.95)';
-    ctx.shadowBlur=4;
-    lines.forEach(function(line,i){
-      var y=img.height-totalH+pad+(i+1)*lh-4;
-      // First line (date/time) slightly larger and lighter
-      if(i===0){
-        ctx.font='bold '+Math.round(fSize*1.08)+'px Arial,sans-serif';
-        ctx.fillStyle='#FFFFFF';
-      } else if(i===lines.length-1){
-        // Last line (timestamp+project) slightly smaller and muted
-        ctx.font=Math.round(fSize*0.88)+'px Arial,sans-serif';
-        ctx.fillStyle='rgba(255,255,255,0.80)';
-      } else {
-        ctx.font='bold '+fSize+'px Arial,sans-serif';
-        ctx.fillStyle='#FFFFFF';
-      }
-      ctx.fillText(line,pad,y);
-    });
-    var b64=c.toDataURL('image/jpeg',0.92).split(',')[1];
-    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
+    drawStamp(ctx,img,data.lines,data.mapB64||null);
   };
   img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({error:'load'}));};
   img.src='data:image/jpeg;base64,'+data.b64;
@@ -492,6 +559,8 @@ export default function PoleDetailScreen() {
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
   const [gpsCapturedAt, setGpsCapturedAt] = useState("");
+  const [gpsConfirmModal, setGpsConfirmModal] = useState(false);
+  const [gpsSuccessModal, setGpsSuccessModal] = useState(false);
   const [poleLoading, setPoleLoading] = useState(true);
   const [gpsCapturing, setGpsCapturing] = useState(false);
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
@@ -500,6 +569,7 @@ export default function PoleDetailScreen() {
     longitude: number;
     accuracy: number | null;
   } | null>(null);
+  const [liveCoords, setLiveCoords] = useState<{ lat: number; lng: number } | null>(null);
   const locationWatcher = useRef<Location.LocationSubscription | null>(null);
   const [street, setStreet] = useState("");
   const [city, setCity] = useState("");
@@ -549,8 +619,6 @@ export default function PoleDetailScreen() {
   } | null>(null);
 
   const [viewerOpen, setViewerOpen] = useState(false);
-  const [qualityAlertOpen, setQualityAlertOpen] = useState(false);
-  const [qualityRetakeFn, setQualityRetakeFn] = useState<(() => void) | null>(null);
   const [viewerLabel, setViewerLabel] = useState("");
   const [viewerPhoto, setViewerPhoto] = useState<PhotoField>(null);
   const [viewerRetake, setViewerRetake] = useState<(() => void) | null>(null);
@@ -558,7 +626,12 @@ export default function PoleDetailScreen() {
   // ── Teardown gate ──────────────────────────────────────────────────────────
   const teardownStartedKey = `teardown_started_${pole_id}`;
   const [teardownStarted, setTeardownStarted] = useState(false);
-  const [teardownStartedAt, setTeardownStartedAt] = useState<string>("");
+  const [poleStartedAt, setPoleStartedAt]     = useState<string | null>(null);
+  const [afterCapturedAt, setAfterCapturedAt] = useState<string | null>(null);
+  const [poleFinishedAt, setPoleFinishedAt]   = useState<string | null>(null);
+  const [startingPole, setStartingPole]       = useState(false);
+  const [gateAlertModal, setGateAlertModal]   = useState<{ title: string; message: string } | null>(null);
+
 
   // Work timer — only counts after Start Teardown is pressed
   const timerStartRef = useRef<number | null>(null);
@@ -568,16 +641,15 @@ export default function PoleDetailScreen() {
   const stampResolverRef = useRef<((b64: string | null) => void) | null>(null);
   const [elapsedSecs, setElapsedSecs] = useState(0);
   useEffect(() => {
-    if (!teardownStarted || timerStartRef.current === null) return;
+    if (!teardownStarted || timerStartRef.current === null || poleFinishedAt) return;
     const startTime = timerStartRef.current;
     const id = setInterval(() => {
       setElapsedSecs(Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
     return () => clearInterval(id);
-  }, [teardownStarted]);
+  }, [teardownStarted, poleFinishedAt]);
 
   // Draft recovery
-  const [draftRestored, setDraftRestored] = useState(false);
 
   const projFolder = sanitize(project_name);
   const draftDir = `${FileSystem.documentDirectory}pole_drafts/${projFolder}/${node_id ?? "node"}/${pole_id}/`;
@@ -610,6 +682,7 @@ export default function PoleDetailScreen() {
         (loc) => {
           if (!mounted) return;
           prewarmedGps.current = loc.coords;
+          setLiveCoords({ lat: loc.coords.latitude, lng: loc.coords.longitude });
           setGpsAccuracy(Math.round(loc.coords.accuracy ?? 999));
         },
       );
@@ -660,15 +733,33 @@ export default function PoleDetailScreen() {
 
   useEffect(() => {
     // Restore teardown started state
-    cacheGet<{ startedAt: string }>(teardownStartedKey).then(v => {
+    cacheGet<{ startedAt: string; startMs?: number }>(teardownStartedKey).then(v => {
       if (v?.startedAt) {
         setTeardownStarted(true);
-        setTeardownStartedAt(v.startedAt);
-        // Restore elapsed time
-        const elapsed = Math.floor((Date.now() - new Date(v.startedAt).getTime()) / 1000);
-        setElapsedSecs(elapsed);
-        timerStartRef.current = new Date(v.startedAt).getTime();
+        setPoleStartedAt(v.startedAt);
+        const baseMs = v.startMs || new Date(v.startedAt).getTime();
+        timerStartRef.current = baseMs;
+        
+        // Also check if already finished
+        cacheGet<string>(`teardown_finished_${pole_id}`).then(finishedTs => {
+          if (finishedTs) {
+            setPoleFinishedAt(finishedTs);
+            const delta = Math.floor((new Date(finishedTs).getTime() - baseMs) / 1000);
+            setElapsedSecs(Math.max(0, delta));
+          } else {
+            const elapsed = Math.floor((Date.now() - baseMs) / 1000);
+            setElapsedSecs(Math.max(0, elapsed));
+          }
+        }).catch(() => {
+          const elapsed = Math.floor((Date.now() - baseMs) / 1000);
+          setElapsedSecs(Math.max(0, elapsed));
+        });
       }
+    }).catch(() => {});
+
+    // Restore after-photo captured timestamp
+    cacheGet<string>(`photo_captured_at_${pole_id}_after`).then(v => {
+      if (v) setAfterCapturedAt(v);
     }).catch(() => {});
 
     cacheGet<GpsDraft>(gpsDraftKey)
@@ -787,8 +878,7 @@ export default function PoleDetailScreen() {
       if (pb) setPhotoBefore(pb);
       if (pa) setPhotoAfter(pa);
       if (pt) setPhotoTag(pt);
-      if (pb || pa || pt) setDraftRestored(true);
-
+      
       const [qb, qa, qt] = await Promise.all([
         cacheGet<number>(`pole_quality_before_${pole_id}`),
         cacheGet<number>(`pole_quality_after_${pole_id}`),
@@ -823,6 +913,8 @@ export default function PoleDetailScreen() {
     });
   }, [
     pole_id,
+    node_id,
+    teardownStartedKey,
     gpsDraftKey,
     draftDir,
     F.after,
@@ -866,8 +958,7 @@ export default function PoleDetailScreen() {
         setPhotoBefore(pb);
         setPhotoAfter(pa);
         setPhotoTag(pt);
-        if (pb || pa || pt) setDraftRestored(true);
-      })();
+              })();
 
       return () => { cancelled = true; };
     }, [draftDir, F.before, F.after, F.tag]),
@@ -939,10 +1030,29 @@ export default function PoleDetailScreen() {
     return lines;
   }
 
-  async function stampPhoto(uri: string, lines: string[]): Promise<string> {
+  async function fetchMapTileB64(lat: number, lng: number): Promise<string | null> {
+    try {
+      const z = 17;
+      const n = Math.pow(2, z);
+      const tileX = Math.floor(((lng + 180) / 360) * n);
+      const latRad = (lat * Math.PI) / 180;
+      const tileY = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
+      const url = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${tileY}/${tileX}`;
+      const tmp = `${FileSystem.cacheDirectory}maptile_${Date.now()}.jpg`;
+      const dl = await FileSystem.downloadAsync(url, tmp);
+      const b64 = await FileSystem.readAsStringAsync(dl.uri, { encoding: "base64" as any });
+      FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {});
+      return b64;
+    } catch {
+      return null;
+    }
+  }
+
+  async function stampPhoto(uri: string, lines: string[], lat?: number | null, lng?: number | null): Promise<string> {
     try {
       const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" as any });
-      const payload = JSON.stringify({ b64, lines });
+      const mapB64 = lat && lng ? await fetchMapTileB64(lat, lng).catch(() => null) : null;
+      const payload = JSON.stringify({ b64, lines, mapB64 });
       return new Promise<string>((resolve) => {
         const timer = setTimeout(() => {
           stampResolverRef.current = null;
@@ -1011,6 +1121,8 @@ export default function PoleDetailScreen() {
     fileName: string,
     uri: string,
     stampLines?: string[],
+    gpsLat?: number | null,
+    gpsLng?: number | null,
   ): Promise<NonNullable<PhotoField>> {
     await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true });
 
@@ -1025,7 +1137,7 @@ export default function PoleDetailScreen() {
     // ── Stamped version → _view file on disk + gallery (display + lineman backup) ──
     let displayUri = dest; // fallback: show clean if no stamp
     if (stampLines?.length) {
-      const stamped = await stampPhoto(compressed, stampLines);
+      const stamped = await stampPhoto(compressed, stampLines, gpsLat, gpsLng);
       const viewDest = dest.replace(/\.jpg$/i, "_view.jpg");
       const viewExisting = await FileSystem.getInfoAsync(viewDest);
       if (viewExisting.exists) await FileSystem.deleteAsync(viewDest, { idempotent: true });
@@ -1042,7 +1154,7 @@ export default function PoleDetailScreen() {
     const version = Date.now();
     return {
       uri: `${displayUri}?v=${version}`,  // stamped view for display
-      fileUri: dest,                        // clean file for backend upload
+      fileUri: displayUri,                  // stamped file for backend upload to preserve visual audits
       name: fileName,
       type: "image/jpeg",
       version,
@@ -1060,9 +1172,18 @@ export default function PoleDetailScreen() {
       const qualitySetter = activeCameraTab === "before" ? setQualityBefore : activeCameraTab === "after" ? setQualityAfter : setQualityTag;
       const file = activeCameraTab === "before" ? F.before : activeCameraTab === "after" ? F.after : F.tag;
       setter(createPhotoField(photo.uri, file));
-      const saved = await savePhotoDraft(file, photo.uri, buildStampLines(activeCameraTab));
+      const saved = await savePhotoDraft(file, photo.uri, buildStampLines(activeCameraTab), lat, lng);
       setter(saved);
       cacheSet(`photo_captured_at_${pole_id}_${activeCameraTab}`, capturedAt).catch(() => {});
+      if (activeCameraTab === "after") {
+        setAfterCapturedAt(capturedAt);
+        // Sync cleared_at (finished_at) to skycable_poles — triggers duration + status=completed
+        api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
+          pole_id:    Number(pole_id),
+          cleared_at: capturedAt,
+          status:     "completed",
+        }).catch(() => {});
+      }
       const variance = await checkPhotoQuality(saved.fileUri);
       const pct = varianceToPercent(variance);
       qualitySetter(pct);
@@ -1076,64 +1197,6 @@ export default function PoleDetailScreen() {
     }
   }
 
-  async function openCamera(
-    setter: (p: PhotoField) => void,
-    fileName: string,
-    modalLabel?: string,
-  ) {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== "granted") {
-      Alert.alert("Permission required", "Please allow camera access.");
-      return;
-    }
-
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 1,
-      allowsEditing: false,
-    });
-
-    if (result.canceled || !result.assets[0]) return;
-
-    const rawUri = result.assets[0].uri;
-    const capturedAt = getPHTNow();
-    const preview = createPhotoField(rawUri, fileName);
-
-    setter(preview);
-
-    if (modalLabel && viewerLabel === modalLabel) {
-      setViewerPhoto(preview);
-    }
-
-    try {
-      const saved = await savePhotoDraft(fileName, rawUri);
-      setter(saved);
-      const tabFromFile = fileName.includes("_before.") ? "before" : fileName.includes("_after.") ? "after" : fileName.includes("_poletag.") ? "tag" : null;
-      if (tabFromFile) cacheSet(`photo_captured_at_${pole_id}_${tabFromFile}`, capturedAt).catch(() => {});
-
-      if (modalLabel && viewerLabel === modalLabel) {
-        setViewerPhoto(saved);
-      }
-
-      const quality = await checkPhotoQuality(saved.fileUri);
-      if (quality < 80) {
-        setQualityRetakeFn(() => () => openCamera(setter, fileName, modalLabel));
-        setQualityAlertOpen(true);
-        return;
-      }
-
-    } catch (e: any) {
-      Alert.alert("Photo Error", e?.message ?? "Failed to save photo.");
-    }
-
-    MediaLibrary.requestPermissionsAsync()
-      .then(({ status: s }) => {
-        if (s === "granted") {
-          MediaLibrary.saveToLibraryAsync(rawUri).catch(() => {});
-        }
-      })
-      .catch(() => {});
-  }
 
   function openViewer(label: string, photo: PhotoField, retakeFn: () => void) {
     if (!photo) return;
@@ -1143,35 +1206,78 @@ export default function PoleDetailScreen() {
     setViewerOpen(true);
   }
 
-  async function captureGps() {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted") {
-      Alert.alert("Permission required", "Please allow location access.");
+  function computeDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const R = 6371e3;
+    const p1 = (lat1 * Math.PI) / 180;
+    const p2 = (lat2 * Math.PI) / 180;
+    const dp = ((lat2 - lat1) * Math.PI) / 180;
+    const dl = ((lng2 - lng1) * Math.PI) / 180;
+    const a = Math.sin(dp / 2) * Math.sin(dp / 2) + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Math.round(R * c);
+  }
+
+  async function handleOpenCapture(tab: "before" | "after" | "tag") {
+    if (!teardownStarted) {
+      setGateAlertModal({ title: "Teardown Not Started", message: "Please tap 'Start Pole Teardown' below to start recording site progress." });
+      return;
+    }
+    if (!infoComplete) {
+      setGateAlertModal({ title: "Requirement Missing", message: isPoleReport ? "Please capture GPS coordinates first." : "Please capture GPS coordinates and set the Slot first." });
       return;
     }
 
-    // If GPS already captured, ask before overwriting
     if (lat !== null && lng !== null) {
-      const confirmed = await new Promise<boolean>((resolve) => {
-        Alert.alert(
-          "Replace GPS?",
-          `This pole already has coordinates:\n${lat.toFixed(6)}, ${lng.toFixed(6)}\n\nRetaking will replace the saved location.`,
-          [
-            { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
-            { text: "Retake GPS", style: "destructive", onPress: () => resolve(true) },
-          ],
-        );
-      });
-      if (!confirmed) return;
+      let live = prewarmedGps.current;
+      if (!live) {
+        try {
+          const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
+          live = pos.coords as any;
+          prewarmedGps.current = live;
+          if (live) setLiveCoords({ lat: live.latitude, lng: live.longitude });
+        } catch {}
+      }
+      if (live) {
+        const dist = computeDistanceMeters(lat, lng, live.latitude, live.longitude);
+        if (dist > 50) {
+          setGateAlertModal({
+            title: "Too Far From Pole",
+            message: `You must be within 50 meters of the captured pole coordinates to take authentic site photos. Current distance: ${dist} meters.`,
+          });
+          return;
+        }
+      }
     }
 
+    setActiveCameraTab(tab);
+    setShowCameraModal(true);
+  }
+
+  async function captureGps() {
+    if (!teardownStarted) {
+      setGateAlertModal({ title: "Teardown Not Started", message: "Please tap 'Start Pole Teardown' below to start recording site progress." });
+      return;
+    }
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== "granted") {
+      setGateAlertModal({ title: "Permission required", message: "Please allow location access." });
+      return;
+    }
+
+    // If GPS already captured, trigger custom confirmation modal
+    if (lat !== null && lng !== null) {
+      setGpsConfirmModal(true);
+      return;
+    }
+
+    await confirmAndCaptureGps();
+  }
+
+  async function confirmAndCaptureGps() {
     setGpsCapturing(true);
 
     try {
       const coords = prewarmedGps.current;
-      const currentAccuracy = Math.round(
-        coords?.accuracy ?? gpsAccuracy ?? 999,
-      );
 
       if (!coords) {
         Alert.alert(
@@ -1213,12 +1319,21 @@ export default function PoleDetailScreen() {
         }
       }
 
-      // GPS stored locally — will be sent with the teardown submission
-      Alert.alert(
-        "GPS Captured",
-        `Location saved.\n${draft.lat.toFixed(6)}, ${draft.lng.toFixed(6)}`,
-        [{ text: "OK" }],
-      );
+      // Commit captured GPS coordinates directly to backend database `poles` table via dedicated GPS endpoint
+      try {
+        await api.post(`/skycable/poles/${pole_id}/gps`, { lat: draft.lat, lng: draft.lng });
+      } catch (err: any) {
+        if (!err?.response?.status) {
+          await simpleQueuePush({
+            method: "post",
+            url: `/skycable/poles/${pole_id}/gps`,
+            body: { lat: draft.lat, lng: draft.lng },
+          }).catch(() => {});
+        }
+      }
+
+      // Trigger high-fidelity custom success popup modal
+      setGpsSuccessModal(true);
     } catch (e: any) {
       Alert.alert("Error", e?.message ?? "Failed to capture GPS.");
     } finally {
@@ -1227,7 +1342,7 @@ export default function PoleDetailScreen() {
   }
 
   const hasGps = !!(lat && lng);
-  const infoComplete = isPoleReport ? hasGps : hasGps && !!slot;
+  const infoComplete = teardownStarted && (isPoleReport ? hasGps : hasGps && !!slot);
 
   const [showCameraModal, setShowCameraModal]   = useState(false);
   const [mapFullscreen, setMapFullscreen]       = useState(false);
@@ -1269,44 +1384,57 @@ export default function PoleDetailScreen() {
           ? `Accuracy: ${gpsAccuracy}m • Tap to capture`
           : `Accuracy: ${gpsAccuracy}m • Weak signal — tap to capture anyway`;
 
-  async function handleSavePoleNameEdit() {
+  function handleSavePoleNameEdit() {
     const trimmed = editNameDraft.trim();
     if (!trimmed) return;
-    setSavingName(true);
 
-    // 1. Update local state immediately (works offline too)
-    setEditedPoleName(trimmed);
-    await cacheSet(`draft_pole_name_${pole_id}`, trimmed).catch(() => {});
+    Alert.alert(
+      "Confirm Name Change",
+      `Are you sure you want to rename this pole to "${trimmed}"?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Yes",
+          onPress: async () => {
+            setSavingName(true);
 
-    // 2. Patch the poles list cache so the list screen shows the new name without a sync
-    if (node_id) {
-      const polesCacheKey = `poles_node_${node_id}`;
-      const cachedPoles = await cacheGet<any[]>(polesCacheKey).catch(() => null);
-      if (cachedPoles) {
-        const updated = cachedPoles.map((p) =>
-          String(p.id) === String(pole_id) ? { ...p, pole_name: trimmed } : p,
-        );
-        await cacheSet(polesCacheKey, updated).catch(() => {});
-      }
-    }
+            // 1. Update local state immediately (works offline too)
+            setEditedPoleName(trimmed);
+            await cacheSet(`draft_pole_name_${pole_id}`, trimmed).catch(() => {});
 
-    // 3. Try to save to backend immediately; queue if offline
-    try {
-      await api.put(`/poles/${pole_id}`, { pole_name: trimmed });
-    } catch (e: any) {
-      const status = e?.response?.status;
-      if (!status) {
-        // Network error — queue for later
-        await simpleQueuePush({
-          method: "put",
-          url: `/poles/${pole_id}`,
-          body: { pole_name: trimmed },
-        }).catch(() => {});
-      }
-    }
+            // 2. Patch the poles list cache so the list screen shows the new name without a sync
+            if (node_id) {
+              const polesCacheKey = `poles_node_${node_id}`;
+              const cachedPoles = await cacheGet<any[]>(polesCacheKey).catch(() => null);
+              if (cachedPoles) {
+                const updated = cachedPoles.map((p) =>
+                  String(p.id) === String(pole_id) ? { ...p, pole_name: trimmed } : p,
+                );
+                await cacheSet(polesCacheKey, updated).catch(() => {});
+              }
+            }
 
-    setSavingName(false);
-    setEditNameModalOpen(false);
+            // 3. Try to save to backend immediately using valid API prefix and database column mapping; queue with priority if offline
+            try {
+              await api.put(`/skycable/poles/${pole_id}`, { pole_code: trimmed });
+            } catch (e: any) {
+              const status = e?.response?.status;
+              if (!status) {
+                // Network error — queue for later with high priority (unshift to top)
+                await simpleQueuePush({
+                  method: "put",
+                  url: `/skycable/poles/${pole_id}`,
+                  body: { pole_code: trimmed },
+                }, true).catch(() => {});
+              }
+            }
+
+            setSavingName(false);
+            setEditNameModalOpen(false);
+          },
+        },
+      ],
+    );
   }
 
   function goToDestination(span: Span) {
@@ -1347,8 +1475,90 @@ export default function PoleDetailScreen() {
     });
   }
 
+  async function handleStartPole() {
+    if (!pole_id || !node_id || startingPole) return;
+    setStartingPole(true);
+    const now = getPHTNow();
+    const startNumeric = Date.now();
+
+    // 1. Instantly write to local UI state and storage cache to unlock task operations offline
+    await cacheSet(teardownStartedKey, { startedAt: now, startMs: startNumeric }).catch(() => {});
+    setPoleStartedAt(now);
+    timerStartRef.current = startNumeric;
+    setTeardownStarted(true);
+
+    // 2. Transmit sync patch payload live; defer to offline queue adapter if network unreachable
+    try {
+      await api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
+        pole_id: Number(pole_id),
+        date_start: now,
+        status: "in_progress",
+      });
+    } catch (err: any) {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "patch",
+          url: `/skycable/nodes/${node_id}/poles/sync`,
+          body: {
+            pole_id: Number(pole_id),
+            date_start: now,
+            status: "in_progress",
+          },
+        }).catch(() => {});
+      }
+    }
+    setStartingPole(false);
+  }
+
   function handleNext() {
     if (!canSelectPair) return;
+
+    // Trigger completion of this pole teardown session offline-first
+    if (!poleFinishedAt) {
+      const nowFinished = getPHTNow();
+      setPoleFinishedAt(nowFinished);
+      cacheSet(`teardown_finished_${pole_id}`, nowFinished).catch(() => {});
+
+      // Synchronize finished status to backend server; queue if offline
+      api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
+        pole_id: Number(pole_id),
+        cleared_at: nowFinished,
+        status: "completed",
+      }).catch((err: any) => {
+        if (!err?.response?.status) {
+          simpleQueuePush({
+            method: "patch",
+            url: `/skycable/nodes/${node_id}/poles/sync`,
+            body: {
+              pole_id: Number(pole_id),
+              cleared_at: nowFinished,
+              status: "completed",
+            },
+          }).catch(() => {});
+        }
+      });
+
+      // Append completed audit trail log
+      api.post("/skycable/pole-teardown-logs", {
+        pole_id: Number(pole_id),
+        node_id: Number(node_id),
+        finished_at: nowFinished,
+        status: "completed",
+      }).catch((err: any) => {
+        if (!err?.response?.status) {
+          simpleQueuePush({
+            method: "post",
+            url: "/skycable/pole-teardown-logs",
+            body: {
+              pole_id: Number(pole_id),
+              node_id: Number(node_id),
+              finished_at: nowFinished,
+              status: "completed",
+            },
+          }).catch(() => {});
+        }
+      });
+    }
 
     if (spans.length === 1) {
       goToDestination(spans[0]);
@@ -1412,11 +1622,6 @@ export default function PoleDetailScreen() {
     );
   }
 
-  function updateSlot(tempId: string, patch: Partial<PoleSlot>) {
-    setPoleSlots((prev) =>
-      prev.map((s) => s.tempId === tempId ? { ...s, ...patch } : s),
-    );
-  }
 
   function addCable(slotTempId: string) {
     setPoleSlots((prev) =>
@@ -1579,10 +1784,9 @@ export default function PoleDetailScreen() {
       <SafeAreaView style={styles.root} edges={["top"]}>
         <View style={styles.floatingHeader}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
-            <ChevronLeft size={22} color="#111827" />
+            <ChevronLeft size={22} color="#0F172A" />
           </TouchableOpacity>
           <View style={styles.floatingHeaderText}>
-            <Text style={styles.headerTitle}>{editedPoleName || pole_name || "Pole Detail"}</Text>
             <Text style={styles.headerSub}>{node_name || "Skycable Teardown"}</Text>
           </View>
           {draftSaved && (
@@ -1599,73 +1803,145 @@ export default function PoleDetailScreen() {
 
 
           <View style={styles.heroCard}>
-            <View style={[styles.heroBg, { backgroundColor: accentColor }]} />
-            <View style={styles.heroNoise} />
-            <View style={styles.heroGlow} />
+            {/* Soft internal accent background layers */}
+            <View style={[styles.heroBg, { backgroundColor: "#0F172A" }]} />
+            <View style={[styles.heroGlowLeft, { backgroundColor: accentColor }]} />
+            <View style={styles.heroGlowRight} />
+            <View style={styles.heroGlassOverlay} />
+
             <View style={styles.heroContent}>
-              <View style={styles.heroTopLine}>
-                <View style={styles.heroBadge}>
-                  <Text style={styles.heroBadgeText}>Pole Teardown</Text>
+              <View style={[styles.heroTopLine, { justifyContent: "space-between" }]}>
+                <View style={[styles.heroBadge, { backgroundColor: `${accentColor}25`, borderColor: `${accentColor}50`, maxWidth: "70%" }]}>
+                  <Text style={[styles.heroBadgeText, { color: "#A7F3D0" }]} numberOfLines={1}>
+                    📁  {(project_name || "Pole Teardown").toUpperCase()}
+                  </Text>
+                </View>
+                {teardownStarted ? (
+                  <View style={styles.heroTopTimerPill}>
+                    <Text style={styles.heroTopTimerIcon}>⏱</Text>
+                    <Text style={styles.heroTopTimerText}>
+                      {String(Math.floor(Math.max(0, elapsedSecs) / 60)).padStart(2, "0")}:{String(Math.max(0, elapsedSecs) % 60).padStart(2, "0")}
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
+
+              <View style={styles.heroMainBlock}>
+                <View style={styles.heroTitleRowWrapper}>
+                  <Text style={styles.heroTitle} numberOfLines={2}>
+                    {editedPoleName || "Pole"}
+                  </Text>
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={() => {
+                      setEditNameDraft(editedPoleName);
+                      setEditNameModalOpen(true);
+                    }}
+                    style={styles.heroEditPill}
+                  >
+                    <Text style={styles.heroEditPillIcon}>✎</Text>
+                    <Text style={styles.heroEditPillText}>EDIT</Text>
+                  </TouchableOpacity>
                 </View>
               </View>
 
-              <Pressable
-                onPress={() => {
-                  setEditNameDraft(editedPoleName);
-                  setEditNameModalOpen(true);
-                }}
-                style={styles.heroTitleRow}
-              >
-                <Text style={[styles.heroTitle, { marginTop: 0, flexShrink: 1 }]} numberOfLines={2}>
-                  {editedPoleName || "Pole"}
-                </Text>
-                <Text style={styles.heroEditIcon}>✎</Text>
-              </Pressable>
+              <View style={styles.heroIntegratedFooter}>
+                <View style={styles.heroSummaryTable}>
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>STARTED AT</Text>
+                    <Text style={styles.heroSummaryValue}>
+                      {(() => {
+                        if (!poleStartedAt) return "—";
+                        const d = new Date(poleStartedAt);
+                        const mo = String(d.getMonth() + 1).padStart(2, '0');
+                        const day = String(d.getDate()).padStart(2, '0');
+                        const yr = String(d.getFullYear()).slice(-2);
+                        let hr = d.getHours();
+                        const mn = String(d.getMinutes()).padStart(2, '0');
+                        const ampm = hr >= 12 ? 'PM' : 'AM';
+                        hr = hr % 12 || 12;
+                        return `${mo}/${day}/${yr} - ${hr}:${mn}${ampm}`;
+                      })()}
+                    </Text>
+                  </View>
+                  <View style={styles.heroSummaryDivider} />
+                  {/* FINISHED AT — timestamp when operator finalizes via Select Pair */}
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>FINISHED AT</Text>
+                    <Text style={styles.heroSummaryValue}>
+                      {(() => {
+                        if (poleFinishedAt) {
+                          const d = new Date(poleFinishedAt);
+                          const mo  = String(d.getMonth() + 1).padStart(2, '0');
+                          const day = String(d.getDate()).padStart(2, '0');
+                          const yr  = String(d.getFullYear()).slice(-2);
+                          let hr    = d.getHours();
+                          const mn  = String(d.getMinutes()).padStart(2, '0');
+                          const ap  = hr >= 12 ? 'PM' : 'AM';
+                          hr = hr % 12 || 12;
+                          return `${mo}/${day}/${yr} - ${hr}:${mn}${ap}`;
+                        }
+                        if (!teardownStarted) return "—";
+                        return "Waiting…";
+                      })()}
+                    </Text>
+                  </View>
+                  <View style={styles.heroSummaryDivider} />
 
-              <Text style={styles.heroMeta} numberOfLines={1}>
-                {project_name || "—"} • ID {pole_id || "—"}
-              </Text>
-            </View>
-          </View>
+                  {/* DURATION — started_at → finished_at/now */}
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>DURATION</Text>
+                    <Text style={[styles.heroSummaryValue, { color: poleFinishedAt ? "#A7F3D0" : "#FBBF24" }]}>
+                      {(() => {
+                        if (!poleStartedAt) return "—";
+                        const endMs   = poleFinishedAt ? new Date(poleFinishedAt).getTime() : Date.now();
+                        const totalSecs = Math.max(0, Math.floor((endMs - new Date(poleStartedAt).getTime()) / 1000));
+                        const h = Math.floor(totalSecs / 3600);
+                        const m = Math.floor((totalSecs % 3600) / 60);
+                        const s = totalSecs % 60;
+                        if (h > 0) return `${h}h ${m}m`;
+                        if (m > 0) return `${m}m ${s}s`;
+                        return `${s}s`;
+                      })()}
+                    </Text>
+                  </View>
+                  <View style={styles.heroSummaryDivider} />
 
-          {draftRestored ? (
-            <View style={styles.draftBanner}>
-              <Text style={styles.draftBannerText}>
-                ↩  Draft restored from previous session
-              </Text>
-            </View>
-          ) : null}
+                  {/* STATUS */}
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>STATUS</Text>
+                    <Text style={[styles.heroSummaryValue, { color: !teardownStarted ? "#94A3B8" : canSelectPair ? "#A7F3D0" : "#FBBF24" }]}>
+                      {!teardownStarted ? "Pending" : canSelectPair ? "Ready" : "In Progress"}
+                    </Text>
+                  </View>
+                </View>
 
-          <View style={styles.progressCard}>
-            <View style={styles.progressTopRow}>
-              <Text style={styles.progressTitle}>Completion Tracker</Text>
-              <View style={styles.timerBadge}>
-                <Text style={styles.timerText}>
-                  ⏱ {String(Math.floor(elapsedSecs / 60)).padStart(2, "0")}:
-                  {String(elapsedSecs % 60).padStart(2, "0")}
-                </Text>
+                <View style={styles.heroFooterHeaderRow}>
+                  <Text style={styles.heroFooterTitle}>PROGRESS</Text>
+                  <Text style={[styles.heroFooterPercentText, { color: accentColor }]}>
+                    {progress.percent}%
+                  </Text>
+                </View>
+
+                <View style={styles.heroTrackerNodesRow}>
+                  <TrackerMini done={hasGps} label="GPS" />
+                  <TrackerMini done={!!photoBefore} label="Before" />
+                  <TrackerMini done={!!photoAfter} label="After" />
+                  <TrackerMini done={!!photoTag} label="Tag" />
+                  {!isPoleReport && <TrackerMini done={!!slot} label="Slot" />}
+                </View>
+
+                <View style={{ marginTop: 4 }}>
+                  <ProgressWaveBar
+                    progress={progress.percent}
+                    accentColor={accentColor}
+                  />
+                </View>
               </View>
-              <Text style={[styles.progressPercent, { color: accentColor }]}>
-                {progress.percent}%
-              </Text>
             </View>
-
-            <View style={styles.trackerRow}>
-              <TrackerMini done={hasGps} label="GPS" />
-              <TrackerMini done={!!photoBefore} label="Before" />
-              <TrackerMini done={!!photoAfter} label="After" />
-              <TrackerMini done={!!photoTag} label="Tag" />
-              {!isPoleReport && <TrackerMini done={!!slot} label="Slot" />}
-            </View>
-
-            <ProgressWaveBar
-              progress={progress.percent}
-              accentColor={accentColor}
-            />
           </View>
 
-          <View style={[styles.sectionCard, !teardownStarted && styles.lockedSection]}>
-            {!teardownStarted && <View style={StyleSheet.absoluteFillObject} pointerEvents="box-only" />}
+          <View style={styles.sectionCard}>
             <SectionHeading
               title="GPS Location"
               right={
@@ -1739,7 +2015,7 @@ export default function PoleDetailScreen() {
             ) : (
               <View style={styles.noGpsPlaceholder}>
                 <Image
-                  source={require("../../assets/images/logo.png")}
+                  source={require("../../assets/images/telcovantage-logo.png")}
                   style={styles.noGpsLogo}
                   resizeMode="contain"
                 />
@@ -1795,9 +2071,16 @@ export default function PoleDetailScreen() {
                 </Text>
 
                 {gpsCapturedAt ? (
-                  <Text style={styles.gpsCapturedAt}>
-                    Captured at {new Date(gpsCapturedAt).toLocaleString()}
-                  </Text>
+                  <View>
+                    <Text style={styles.gpsCapturedAt}>
+                      Captured at {new Date(gpsCapturedAt).toLocaleString()}
+                    </Text>
+                    {liveCoords && lat !== null && lng !== null ? (
+                      <Text style={[styles.gpsCapturedAt, { color: accentColor, fontWeight: "800", marginTop: 2 }]}>
+                        🚶 Live Distance: {computeDistanceMeters(lat, lng, liveCoords.lat, liveCoords.lng)} meters away
+                      </Text>
+                    ) : null}
+                  </View>
                 ) : null}
 
               </View>
@@ -1831,7 +2114,13 @@ export default function PoleDetailScreen() {
                     slot === s && { backgroundColor: accentColor, borderColor: accentColor },
                     pressed && styles.pressedDown,
                   ]}
-                  onPress={() => setSlot(s)}
+                  onPress={() => {
+                    if (!teardownStarted) {
+                      setGateAlertModal({ title: "Teardown Not Started", message: "Please tap 'Start Pole Teardown' below to start recording site progress." });
+                      return;
+                    }
+                    setSlot(s);
+                  }}
                 >
                   <Text style={[styles.slotText, slot === s && { color: "#FFFFFF" }]}>{s}</Text>
                 </Pressable>
@@ -1851,44 +2140,67 @@ export default function PoleDetailScreen() {
                 </View>
               }
             />
-            <TextInput
-              style={styles.textArea}
-              placeholder="e.g. Near Jollibee corner, 3rd pole from left..."
-              placeholderTextColor="#9CA3AF"
-              value={landmark}
-              onChangeText={setLandmark}
-              multiline
-              numberOfLines={3}
-            />
+            {teardownStarted ? (
+              <TextInput
+                style={styles.textArea}
+                placeholder="e.g. Near Jollibee corner, 3rd pole from left..."
+                placeholderTextColor="#9CA3AF"
+                value={landmark}
+                onChangeText={setLandmark}
+                multiline
+                numberOfLines={3}
+              />
+            ) : (
+              <Pressable
+                onPress={() => {
+                  setGateAlertModal({
+                    title: "Teardown Not Started",
+                    message: "Please tap 'Start Pole Teardown' below to start recording site progress.",
+                  });
+                }}
+              >
+                <View pointerEvents="none">
+                  <TextInput
+                    style={[styles.textArea, { opacity: 0.6 }]}
+                    placeholder="e.g. Near Jollibee corner, 3rd pole from left..."
+                    placeholderTextColor="#9CA3AF"
+                    value={landmark}
+                    editable={false}
+                    multiline
+                    numberOfLines={3}
+                  />
+                </View>
+              </Pressable>
+            )}
           </View>
 
           {/* Photo capture */}
           <View style={styles.sectionCard}>
             <SectionHeading
               title="Pole Photos"
-              subtitle={infoComplete ? "Tap a photo to view or capture" : isPoleReport ? "Capture GPS first" : "Fill GPS & Slot first"}
+              subtitle={!teardownStarted ? "Start teardown first" : infoComplete ? "Tap a photo to view or capture" : isPoleReport ? "Capture GPS first" : "Fill GPS & Slot first"}
             />
             <View style={styles.photoTileRow}>
               <PhotoTile
                 label="Before"
                 photo={photoBefore}
                 accentColor={accentColor}
-                onCapture={() => { if (infoComplete) { setActiveCameraTab("before"); setShowCameraModal(true); } }}
-                onView={() => openViewer("Before", photoBefore, () => { setActiveCameraTab("before"); setShowCameraModal(true); })}
+                onCapture={() => handleOpenCapture("before")}
+                onView={() => openViewer("Before", photoBefore, () => handleOpenCapture("before"))}
               />
               <PhotoTile
                 label="After"
                 photo={photoAfter}
                 accentColor={accentColor}
-                onCapture={() => { if (infoComplete) { setActiveCameraTab("after"); setShowCameraModal(true); } }}
-                onView={() => openViewer("After", photoAfter, () => { setActiveCameraTab("after"); setShowCameraModal(true); })}
+                onCapture={() => handleOpenCapture("after")}
+                onView={() => openViewer("After", photoAfter, () => handleOpenCapture("after"))}
               />
               <PhotoTile
                 label="Tag"
                 photo={photoTag}
                 accentColor={accentColor}
-                onCapture={() => { if (infoComplete) { setActiveCameraTab("tag"); setShowCameraModal(true); } }}
-                onView={() => openViewer("Tag", photoTag, () => { setActiveCameraTab("tag"); setShowCameraModal(true); })}
+                onCapture={() => handleOpenCapture("tag")}
+                onView={() => openViewer("Tag", photoTag, () => handleOpenCapture("tag"))}
               />
             </View>
             <Pressable
@@ -1897,11 +2209,10 @@ export default function PoleDetailScreen() {
                 { backgroundColor: infoComplete ? accentColor : "#C9CED6" },
                 pressed && infoComplete && styles.pressedDown,
               ]}
-              onPress={infoComplete ? () => { setActiveCameraTab("before"); setShowCameraModal(true); } : undefined}
-              disabled={!infoComplete}
+              onPress={() => handleOpenCapture("before")}
             >
               <Text style={styles.capturePhotosBtnText}>
-                {infoComplete ? "📷  Capture Photos" : isPoleReport ? "Capture GPS first" : "Complete GPS & Slot first"}
+                {!teardownStarted ? "Start teardown first" : infoComplete ? "📷  Capture Photos" : isPoleReport ? "Capture GPS first" : "Complete GPS & Slot first"}
               </Text>
             </Pressable>
           </View>
@@ -2221,6 +2532,23 @@ export default function PoleDetailScreen() {
                     : "GPS + Before + Tag required"}
               </Text>
             </Pressable>
+          ) : !teardownStarted ? (
+            <Pressable
+              style={({ pressed }) => [
+                styles.submitBtn,
+                { backgroundColor: startingPole ? "#6B7280" : accentColor },
+                pressed && !startingPole && styles.pressedDown,
+              ]}
+              onPress={handleStartPole}
+              disabled={startingPole}
+            >
+              {startingPole
+                ? <ActivityIndicator size="small" color="#FFFFFF" style={{ marginRight: 8 }} />
+                : <Text style={[styles.submitText, { marginRight: 6 }]}>▶</Text>}
+              <Text style={styles.submitText}>
+                {startingPole ? "Starting…" : "Start Pole Teardown"}
+              </Text>
+            </Pressable>
           ) : (
             <Pressable
               style={({ pressed }) => [
@@ -2306,42 +2634,6 @@ export default function PoleDetailScreen() {
           </View>
         </Modal>
 
-        {/* Quality Alert Modal */}
-        <Modal
-          visible={qualityAlertOpen}
-          transparent
-          animationType="fade"
-          onRequestClose={() => {}}
-        >
-          <View style={styles.modalBackdrop}>
-            <View style={styles.qualityAlertCard}>
-              <View style={styles.qualityAlertIconWrap}>
-                <Text style={styles.qualityAlertIcon}>⚠️</Text>
-              </View>
-              <Text style={styles.qualityAlertTitle}>Blurry Photo Detected</Text>
-              <Text style={styles.qualityAlertBody}>
-                This photo appears to be{" "}
-                <Text style={styles.qualityAlertBold}>too blurry</Text>.
-                {"\n"}Please retake for a clearer image of the pole tag.
-              </Text>
-              <View style={styles.qualityAlertActions}>
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.qualityRetakeBtn,
-                    { backgroundColor: accentColor },
-                    pressed && styles.pressedDown,
-                  ]}
-                  onPress={() => {
-                    setQualityAlertOpen(false);
-                    qualityRetakeFn?.();
-                  }}
-                >
-                  <Text style={styles.qualityRetakeBtnText}>Retake Photo</Text>
-                </Pressable>
-              </View>
-            </View>
-          </View>
-        </Modal>
 
         {/* ── Edit Pole Name Modal ── */}
         <Modal
@@ -2468,6 +2760,7 @@ export default function PoleDetailScreen() {
           visible={showCameraModal}
           animationType="slide"
           statusBarTranslucent
+          supportedOrientations={["portrait"]}
           onRequestClose={() => setShowCameraModal(false)}
         >
           <SafeAreaView style={styles.cameraModalRoot} edges={["top", "bottom"]}>
@@ -2515,20 +2808,22 @@ export default function PoleDetailScreen() {
                     : photoQuality >= 50 ? "#f97316"
                     : "#ef4444";
                   return (
-                    <Pressable style={StyleSheet.absoluteFillObject} onPress={clearPhoto}>
-                      <ExpoImage source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="cover" />
-                      <View style={styles.cameraRetakeBadge}>
-                        <Text style={styles.cameraRetakeText}>Tap to retake</Text>
-                      </View>
-                      <View style={styles.photoQualityBadgeWrap}>
-                        <View style={[styles.photoQualityBadge, { backgroundColor: badgeColor }]}>
-                          <Text style={styles.photoQualityBadgeLabel}>HD QUALITY</Text>
-                          <Text style={styles.photoQualityBadgePercent}>
-                            {photoQuality !== null ? `${photoQuality}%` : "—"}
-                          </Text>
+                    <View style={{ flex: 1, width: "100%", alignSelf: "stretch", backgroundColor: "#000" }}>
+                      <Pressable style={StyleSheet.absoluteFillObject} onPress={clearPhoto}>
+                        <ExpoImage source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="contain" />
+                        <View style={styles.cameraRetakeBadge}>
+                          <Text style={styles.cameraRetakeText}>Tap to retake</Text>
                         </View>
-                      </View>
-                    </Pressable>
+                        <View style={styles.photoQualityBadgeWrap}>
+                          <View style={[styles.photoQualityBadge, { backgroundColor: badgeColor }]}>
+                            <Text style={styles.photoQualityBadgeLabel}>HD QUALITY</Text>
+                            <Text style={styles.photoQualityBadgePercent}>
+                              {photoQuality !== null ? `${photoQuality}%` : "—"}
+                            </Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                    </View>
                   );
                 }
                 if (cameraPermission?.granted) {
@@ -2542,6 +2837,43 @@ export default function PoleDetailScreen() {
                           zoom={cameraZoom}
                           onCameraReady={() => setCameraReady(true)}
                         />
+                        {lat !== null && lng !== null && (
+                          <View
+                            style={{
+                              position: "absolute",
+                              top: 16,
+                              left: 16,
+                              right: 16,
+                              backgroundColor: "rgba(13, 17, 23, 0.85)",
+                              borderRadius: 12,
+                              paddingVertical: 10,
+                              paddingHorizontal: 14,
+                              flexDirection: "row",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              borderWidth: 1,
+                              borderColor: "rgba(255,255,255,0.15)"
+                            }}
+                          >
+                            <View style={{ flexDirection: "row", alignItems: "center" }}>
+                              <Text style={{ fontSize: 16, marginRight: 8 }}>📍</Text>
+                              <View>
+                                <Text style={{ color: "#FFF", fontSize: 12, fontWeight: "600" }}>Target Coordinates</Text>
+                                <Text style={{ color: "#9CA3AF", fontSize: 11 }}>{lat.toFixed(6)}, {lng.toFixed(6)}</Text>
+                              </View>
+                            </View>
+                            {liveCoords ? (
+                              <View style={{ alignItems: "flex-end" }}>
+                                <Text style={{ color: accentColor, fontSize: 13, fontWeight: "800" }}>
+                                  {computeDistanceMeters(lat, lng, liveCoords.lat, liveCoords.lng)}m Range
+                                </Text>
+                                <Text style={{ color: "#A7F3D0", fontSize: 9 }}>Verified</Text>
+                              </View>
+                            ) : (
+                              <Text style={{ color: accentColor, fontSize: 12, fontWeight: "600" }}>Active</Text>
+                            )}
+                          </View>
+                        )}
                         {blurWarning && (
                           <View style={styles.blurWarningOverlay}>
                             <Text style={styles.blurWarningIcon}>⚠️</Text>
@@ -2622,6 +2954,99 @@ export default function PoleDetailScreen() {
           </SafeAreaView>
         </Modal>
 
+        {/* ── GPS Confirm Replace Modal ── */}
+        <Modal
+          transparent
+          visible={gpsConfirmModal}
+          animationType="fade"
+          onRequestClose={() => setGpsConfirmModal(false)}
+        >
+          <View style={styles.prModalOverlay}>
+            <View style={styles.alertModalCard}>
+              <Text style={styles.alertModalTitle}>Replace GPS?</Text>
+              <Text style={styles.alertModalText}>
+                This pole already has coordinates:{"\n"}
+                {lat?.toFixed(6)}, {lng?.toFixed(6)}
+              </Text>
+              <Text style={[styles.alertModalText, { marginTop: 8, color: "#EF4444" }]}>
+                Retaking will replace the saved location.
+              </Text>
+
+              <View style={styles.alertModalBtnRow}>
+                <TouchableOpacity
+                  style={styles.alertModalBtnCancel}
+                  onPress={() => setGpsConfirmModal(false)}
+                >
+                  <Text style={styles.alertModalBtnCancelText}>CANCEL</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.alertModalBtnConfirm}
+                  onPress={() => {
+                    setGpsConfirmModal(false);
+                    confirmAndCaptureGps();
+                  }}
+                >
+                  <Text style={styles.alertModalBtnConfirmText}>RETAKE GPS</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ── GPS Success Modal ── */}
+        <Modal
+          transparent
+          visible={gpsSuccessModal}
+          animationType="fade"
+          onRequestClose={() => setGpsSuccessModal(false)}
+        >
+          <View style={styles.prModalOverlay}>
+            <View style={styles.alertModalCard}>
+              <View style={styles.alertModalSuccessIcon}>
+                <Text style={{ fontSize: 24, color: "#10b981", fontWeight: "900" }}>✓</Text>
+              </View>
+              <Text style={styles.alertModalTitle}>GPS Captured</Text>
+              <Text style={styles.alertModalText}>
+                Location successfully saved:{"\n"}
+                {lat?.toFixed(6)}, {lng?.toFixed(6)}
+              </Text>
+
+              <TouchableOpacity
+                style={styles.alertModalBtnFull}
+                onPress={() => setGpsSuccessModal(false)}
+              >
+                <Text style={styles.alertModalBtnFullText}>OK</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ── Custom Gate Intercept Alert Modal ── */}
+        <Modal
+          transparent
+          visible={!!gateAlertModal}
+          animationType="fade"
+          onRequestClose={() => setGateAlertModal(null)}
+        >
+          <View style={styles.prModalOverlay}>
+            <View style={styles.alertModalCard}>
+              <View style={[styles.alertModalSuccessIcon, { backgroundColor: "#FFFBEB", borderColor: "#FCD34D" }]}>
+                <Text style={{ fontSize: 22, color: "#F59E0B", fontWeight: "900" }}>⚠️</Text>
+              </View>
+              <Text style={styles.alertModalTitle}>{gateAlertModal?.title}</Text>
+              <Text style={styles.alertModalText}>{gateAlertModal?.message}</Text>
+
+              <TouchableOpacity
+                style={[styles.alertModalBtnFull, { backgroundColor: "#F59E0B" }]}
+                onPress={() => setGateAlertModal(null)}
+              >
+                <Text style={styles.alertModalBtnFullText}>GOT IT</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
       </SafeAreaView>
     </>
   );
@@ -2635,33 +3060,29 @@ const styles = StyleSheet.create({
   floatingHeader: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
+    justifyContent: "space-between",
+    paddingHorizontal: 24,
     paddingTop: 8,
-    paddingBottom: 12,
-    gap: 12,
-    backgroundColor: "#F4F6F8",
+    paddingBottom: 8,
+    backgroundColor: "transparent",
     zIndex: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: "#E7ECF2",
   },
   backBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#E7ECF2",
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: "#101828",
-    shadowOpacity: 0.05,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 3,
+    borderWidth: 1.2,
+    borderColor: "#E2E8F0",
   },
-  floatingHeaderText: { flex: 1 },
-  headerTitle: { fontSize: 18, fontWeight: "900", color: "#111827" },
-  headerSub: { marginTop: 1, fontSize: 11, color: "#667085", fontWeight: "600" },
+  floatingHeaderText: { 
+    alignItems: "flex-end",
+    maxWidth: "75%",
+  },
+  headerTitle: { fontSize: 18, fontWeight: "900", color: "#0F172A", textAlign: "right" },
+  headerSub: { marginTop: 1, fontSize: 12, color: "#334155", fontWeight: "800", textAlign: "right" },
 
   content: {
     paddingHorizontal: 16,
@@ -2699,84 +3120,207 @@ const styles = StyleSheet.create({
   },
 
   heroCard: {
-    borderRadius: 30,
+    borderRadius: 32,
     overflow: "hidden",
-    marginBottom: 14,
-    minHeight: 164,
-    backgroundColor: "#0B7A5A",
+    marginBottom: 16,
+    minHeight: 180,
+    backgroundColor: "#0F172A",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
     shadowColor: "#000",
-    shadowOpacity: 0.14,
-    shadowRadius: 18,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 7,
+    shadowOpacity: 0.25,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 12 },
+    elevation: 8,
   },
 
   heroBg: {
     ...StyleSheet.absoluteFillObject,
-    opacity: 1,
   },
 
-  heroNoise: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(255,255,255,0.03)",
-  },
-
-  heroGlow: {
+  heroGlowLeft: {
     position: "absolute",
-    right: -30,
-    top: -20,
-    width: 180,
-    height: 180,
-    borderRadius: 999,
-    backgroundColor: "rgba(255,255,255,0.08)",
+    left: -60,
+    top: -60,
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    opacity: 0.35,
+  },
+
+  heroGlowRight: {
+    position: "absolute",
+    right: -40,
+    bottom: -40,
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: "#3B82F6",
+    opacity: 0.2,
+  },
+
+  heroGlassOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
   },
 
   heroContent: {
-    paddingHorizontal: 18,
-    paddingVertical: 18,
+    paddingHorizontal: 22,
+    paddingTop: 22,
+    paddingBottom: 22,
     justifyContent: "space-between",
     flex: 1,
+    zIndex: 2,
   },
 
   heroTopLine: {
     flexDirection: "row",
-    justifyContent: "space-between",
+    justifyContent: "flex-start",
   },
 
   heroBadge: {
-    alignSelf: "flex-start",
-    backgroundColor: "rgba(255,255,255,0.16)",
+    flexDirection: "row",
+    alignItems: "center",
     paddingHorizontal: 12,
-    paddingVertical: 7,
+    paddingVertical: 6,
     borderRadius: 999,
+    borderWidth: 1,
   },
 
   heroBadgeText: {
-    color: "#FFFFFF",
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.6,
+  },
+
+  heroTopTimerPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(0,0,0,0.35)",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    gap: 4,
+  },
+
+  heroTopTimerIcon: {
+    fontSize: 10,
+  },
+
+  heroTopTimerText: {
     fontSize: 11,
     fontWeight: "800",
-    letterSpacing: 0.3,
+    color: "#F8FAFC",
+    fontVariant: ["tabular-nums"],
+  },
+
+  heroMainBlock: {
+    marginTop: 16,
+    marginBottom: 12,
+  },
+
+  heroTitleRowWrapper: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
   },
 
   heroTitle: {
-    marginTop: 18,
-    fontSize: 28,
+    flex: 1,
+    fontSize: 30,
     fontWeight: "900",
     color: "#FFFFFF",
-    letterSpacing: -0.6,
+    letterSpacing: -0.8,
+    lineHeight: 36,
   },
 
-  heroTitleRow: {
+  heroEditPill: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    marginTop: 18,
+    backgroundColor: "rgba(255,255,255,0.1)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+    gap: 4,
   },
 
-  heroEditIcon: {
-    fontSize: 15,
-    color: "rgba(255,255,255,0.45)",
-    marginTop: 4,
+  heroEditPillIcon: {
+    fontSize: 12,
+    color: "#94A3B8",
+  },
+
+  heroEditPillText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#E2E8F0",
+  },
+
+  heroIntegratedFooter: {
+    marginTop: 18,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255,255,255,0.08)",
+  },
+  heroSummaryTable: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(0,0,0,0.25)",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.05)",
+  },
+  heroSummaryCol: {
+    flex: 1,
+    alignItems: "center",
+  },
+  heroSummaryDivider: {
+    width: 1,
+    height: 24,
+    backgroundColor: "rgba(255,255,255,0.1)",
+  },
+  heroSummaryLabel: {
+    fontSize: 9,
+    fontWeight: "800",
+    color: "#64748B",
+    marginBottom: 2,
+    letterSpacing: 0.5,
+  },
+  heroSummaryValue: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#E2E8F0",
+    textAlign: "center",
+  },
+  heroFooterHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  heroFooterTitle: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: "#94A3B8",
+    letterSpacing: 0.8,
+  },
+  heroFooterPercentText: {
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  heroTrackerNodesRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 6,
+    marginBottom: 8,
   },
 
   editNameCard: {
@@ -2867,6 +3411,32 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
 
+  poleStartStrip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#ECFDF5",
+    borderWidth: 1,
+    borderColor: "#A7F3D0",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    marginBottom: 10,
+  },
+  poleStartLabel: {
+    fontSize: 9,
+    fontWeight: "900",
+    color: "#059669",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+  },
+  poleStartValue: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#065F46",
+    flex: 1,
+  },
+
   progressTopRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -2904,7 +3474,9 @@ const styles = StyleSheet.create({
     width: 26,
     height: 26,
     borderRadius: 13,
-    backgroundColor: "#F3F4F6",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.1)",
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 5,
@@ -2912,12 +3484,13 @@ const styles = StyleSheet.create({
 
   trackerMiniDotDone: {
     backgroundColor: "#DCFCE7",
+    borderColor: "#DCFCE7",
   },
 
   trackerMiniDotText: {
     fontSize: 12,
     fontWeight: "900",
-    color: "#64748B",
+    color: "#94A3B8",
   },
 
   trackerMiniDotTextDone: {
@@ -2927,11 +3500,11 @@ const styles = StyleSheet.create({
   trackerMiniLabel: {
     fontSize: 10,
     fontWeight: "700",
-    color: "#6B7280",
+    color: "#94A3B8",
   },
 
   trackerMiniLabelDone: {
-    color: "#166534",
+    color: "#A7F3D0",
   },
 
   progressBarTrack: {
@@ -2969,6 +3542,9 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 5 },
     elevation: 2,
+  },
+  lockedSection: {
+    opacity: 0.6,
   },
 
   sectionHeader: {
@@ -3309,23 +3885,23 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 1.5,
-    borderStyle: "dashed",
-    borderColor: "#D1D5DB",
     margin: 6,
-    borderRadius: 10,
+    backgroundColor: "transparent",
   },
 
-  photoTilePlaceholderIcon: {
-    fontSize: 22,
-    marginBottom: 4,
+  photoTilePlaceholderLogo: {
+    width: "75%",
+    height: "75%",
+    opacity: 1,
   },
 
   photoTilePlaceholderText: {
-    fontSize: 10,
-    fontWeight: "700",
-    color: "#9CA3AF",
-    letterSpacing: 0.5,
+    position: "absolute",
+    bottom: 8,
+    fontSize: 9,
+    fontWeight: "800",
+    color: "#94A3B8",
+    letterSpacing: 0.2,
   },
 
   photoTileLabel: {
@@ -3580,25 +4156,21 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: "#FFFFFF",
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 28,
-    shadowColor: "#000",
-    shadowOpacity: 0.05,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: -3 },
-    elevation: 10,
+    backgroundColor: "transparent",
+    paddingHorizontal: 24,
+    paddingBottom: 24,
     gap: 8,
   },
 
   submitBtn: {
-    borderRadius: 20,
-    paddingVertical: 18,
+    flexDirection: "row",
+    justifyContent: "center",
     alignItems: "center",
+    borderRadius: 16,
+    paddingVertical: 14,
     shadowColor: "#000",
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
+    shadowOpacity: 0.12,
+    shadowRadius: 10,
     shadowOffset: { width: 0, height: 4 },
     elevation: 4,
   },
@@ -4463,4 +5035,86 @@ const styles = StyleSheet.create({
     color: "#065F46",
   },
 
+  // ── Custom Popup Alerts ──────────────────────────────────────────────────
+  alertModalCard: {
+    width: "100%",
+    maxWidth: 320,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    padding: 24,
+    alignItems: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.08,
+    shadowRadius: 20,
+    elevation: 5,
+  },
+  alertModalSuccessIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: "#ECFDF5",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 16,
+    borderWidth: 2,
+    borderColor: "#A7F3D0",
+  },
+  alertModalTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: "#0F172A",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  alertModalText: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: "#64748B",
+    textAlign: "center",
+    lineHeight: 20,
+  },
+  alertModalBtnRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 24,
+    width: "100%",
+  },
+  alertModalBtnCancel: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: "#F1F5F9",
+    alignItems: "center",
+  },
+  alertModalBtnCancelText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#64748B",
+  },
+  alertModalBtnConfirm: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: "#EF4444",
+    alignItems: "center",
+  },
+  alertModalBtnConfirmText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
+  alertModalBtnFull: {
+    marginTop: 24,
+    width: "100%",
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: "#0B7A5A",
+    alignItems: "center",
+  },
+  alertModalBtnFullText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
 });

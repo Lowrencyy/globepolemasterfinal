@@ -10,7 +10,7 @@ const MAX_RETRIES = 5;
 
 export type SimpleQueueEntry = {
   id: string;
-  method: "put" | "post";
+  method: "put" | "post" | "patch";
   url: string;
   body: Record<string, any>;
   retryCount: number;
@@ -32,16 +32,22 @@ async function writeQueue(entries: SimpleQueueEntry[]): Promise<void> {
 
 export async function simpleQueuePush(
   entry: Omit<SimpleQueueEntry, "id" | "retryCount" | "queuedAt">,
+  priority?: boolean,
 ): Promise<void> {
   const entries = await readQueue();
   // Replace existing entry for the same URL — no point stacking identical edits
   const filtered = entries.filter(e => e.url !== entry.url);
-  filtered.push({
+  const newEntry: SimpleQueueEntry = {
     ...entry,
     id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
     retryCount: 0,
     queuedAt: new Date().toISOString(),
-  });
+  };
+  if (priority) {
+    filtered.unshift(newEntry);
+  } else {
+    filtered.push(newEntry);
+  }
   await writeQueue(filtered);
 }
 
@@ -67,6 +73,8 @@ export async function processSimpleQueue(): Promise<void> {
     try {
       if (entry.method === "put") {
         await api.put(entry.url, entry.body);
+      } else if (entry.method === "patch") {
+        await api.patch(entry.url, entry.body);
       } else {
         await api.post(entry.url, entry.body);
       }

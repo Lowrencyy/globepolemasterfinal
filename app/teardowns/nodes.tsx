@@ -2,9 +2,10 @@ import { useAuth } from "@/context/auth-context";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getNodes, SkycableNode, SkycablePole } from "@/services/skycable";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import { ChevronLeft, Layers, Search, X } from "lucide-react-native";
-import { useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, FlatList, Image, LayoutChangeEvent, SafeAreaView, StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
+import { CalendarCheck2, CalendarClock, ChevronLeft, Layers, Search, X } from "lucide-react-native";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ActivityIndicator, Animated, FlatList, Image, LayoutChangeEvent, StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 const TILE_PX = 256;
 function latLngToTileFrac(lat: number, lng: number, z: number) {
@@ -74,30 +75,52 @@ function PolesVicinityMap({ locs }: { locs: { lat: number; lng: number }[] }) {
 }
 
 const SC: Record<string, { label: string; color: string; bg: string }> = {
-  pending: { label: "Pending", color: "#F59E0B", bg: "#FEF3C7" },
+  pending:     { label: "Pending",     color: "#F59E0B", bg: "#FEF3C7" },
   in_progress: { label: "In Progress", color: "#3B82F6", bg: "#DBEAFE" },
-  completed: { label: "Completed", color: "#10B981", bg: "#DCFCE7" },
+  completed:   { label: "Completed",   color: "#10B981", bg: "#DCFCE7" },
 };
 
-function NodeCard({ node, index, onPress }: { node: SkycableNode; index: number; onPress: () => void }) {
-  const [poleLocs, setPoleLocs] = useState<{ lat: number; lng: number }[]>([]);
+function fmtDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const pht = new Date(d.getTime() + 8 * 3600 * 1000);
+  const mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][pht.getUTCMonth()];
+  return `${mon} ${pht.getUTCDate()}, ${pht.getUTCFullYear()}`;
+}
+
+function NodeProgressBar({ pct, color = "#3B82F6" }: { pct: number; color?: string }) {
+  const anim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(anim, { toValue: pct / 100, duration: 600, useNativeDriver: false }).start();
+  }, [pct]);
+  return (
+    <View style={{ flexDirection: "row", height: 6, borderRadius: 999, backgroundColor: "#E2E8F0", overflow: "hidden" }}>
+      <Animated.View style={{ flex: anim, backgroundColor: color, borderRadius: 999 }} />
+      <Animated.View style={{ flex: Animated.subtract(1, anim) as any }} />
+    </View>
+  );
+}
+
+function NodeCard({ node, onPress }: { node: SkycableNode; onPress: () => void }) {
+  const [poleLocs, setPoleLocs]         = useState<{ lat: number; lng: number }[]>([]);
   const [cachedPolesCount, setCachedPolesCount] = useState<number | null>(null);
-  const [derivedStatus, setDerivedStatus] = useState<string>(node.status);
+  const [completedCount, setCompletedCount]     = useState(0);
+  const [derivedStatus, setDerivedStatus]       = useState<string>(node.status);
 
   useEffect(() => {
     cacheGet<SkycablePole[]>(`sitemap_poles_${node.id}`).then(poles => {
       if (!poles?.length) return;
       setCachedPolesCount(poles.length);
+      const cleared = poles.filter(p => p.pole?.skycable_status === "cleared").length;
+      setCompletedCount(cleared);
       const locs = poles
         .filter(p => p.pole?.lat && p.pole?.lng)
         .map(p => ({ lat: parseFloat(p.pole.lat), lng: parseFloat(p.pole.lng) }));
       setPoleLocs(locs);
-
-      // Derive status from actual pole statuses
       const statuses = poles.map(p => p.pole?.skycable_status ?? "pending");
       const allCleared = statuses.every(s => s === "cleared");
-      const anyActive = statuses.some(s => s === "in_progress" || s === "cleared");
-      if (allCleared) setDerivedStatus("completed");
+      const anyActive  = statuses.some(s => s === "in_progress" || s === "cleared");
+      if (allCleared)   setDerivedStatus("completed");
       else if (anyActive) setDerivedStatus("in_progress");
       else setDerivedStatus("pending");
     });
@@ -105,16 +128,18 @@ function NodeCard({ node, index, onPress }: { node: SkycableNode; index: number;
 
   const sc = SC[derivedStatus] || SC.pending;
   const hasMap = poleLocs.length > 0;
-  // Use cached count (full poles list) first, fall back to API-provided poles_count
   const polesCount = cachedPolesCount ?? node.poles_count ?? 0;
+  const progressPct = polesCount > 0 ? Math.round((completedCount / polesCount) * 100) : (node.progress_percentage ?? 0);
+  const isActive = !!node.date_start;
 
   return (
     <TouchableOpacity style={s.cardContainer} activeOpacity={0.8} onPress={onPress}>
+      {/* Map hero */}
       <View style={s.heroMapShell}>
         {hasMap ? (
           <PolesVicinityMap locs={poleLocs} />
         ) : (
-          <Image source={require("../../assets/images/logo.png")} style={s.noGpsLogo} resizeMode="contain" />
+          <Image source={require("../../assets/images/telcovantage-logo.png")} style={s.noGpsLogo} resizeMode="contain" />
         )}
         {hasMap && (
           <View style={s.mapAreaLabel}>
@@ -123,6 +148,7 @@ function NodeCard({ node, index, onPress }: { node: SkycableNode; index: number;
         )}
       </View>
 
+      {/* Name + status */}
       <View style={s.cardBody}>
         <View style={s.info}>
           <Text style={s.nodeName}>{node.name}</Text>
@@ -134,6 +160,45 @@ function NodeCard({ node, index, onPress }: { node: SkycableNode; index: number;
         </View>
       </View>
 
+      {/* Progress bar (only when active or completed) */}
+      {(isActive || derivedStatus === "completed") && (
+        <View style={s.progressWrap}>
+          <View style={s.progressLabelRow}>
+            <Text style={s.progressLabel}>{completedCount}/{polesCount} poles</Text>
+            <Text style={s.progressPct}>{progressPct}%</Text>
+          </View>
+          <NodeProgressBar
+            pct={progressPct}
+            color={derivedStatus === "completed" ? "#10B981" : "#3B82F6"}
+          />
+        </View>
+      )}
+
+      {/* Date chips */}
+      {(node.date_start || node.due_date) && (
+        <View style={s.datePillsRow}>
+          {node.date_start && (
+            <View style={s.datePill}>
+              <CalendarCheck2 size={11} color="#1D4ED8" />
+              <Text style={s.datePillText}>Started {fmtDate(node.date_start)}</Text>
+            </View>
+          )}
+          {node.due_date && (
+            <View style={[s.datePill, { backgroundColor: "#FFF7E8", borderColor: "#FED7AA" }]}>
+              <CalendarClock size={11} color="#B54708" />
+              <Text style={[s.datePillText, { color: "#92400E" }]}>Due {fmtDate(node.due_date)}</Text>
+            </View>
+          )}
+          {node.date_finished && (
+            <View style={[s.datePill, { backgroundColor: "#ECFDF5", borderColor: "#A7F3D0" }]}>
+              <CalendarCheck2 size={11} color="#059669" />
+              <Text style={[s.datePillText, { color: "#065F46" }]}>Done {fmtDate(node.date_finished)}</Text>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* Stats row */}
       <View style={s.statsRow}>
         <View style={s.statBox}>
           <Text style={s.statNum}>{polesCount}</Text>
@@ -148,8 +213,8 @@ function NodeCard({ node, index, onPress }: { node: SkycableNode; index: number;
         </View>
         <View style={s.statDivider} />
         <View style={s.statBox}>
-          <Text style={[s.statNum, { color: sc.color }]}>{sc.label}</Text>
-          <Text style={s.statLbl}>Status</Text>
+          <Text style={[s.statNum, { color: "#10B981" }]}>{completedCount}</Text>
+          <Text style={s.statLbl}>Completed</Text>
         </View>
       </View>
     </TouchableOpacity>
@@ -239,11 +304,10 @@ export default function NodesScreen() {
             contentContainerStyle={s.list}
             showsVerticalScrollIndicator={false}
             ListEmptyComponent={<View style={s.empty}><Layers size={40} color="#D0D5DD" /><Text style={s.emptyTitle}>No nodes found</Text></View>}
-            renderItem={({ item: node, index }) => (
+            renderItem={({ item: node }) => (
               <NodeCard
                 key={node.id}
                 node={node}
-                index={index}
                 onPress={() => router.push({ pathname: "/teardowns/poles", params: { nodeId: node.id, nodeName: node.name, nodeTeamId: node.team_id ?? node.team?.id ?? "" } })}
               />
             )}
@@ -291,4 +355,17 @@ const s = StyleSheet.create({
   statNum: { fontSize: 15, fontWeight: "900", color: "#111827" },
   statLbl: { fontSize: 9, fontWeight: "800", color: "#98A2B3", textTransform: "uppercase", letterSpacing: 0.5, marginTop: 3 },
   statDivider: { width: 1, height: 28, backgroundColor: "#E7ECF2" },
+
+  progressWrap: { marginBottom: 10, gap: 5 },
+  progressLabelRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  progressLabel: { fontSize: 11, fontWeight: "700", color: "#64748B" },
+  progressPct:   { fontSize: 12, fontWeight: "900", color: "#374151" },
+
+  datePillsRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginBottom: 10 },
+  datePill: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+    backgroundColor: "#EFF6FF", borderWidth: 1, borderColor: "#BFDBFE",
+    paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999,
+  },
+  datePillText: { fontSize: 11, fontWeight: "700", color: "#1E3A8A" },
 });

@@ -3,7 +3,7 @@ import { cacheGet, cacheSet } from "@/lib/cache";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -40,7 +40,7 @@ type Span = {
   status: string;
   from_pole: SpanPoleRef;
   to_pole: SpanPoleRef;
-  components?: Array<{ component_type: string; expected_count: number }>;
+  components?: { component_type: string; expected_count: number }[];
 };
 
 function sanitize(s?: string) {
@@ -464,7 +464,7 @@ export default function SelectPairScreen() {
       } as any);
     }, 2000);
     return () => clearTimeout(timer);
-  }, [allDone]);
+  }, [allDone, accent, node_id, pole_name]);
   const [selectedSpan, setSelectedSpan] = useState<Span | null>(null);
   const [showVicinityModal, setShowVicinityModal] = useState(false);
 
@@ -535,6 +535,52 @@ export default function SelectPairScreen() {
     })();
   }, [pole_code, node_id, project_name, pole_id]);
 
+  const getDisplayPole = useCallback((span: Span) => {
+    const isFromPole = String(span.from_pole?.pole?.id) === String(pole_id);
+    return isFromPole ? span.to_pole?.pole : span.from_pole?.pole;
+  }, [pole_id]);
+
+  const navigateToKabila = useCallback((span: Span) => {
+    const isFromPole = String(span.from_pole?.pole?.id) === String(pole_id);
+    const destPole = isFromPole ? span.to_pole : span.from_pole;
+
+    const actualFromCode = isFromPole ? pole_code : (span.to_pole?.pole?.pole_code ?? pole_code);
+    const actualFromName = isFromPole ? (pole_name ?? pole_code) : (span.to_pole?.pole?.pole_code ?? pole_code);
+    const actualToId = String(destPole?.pole?.id ?? "");
+    const actualToCode = destPole?.pole?.pole_code ?? "";
+    const actualToName = destPole?.pole?.pole_code ?? "";
+
+    router.replace({
+      pathname: "/teardowns/destination-pole" as any,
+      params: {
+        pole_code: actualFromCode,
+        pole_name: actualFromName,
+        node_id,
+        project_id,
+        project_name,
+        accent,
+        span_id: String(span.id),
+        span_code: span.span_code ?? "",
+        to_pole_id: actualToId,
+        to_pole_code: actualToCode,
+        to_pole_name: actualToName,
+        expected_cable: String(getExpected(span, "cable")),
+        length_meters: String(span.strand_length),
+        declared_runs: String(span.number_of_runs),
+        expected_node: String(getExpected(span, "node")),
+        expected_amplifier: String(getExpected(span, "amplifier")),
+        expected_extender: String(getExpected(span, "extender")),
+        expected_tsc: String(getExpected(span, "tsc")),
+        expected_powersupply: String(getExpected(span, "powersupply")),
+        expected_powersupply_housing: String(getExpected(span, "powersupply_case")),
+        from_pole_id: pole_id ?? "",
+        from_pole_latitude: from_pole_latitude ?? "",
+        from_pole_longitude: from_pole_longitude ?? "",
+        from_pole_gps_captured_at: from_pole_gps_captured_at ?? "",
+      },
+    });
+  }, [accent, from_pole_gps_captured_at, from_pole_latitude, from_pole_longitude, node_id, pole_code, pole_id, pole_name, project_id, project_name]);
+
   useEffect(() => {
     if (!pole_id || !node_id) return;
 
@@ -595,53 +641,8 @@ export default function SelectPairScreen() {
           }
         });
       });
-  }, [pole_id, node_id]);
+  }, [pole_id, node_id, navigateToKabila]);
 
-  function getDisplayPole(span: Span) {
-    const isFromPole = String(span.from_pole?.pole?.id) === String(pole_id);
-    return isFromPole ? span.to_pole?.pole : span.from_pole?.pole;
-  }
-
-  function navigateToKabila(span: Span) {
-    const isFromPole = String(span.from_pole?.pole?.id) === String(pole_id);
-    const destPole = isFromPole ? span.to_pole : span.from_pole;
-
-    const actualFromCode = isFromPole ? pole_code : (span.to_pole?.pole?.pole_code ?? pole_code);
-    const actualFromName = isFromPole ? (pole_name ?? pole_code) : (span.to_pole?.pole?.pole_code ?? pole_code);
-    const actualToId = String(destPole?.pole?.id ?? "");
-    const actualToCode = destPole?.pole?.pole_code ?? "";
-    const actualToName = destPole?.pole?.pole_code ?? "";
-
-    router.replace({
-      pathname: "/teardowns/destination-pole" as any,
-      params: {
-        pole_code: actualFromCode,
-        pole_name: actualFromName,
-        node_id,
-        project_id,
-        project_name,
-        accent,
-        span_id: String(span.id),
-        span_code: span.span_code ?? "",
-        to_pole_id: actualToId,
-        to_pole_code: actualToCode,
-        to_pole_name: actualToName,
-        expected_cable: String(getExpected(span, "cable")),
-        length_meters: String(span.strand_length),
-        declared_runs: String(span.number_of_runs),
-        expected_node: String(getExpected(span, "node")),
-        expected_amplifier: String(getExpected(span, "amplifier")),
-        expected_extender: String(getExpected(span, "extender")),
-        expected_tsc: String(getExpected(span, "tsc")),
-        expected_powersupply: String(getExpected(span, "powersupply")),
-        expected_powersupply_housing: String(getExpected(span, "powersupply_case")),
-        from_pole_id: pole_id ?? "",
-        from_pole_latitude: from_pole_latitude ?? "",
-        from_pole_longitude: from_pole_longitude ?? "",
-        from_pole_gps_captured_at: from_pole_gps_captured_at ?? "",
-      },
-    });
-  }
 
   function retryFetch() {
     if (!pole_id || !node_id) return;
@@ -764,7 +765,7 @@ export default function SelectPairScreen() {
   const selectedDisplayPole = useMemo(() => {
     if (!selectedSpan) return null;
     return getDisplayPole(selectedSpan);
-  }, [selectedSpan, pole_code]);
+  }, [selectedSpan, getDisplayPole]);
 
   const spanCoords = useMemo(() => {
     if (!selectedSpan) {
@@ -778,7 +779,7 @@ export default function SelectPairScreen() {
     }
 
     return getSpanCoords(selectedSpan, pole_id ?? "", from_pole_latitude, from_pole_longitude);
-  }, [selectedSpan, from_pole_latitude, from_pole_longitude]);
+  }, [selectedSpan, from_pole_latitude, from_pole_longitude, pole_id]);
 
   const mapHtml = useMemo(() => {
     if (

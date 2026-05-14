@@ -14,6 +14,7 @@ export type GlobeUser = {
   password_reset_required: boolean;
   team_id: number | null;
   subcontractor_id: number | null;
+  subcontractor_name?: string | null;
   last_login: string | null;
   is_online: boolean;
 };

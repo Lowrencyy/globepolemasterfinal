@@ -732,28 +732,40 @@ export default function PoleDetailScreen() {
   }, [poleSlots, pole_id]);
 
   useEffect(() => {
-    // Restore teardown started state
+    // Restore teardown started state.
+    // For pole_report: auto-start on first open (no gate needed — lineman
+    // just created this pole and navigated here to capture it immediately).
     cacheGet<{ startedAt: string; startMs?: number }>(teardownStartedKey).then(v => {
       if (v?.startedAt) {
         setTeardownStarted(true);
         setPoleStartedAt(v.startedAt);
         const baseMs = v.startMs || new Date(v.startedAt).getTime();
         timerStartRef.current = baseMs;
-        
-        // Also check if already finished
+
+        // Check if already finished
         cacheGet<string>(`teardown_finished_${pole_id}`).then(finishedTs => {
           if (finishedTs) {
             setPoleFinishedAt(finishedTs);
             const delta = Math.floor((new Date(finishedTs).getTime() - baseMs) / 1000);
             setElapsedSecs(Math.max(0, delta));
           } else {
-            const elapsed = Math.floor((Date.now() - baseMs) / 1000);
-            setElapsedSecs(Math.max(0, elapsed));
+            setElapsedSecs(Math.max(0, Math.floor((Date.now() - baseMs) / 1000)));
           }
         }).catch(() => {
-          const elapsed = Math.floor((Date.now() - baseMs) / 1000);
-          setElapsedSecs(Math.max(0, elapsed));
+          setElapsedSecs(Math.max(0, Math.floor((Date.now() - baseMs) / 1000)));
         });
+
+      } else if (isPoleReport) {
+        // Auto-start for pole_report — no gate needed, lineman just created this pole
+        const now = getPHTNow();
+        const nowMs = Date.now();
+        setTeardownStarted(true);
+        setPoleStartedAt(now);
+        timerStartRef.current = nowMs;
+        cacheSet(teardownStartedKey, { startedAt: now, startMs: nowMs }).catch(() => {});
+        if (node_id && pole_id) {
+          api.put(`/skycable/nodes/${node_id}/poles/${pole_id}`, { date_start: now }).catch(() => {});
+        }
       }
     }).catch(() => {});
 
@@ -1162,38 +1174,87 @@ export default function PoleDetailScreen() {
   }
 
   async function captureFromCamera() {
-    if (!cameraRef.current || !cameraReady) return;
+    if (!cameraRef.current || !cameraReady || photoCapturing) return;
+    if (isCapturingRef.current) return; // prevent rapid double-tap
+    isCapturingRef.current = true;
+    setPhotoCapturing(true);
+
+    // ── Distance check using already-warmed GPS (no blocking network call) ──
+    // The background watcher updates prewarmedGps every 2s — use it directly.
+    if (lat !== null && lng !== null && prewarmedGps.current) {
+      const live = prewarmedGps.current;
+      setLiveCoords({ lat: live.latitude, lng: live.longitude });
+      const dist = computeDistanceMeters(lat, lng, live.latitude, live.longitude);
+      if (dist > 50) {
+        setOutOfAreaAlert({ visible: true, distance: dist });
+        isCapturingRef.current = false;
+        setPhotoCapturing(false);
+        return;
+      }
+    }
+
     setBlurWarning(false);
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 1, skipProcessing: false });
-      if (!photo?.uri) return;
-      const capturedAt = getPHTNow();
-      const setter = activeCameraTab === "before" ? setPhotoBefore : activeCameraTab === "after" ? setPhotoAfter : setPhotoTag;
-      const qualitySetter = activeCameraTab === "before" ? setQualityBefore : activeCameraTab === "after" ? setQualityAfter : setQualityTag;
-      const file = activeCameraTab === "before" ? F.before : activeCameraTab === "after" ? F.after : F.tag;
+      // skipProcessing:true = instant capture; we compress + stamp ourselves below
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.92,
+        skipProcessing: true,
+        exif: false,
+      });
+      if (!photo?.uri) {
+        isCapturingRef.current = false;
+        setPhotoCapturing(false);
+        return;
+      }
+
+      const capturedAt   = getPHTNow();
+      const tab          = activeCameraTab;
+      const setter       = tab === "before" ? setPhotoBefore : tab === "after" ? setPhotoAfter : setPhotoTag;
+      const qualitySetter= tab === "before" ? setQualityBefore : tab === "after" ? setQualityAfter : setQualityTag;
+      const file         = tab === "before" ? F.before : tab === "after" ? F.after : F.tag;
+
+      // ── Show raw photo immediately so the user sees it right away ──
       setter(createPhotoField(photo.uri, file));
-      const saved = await savePhotoDraft(file, photo.uri, buildStampLines(activeCameraTab), lat, lng);
-      setter(saved);
-      cacheSet(`photo_captured_at_${pole_id}_${activeCameraTab}`, capturedAt).catch(() => {});
-      if (activeCameraTab === "after") {
-        setAfterCapturedAt(capturedAt);
-        // Sync cleared_at (finished_at) to skycable_poles — triggers duration + status=completed
-        api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
-          pole_id:    Number(pole_id),
-          cleared_at: capturedAt,
-          status:     "completed",
-        }).catch(() => {});
-      }
-      const variance = await checkPhotoQuality(saved.fileUri);
-      const pct = varianceToPercent(variance);
-      qualitySetter(pct);
-      const qualityKey = activeCameraTab === "before" ? `pole_quality_before_${pole_id}` : activeCameraTab === "after" ? `pole_quality_after_${pole_id}` : `pole_quality_tag_${pole_id}`;
-      cacheSet(qualityKey, pct).catch(() => {});
-      if (variance < 80) {
-        setBlurWarning(true);
-      }
+      // Release the capture lock now — user can interact again
+      setTimeout(() => { 
+        isCapturingRef.current = false; 
+        setPhotoCapturing(false);
+      }, 400);
+
+      // ── Stamp + save + quality check in background (non-blocking) ──
+      (async () => {
+        try {
+          const saved = await savePhotoDraft(file, photo.uri, buildStampLines(tab), lat, lng);
+          setter(saved);
+          cacheSet(`photo_captured_at_${pole_id}_${tab}`, capturedAt).catch(() => {});
+
+          if (tab === "after") {
+            setAfterCapturedAt(capturedAt);
+            api.put(`/skycable/nodes/${node_id}/poles/${pole_id}`, {
+              cleared_at: capturedAt,
+            }).catch(() => {});
+          }
+
+          const variance = await checkPhotoQuality(saved.fileUri);
+          const pct = varianceToPercent(variance);
+          qualitySetter(pct);
+          cacheSet(
+            tab === "before" ? `pole_quality_before_${pole_id}` :
+            tab === "after"  ? `pole_quality_after_${pole_id}`  :
+                               `pole_quality_tag_${pole_id}`,
+            pct,
+          ).catch(() => {});
+          if (variance < 80) setBlurWarning(true);
+        } catch {}
+      })();
+
     } catch (e: any) {
-      Alert.alert("Photo Error", e?.message ?? "Failed to capture photo.");
+      const msg = (e?.message ?? "").toLowerCase();
+      if (!msg.includes("not running") && !msg.includes("already")) {
+        Alert.alert("Photo Error", "Failed to capture image. Make sure the camera is ready and try again.");
+      }
+      isCapturingRef.current = false;
+      setPhotoCapturing(false);
     }
   }
 
@@ -1227,26 +1288,15 @@ export default function PoleDetailScreen() {
       return;
     }
 
+    // Refresh live distance asynchronously for UI overlay display without blocking preview access
     if (lat !== null && lng !== null) {
-      let live = prewarmedGps.current;
-      if (!live) {
-        try {
-          const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
-          live = pos.coords as any;
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
+        .then((pos) => {
+          const live = pos.coords as any;
           prewarmedGps.current = live;
           if (live) setLiveCoords({ lat: live.latitude, lng: live.longitude });
-        } catch {}
-      }
-      if (live) {
-        const dist = computeDistanceMeters(lat, lng, live.latitude, live.longitude);
-        if (dist > 50) {
-          setGateAlertModal({
-            title: "Too Far From Pole",
-            message: `You must be within 50 meters of the captured pole coordinates to take authentic site photos. Current distance: ${dist} meters.`,
-          });
-          return;
-        }
-      }
+        })
+        .catch(() => {});
     }
 
     setActiveCameraTab(tab);
@@ -1351,6 +1401,7 @@ export default function PoleDetailScreen() {
   const cameraRef = useRef<React.ComponentRef<typeof CameraView>>(null);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [cameraReady, setCameraReady] = useState(false);
+  const isCapturingRef = useRef(false);  // prevents concurrent takePictureAsync calls
   const [cameraZoom, setCameraZoom] = useState(0);
   const pinchBaseZoom = useRef(0);
   const pinchGesture = Gesture.Pinch()
@@ -1360,6 +1411,9 @@ export default function PoleDetailScreen() {
       setCameraZoom(Math.min(1, Math.max(0, pinchBaseZoom.current + (e.scale - 1) * 0.5)));
     });
   const [blurWarning, setBlurWarning] = useState(false);
+  const [photoCapturing, setPhotoCapturing] = useState(false);
+  const [outOfAreaAlert, setOutOfAreaAlert] = useState<{ visible: boolean; distance: number } | null>(null);
+
 
   const canSelectPair =
     (hasGps || poleLoading) &&
@@ -2233,47 +2287,59 @@ export default function PoleDetailScreen() {
                   }
                 />
 
-                {/* Condition */}
-                <Text style={styles.prFieldLabel}>Condition</Text>
-                <View style={styles.prChipRow}>
-                  {POLE_CONDITIONS.map((c) => (
+                <View style={{ flexDirection: "row", gap: 12 }}>
+                  {/* Condition */}
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.prFieldLabel}>Condition</Text>
                     <Pressable
-                      key={c}
-                      style={[styles.prChip, poleCondition === c && { backgroundColor: accentColor, borderColor: accentColor }]}
-                      onPress={() => setPoleCondition(c)}
+                      style={styles.prDropdownSelectBtn}
+                      onPress={() => setPickerModal({
+                        options: POLE_CONDITIONS,
+                        current: poleCondition,
+                        onSelect: setPoleCondition,
+                      })}
                     >
-                      <Text style={[styles.prChipText, poleCondition === c && { color: "#fff" }]}>{c}</Text>
+                      <Text numberOfLines={1} style={[styles.prDropdownSelectText, !poleCondition && styles.prDropdownPlaceholder]}>
+                        {poleCondition ? poleCondition : "Condition..."}
+                      </Text>
+                      <Text style={styles.prDropdownSelectIcon}>▼</Text>
                     </Pressable>
-                  ))}
-                </View>
+                  </View>
 
-                {/* Material */}
-                <Text style={styles.prFieldLabel}>Material</Text>
-                <View style={styles.prChipRow}>
-                  {POLE_MATERIALS.map((m) => (
+                  {/* Material */}
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.prFieldLabel}>Material</Text>
                     <Pressable
-                      key={m}
-                      style={[styles.prChip, poleMaterial === m && { backgroundColor: accentColor, borderColor: accentColor }]}
-                      onPress={() => setPoleMaterial(m)}
+                      style={styles.prDropdownSelectBtn}
+                      onPress={() => setPickerModal({
+                        options: POLE_MATERIALS,
+                        current: poleMaterial,
+                        onSelect: setPoleMaterial,
+                      })}
                     >
-                      <Text style={[styles.prChipText, poleMaterial === m && { color: "#fff" }]}>{m}</Text>
+                      <Text numberOfLines={1} style={[styles.prDropdownSelectText, !poleMaterial && styles.prDropdownPlaceholder]}>
+                        {poleMaterial ? poleMaterial : "Material..."}
+                      </Text>
+                      <Text style={styles.prDropdownSelectIcon}>▼</Text>
                     </Pressable>
-                  ))}
+                  </View>
                 </View>
 
                 {/* Height */}
                 <Text style={styles.prFieldLabel}>Height</Text>
-                <View style={styles.prChipRow}>
-                  {POLE_HEIGHTS.map((h) => (
-                    <Pressable
-                      key={h}
-                      style={[styles.prChip, poleHeight === h && { backgroundColor: accentColor, borderColor: accentColor }]}
-                      onPress={() => setPoleHeight(h)}
-                    >
-                      <Text style={[styles.prChipText, poleHeight === h && { color: "#fff" }]}>{h}</Text>
-                    </Pressable>
-                  ))}
-                </View>
+                <Pressable
+                  style={styles.prDropdownSelectBtn}
+                  onPress={() => setPickerModal({
+                    options: POLE_HEIGHTS,
+                    current: poleHeight,
+                    onSelect: setPoleHeight,
+                  })}
+                >
+                  <Text style={[styles.prDropdownSelectText, !poleHeight && styles.prDropdownPlaceholder]}>
+                    {poleHeight ? poleHeight : "Select height..."}
+                  </Text>
+                  <Text style={styles.prDropdownSelectIcon}>▼</Text>
+                </Pressable>
 
                 {/* Notes */}
                 <Text style={styles.prFieldLabel}>Notes</Text>
@@ -2917,11 +2983,20 @@ export default function PoleDetailScreen() {
               </Pressable>
 
               <Pressable
-                style={[styles.cameraCaptureBtn, { borderColor: accentColor, opacity: cameraReady ? 1 : 0.4 }]}
+                style={({ pressed }) => [
+                  styles.cameraCaptureBtn,
+                  { borderColor: accentColor, opacity: cameraReady ? 1 : 0.35 },
+                  pressed && { transform: [{ scale: 0.94 }] }
+                ]}
                 onPress={captureFromCamera}
-                disabled={!cameraReady}
+                disabled={!cameraReady || photoCapturing}
+                hitSlop={{ top: 30, bottom: 30, left: 30, right: 30 }}
               >
-                <View style={[styles.cameraCaptureInner, { backgroundColor: accentColor }]} />
+                <View style={[
+                  styles.cameraCaptureInner,
+                  { backgroundColor: accentColor },
+                  photoCapturing && { opacity: 0.4 }
+                ]} />
               </Pressable>
 
               {(() => {
@@ -2952,6 +3027,33 @@ export default function PoleDetailScreen() {
               })()}
             </View>
           </SafeAreaView>
+        </Modal>
+
+        {/* ── Premium Out of Area Alert Modal ── */}
+        <Modal
+          visible={!!outOfAreaAlert?.visible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setOutOfAreaAlert(null)}
+        >
+          <View style={styles.prModalOverlay}>
+            <View style={styles.alertModalCard}>
+              <View style={[styles.alertModalSuccessIcon, { backgroundColor: "#FFF1F2", borderColor: "#FECDD3" }]}>
+                <Text style={{ fontSize: 24 }}>📍</Text>
+              </View>
+              <Text style={styles.alertModalTitle}>Too Far From Pole</Text>
+              <Text style={styles.alertModalText}>
+                You must be within <Text style={{ fontWeight: "bold", color: "#111827" }}>50 meters</Text> of the pole coordinates to take authentic site photos.{"\n\n"}
+                Current distance: <Text style={{ fontWeight: "900", color: "#111827" }}>{outOfAreaAlert?.distance} meters</Text>.
+              </Text>
+              <TouchableOpacity
+                style={[styles.alertModalBtnFull, { backgroundColor: accentColor, marginTop: 16 }]}
+                onPress={() => setOutOfAreaAlert(null)}
+              >
+                <Text style={styles.alertModalBtnFullText}>Understood</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
         </Modal>
 
         {/* ── GPS Confirm Replace Modal ── */}
@@ -4530,8 +4632,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 32,
-    paddingBottom: 24,
-    paddingTop: 8,
+    paddingBottom: 36,
+    paddingTop: 16,
   },
 
   cameraControlSide: {
@@ -4551,18 +4653,19 @@ const styles = StyleSheet.create({
   },
 
   cameraCaptureBtn: {
-    width: 76,
-    height: 76,
-    borderRadius: 38,
-    borderWidth: 3,
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    borderWidth: 4,
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.08)",
   },
 
   cameraCaptureInner: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
+    width: 70,
+    height: 70,
+    borderRadius: 35,
   },
 
   cameraRetakeBadge: {
@@ -4877,6 +4980,34 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: "#9CA3AF",
     fontWeight: "700",
+  },
+  prDropdownSelectBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#F9FAFB",
+    borderWidth: 1.5,
+    borderColor: "#D1D5DB",
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  prDropdownSelectText: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#111827",
+    textTransform: "capitalize",
+    marginRight: 4,
+  },
+  prDropdownPlaceholder: {
+    color: "#9CA3AF",
+    textTransform: "none",
+  },
+  prDropdownSelectIcon: {
+    fontSize: 11,
+    color: "#6B7280",
+    fontWeight: "800",
   },
   prItemQtyRow: {
     flexDirection: "row",

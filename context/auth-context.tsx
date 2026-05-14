@@ -30,9 +30,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<GlobeUser | null>(null);
   const [mustChangePassword, setMustChangePassword] = useState(false);
 
-  // Rehydrate token from persistent store on app start
+  // Rehydrate token from persistent store on app start.
+  // On a fresh APK install the data directory may still exist from a previous
+  // install (Android preserves app data on update-install).  If this is the
+  // very first launch (no install.flag), wipe all credentials so the user
+  // always starts at the login + onboarding flow on a new install.
   useEffect(() => {
-    tokenStore.get().then(saved => {
+    (async () => {
+      const isNew = await tokenStore.isNewInstall();
+      if (isNew) {
+        await tokenStore.clear();
+        await tokenStore.markInstalled();
+        return; // isLoggedIn stays false → redirected to login
+      }
+
+      const saved = await tokenStore.get();
       if (saved) {
         setToken(saved);
         setBridgeToken(saved);
@@ -40,13 +52,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         startNetSync();
         startLocationTracking();
       }
-    });
-    tokenStore.getUser().then(saved => {
-      if (saved) {
-        setUser(saved);
-        if (saved.password_reset_required) setMustChangePassword(true);
+
+      const savedUser = await tokenStore.getUser();
+      if (savedUser) {
+        setUser(savedUser);
+        if (savedUser.password_reset_required) setMustChangePassword(true);
       }
-    });
+    })();
   }, []);
 
   async function login(email: string, password: string) {

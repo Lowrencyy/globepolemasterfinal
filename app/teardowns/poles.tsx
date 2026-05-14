@@ -3,6 +3,7 @@ import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getPHTNow } from "@/lib/display-time";
 import { gpsQueueReadAll } from "@/lib/gps-queue";
+import { simpleQueuePush } from "@/lib/simple-queue";
 import { getNodeDetail, getNodePoles, SkycablePole, startNodeTeardown } from "@/services/skycable";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
@@ -159,8 +160,9 @@ function VicinityMap({
   const minLng = Math.min(...lngs);
   const maxLng = Math.max(...lngs);
 
-  const centerLat = (minLat + maxLat) / 2;
-  const centerLng = (minLng + maxLng) / 2;
+  // Centroid — centers on where poles cluster, not skewed by outliers
+  const centerLat = lats.reduce((a, b) => a + b, 0) / lats.length;
+  const centerLng = lngs.reduce((a, b) => a + b, 0) / lngs.length;
 
   const w = size?.w ?? 320;
   const h = size?.h ?? 180;
@@ -637,11 +639,14 @@ export default function PolesScreen() {
   const router = useRouter();
   const { token, user } = useAuth();
 
-  const { nodeId, nodeName, nodeTeamId } = useLocalSearchParams<{
+  const { nodeId, nodeName, nodeTeamId, reportType } = useLocalSearchParams<{
     nodeId: string;
     nodeName: string;
     nodeTeamId?: string;
+    reportType?: string;
   }>();
+
+  const isPoleReport = reportType === "pole_report";
 
   const userTeamId = (user as any)?.team_id ?? null;
   const accessDenied = !!nodeTeamId && !!userTeamId && String(nodeTeamId) !== String(userTeamId);
@@ -660,25 +665,43 @@ export default function PolesScreen() {
 
   const [mapPreviewVisible, setMapPreviewVisible] = useState(false);
 
+  // ── Add Pole modal (pole_report only) ────────────────────────────────────
+  const [addPoleVisible, setAddPoleVisible]     = useState(false);
+  const [newPoleCode, setNewPoleCode]           = useState("");
+  const [addingPole, setAddingPole]             = useState(false);
+
   const isStarted = !!session?.date_start;
 
-  // ── Load node session ────────────────────────────────────────────────────
+  // ── Load node session offline-first ──────────────────────────────────────
   useEffect(() => {
     if (!token || !nodeId) return;
 
-    getNodeDetail(Number(nodeId), token)
-      .then(node => {
-        setSession({
-          date_start: node.date_start ?? null,
-          due_date: node.due_date ?? null,
-          date_finished: node.date_finished ?? null,
-          expected_cable: node.expected_cable ?? null,
-          actual_cable: node.actual_cable ?? null,
-          progress_percentage: node.progress_percentage ?? null,
-        });
-      })
-      .catch(() => { })
-      .finally(() => setSessionLoading(false));
+    const SESSION_CACHE_KEY = `session_node_${nodeId}`;
+
+    // 1. Instantly unblock layout via local cache
+    cacheGet<NodeSession>(SESSION_CACHE_KEY).then(cached => {
+      if (cached) {
+        setSession(cached);
+        setSessionLoading(false);
+      }
+
+      // 2. Fetch network layout state transparently in background
+      getNodeDetail(Number(nodeId), token)
+        .then(node => {
+          const freshSession = {
+            date_start: node.date_start ?? null,
+            due_date: node.due_date ?? null,
+            date_finished: node.date_finished ?? null,
+            expected_cable: node.expected_cable ?? null,
+            actual_cable: node.actual_cable ?? null,
+            progress_percentage: node.progress_percentage ?? null,
+          };
+          setSession(freshSession);
+          cacheSet(SESSION_CACHE_KEY, freshSession).catch(() => {});
+        })
+        .catch(() => {})
+        .finally(() => setSessionLoading(false));
+    });
   }, [token, nodeId]);
 
   // ── Show gate modal once ─────────────────────────────────────────────────
@@ -823,16 +846,84 @@ export default function PolesScreen() {
     if (!token || !nodeId || starting) return;
 
     setStarting(true);
+    const now = getPHTNow();
 
+    // 1. Immediately apply local state & storage cache to unblock inspection screen instantly
+    const updatedSession = { ...session!, date_start: now };
+    setSession(updatedSession);
+    cacheSet(`session_node_${nodeId}`, updatedSession).catch(() => {});
+    dismissGate();
+
+    // 2. Transmit session start payload to server; fallback to simpleQueue if offline
     try {
-      const now = getPHTNow();
       await startNodeTeardown(Number(nodeId), token, now);
-      setSession(prev => ({ ...prev!, date_start: now }));
-      dismissGate();
-    } catch {
-      Alert.alert("Error", "Could not start teardown. Check your connection.");
+    } catch (err: any) {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "put",
+          url: `/skycable/nodes/${nodeId}`,
+          body: { date_start: now },
+        }).catch(() => {});
+      }
+    }
+    setStarting(false);
+  }
+
+  // ── Add Pole (pole_report only) ─────────────────────────────────────────
+  async function handleAddPole() {
+    const code = newPoleCode.trim();
+    if (!code) { Alert.alert("Required", "Please enter a pole code."); return; }
+    if (!nodeId || !token || addingPole) return;
+    setAddingPole(true);
+    try {
+      const { data } = await api.post("/skycable/poles", {
+        pole_code: code,
+        node_id: Number(nodeId),
+      });
+      const newPole = data?.data ?? data;
+      const poleId  = String(newPole?.id ?? "");
+
+      // Add to local poles list so the listahan stays updated when they come back
+      const fakeSkyPole = {
+        id: newPole?.id,
+        node_id: Number(nodeId),
+        pole_id: newPole?.id,
+        sequence: poles.length + 1,
+        date_start: null,
+        cleared_at: null,
+        pole: {
+          id: newPole?.id,
+          pole_code: code,
+          lat: null,
+          lng: null,
+          skycable_status: "pending" as const,
+          cableSlots: [],
+        },
+      };
+      const updated = [...poles, fakeSkyPole];
+      setPoles(updated as any);
+      cacheSet(`sitemap_poles_${nodeId}`, updated).catch(() => {});
+
+      // Close modal and navigate directly to pole-detail for GPS + photos
+      setNewPoleCode("");
+      setAddPoleVisible(false);
+      router.push({
+        pathname: "/teardowns/pole-detail",
+        params: {
+          pole_id:   poleId,
+          pole_code: code,
+          pole_name: code,
+          node_id:   nodeId,
+          node_name: nodeName,
+          accent:    "#0B7A5A",
+          report_type: "pole_report",
+        },
+      });
+    } catch (e: any) {
+      const msg = e?.response?.data?.message ?? e?.message ?? "Failed to add pole.";
+      Alert.alert("Error", msg);
     } finally {
-      setStarting(false);
+      setAddingPole(false);
     }
   }
 
@@ -896,6 +987,42 @@ export default function PolesScreen() {
         poles={mapPolePins}
         nodeName={nodeName || "Node"}
       />
+
+      {/* ── Add Pole Modal (pole_report only) ── */}
+      <Modal visible={addPoleVisible} transparent animationType="slide" onRequestClose={() => setAddPoleVisible(false)}>
+        <View style={s.addPoleBackdrop}>
+          <TouchableOpacity style={StyleSheet.absoluteFillObject} activeOpacity={1} onPress={() => setAddPoleVisible(false)} />
+          <View style={s.addPoleSheet}>
+            <View style={s.addPoleHandle} />
+            <Text style={s.addPoleTitle}>Add New Pole</Text>
+            <Text style={s.addPoleSub}>Enter the pole code/name to register it to this node.</Text>
+            <TextInput
+              style={s.addPoleInput}
+              placeholder="e.g. POLE-12 or BGC-011"
+              placeholderTextColor="#94A3B8"
+              value={newPoleCode}
+              onChangeText={setNewPoleCode}
+              autoCapitalize="characters"
+              autoFocus
+              returnKeyType="done"
+              onSubmitEditing={handleAddPole}
+            />
+            <TouchableOpacity
+              style={[s.addPoleBtn, (!newPoleCode.trim() || addingPole) && { opacity: 0.55 }]}
+              activeOpacity={0.85}
+              onPress={handleAddPole}
+              disabled={!newPoleCode.trim() || addingPole}
+            >
+              {addingPole
+                ? <ActivityIndicator size="small" color="#FFFFFF" />
+                : <Text style={s.addPoleBtnText}>+ Add Pole</Text>}
+            </TouchableOpacity>
+            <TouchableOpacity style={s.addPoleCancelBtn} onPress={() => { setAddPoleVisible(false); setNewPoleCode(""); }}>
+              <Text style={s.addPoleCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       <SafeAreaView style={s.container}>
         <View style={s.floatingHeader}>
@@ -1023,10 +1150,7 @@ export default function PolesScreen() {
               <View style={s.filterRow}>
                 <TouchableOpacity
                   activeOpacity={0.8}
-                  onPress={() => {
-                    setShowCompleted(false);
-                    setSearch("");
-                  }}
+                  onPress={() => { setShowCompleted(false); setSearch(""); }}
                   style={[s.filterChip, !showCompleted && s.filterChipActive]}
                 >
                   <Text style={[s.filterChipText, !showCompleted && s.filterChipTextActive]}>
@@ -1036,16 +1160,24 @@ export default function PolesScreen() {
 
                 <TouchableOpacity
                   activeOpacity={0.8}
-                  onPress={() => {
-                    setShowCompleted(true);
-                    setSearch("");
-                  }}
+                  onPress={() => { setShowCompleted(true); setSearch(""); }}
                   style={[s.filterChip, showCompleted && s.filterChipDone]}
                 >
                   <Text style={[s.filterChipText, showCompleted && s.filterChipTextActive]}>
                     Completed ({completedPoles.length})
                   </Text>
                 </TouchableOpacity>
+
+                {/* Add Pole — only for pole_report nodes after teardown is started */}
+                {isPoleReport && isStarted && !showCompleted && (
+                  <TouchableOpacity
+                    activeOpacity={0.85}
+                    onPress={() => setAddPoleVisible(true)}
+                    style={s.addPoleFab}
+                  >
+                    <Text style={s.addPoleFabText}>+ Add Pole</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             </View>
 
@@ -1224,7 +1356,9 @@ export default function PolesScreen() {
                             node_id: nodeId,
                             node_name: nodeName,
                             accent: "#0B7A5A",
-                            report_type: "teardown",
+                            // pass the actual report type so pole-detail knows
+                            // whether to show full teardown flow or pole report only
+                            report_type: isPoleReport ? "pole_report" : "teardown",
                           },
                         });
                       }}
@@ -2188,5 +2322,99 @@ const s = StyleSheet.create({
     fontSize: 15,
     fontWeight: "800",
     color: "#fff",
+  },
+
+  // ── Add Pole FAB ──────────────────────────────────────────────────────────
+  addPoleFab: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "#0B7A5A",
+    alignSelf: "center",
+  },
+  addPoleFabText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
+
+  // ── Add Pole modal ────────────────────────────────────────────────────────
+  addPoleBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(15,23,42,0.55)",
+    justifyContent: "flex-end",
+  },
+  addPoleSheet: {
+    backgroundColor: "#FFFFFF",
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    paddingBottom: 36,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 20,
+    elevation: 14,
+  },
+  addPoleHandle: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "#E2E8F0",
+    alignSelf: "center",
+    marginBottom: 20,
+  },
+  addPoleTitle: {
+    fontSize: 20,
+    fontWeight: "900",
+    color: "#111827",
+    marginBottom: 6,
+  },
+  addPoleSub: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: "#6B7280",
+    marginBottom: 18,
+    lineHeight: 20,
+  },
+  addPoleInput: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1.5,
+    borderColor: "#E2E8F0",
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#111827",
+    marginBottom: 14,
+  },
+  addPoleBtn: {
+    backgroundColor: "#0B7A5A",
+    borderRadius: 14,
+    paddingVertical: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+    shadowColor: "#0B7A5A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    elevation: 4,
+  },
+  addPoleBtnText: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
+  addPoleCancelBtn: {
+    alignItems: "center",
+    paddingVertical: 10,
+  },
+  addPoleCancelText: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#94A3B8",
   },
 });

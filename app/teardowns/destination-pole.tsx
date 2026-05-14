@@ -406,6 +406,8 @@ export default function DestinationPoleScreen() {
   const cameraRef = useRef<React.ComponentRef<typeof CameraView>>(null);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [cameraReady, setCameraReady] = useState(false);
+  const [photoCapturing, setPhotoCapturing] = useState(false);
+  const [outOfAreaAlert, setOutOfAreaAlert] = useState<{ visible: boolean; distance: number } | null>(null);
   const [cameraZoom, setCameraZoom] = useState(0);
   const pinchBaseZoom = useRef(0);
   const pinchGesture = Gesture.Pinch()
@@ -944,12 +946,49 @@ export default function DestinationPoleScreen() {
     setViewerOpen(true);
   }
 
+  function computeDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const R = 6371e3;
+    const p1 = (lat1 * Math.PI) / 180;
+    const p2 = (lat2 * Math.PI) / 180;
+    const dp = ((lat2 - lat1) * Math.PI) / 180;
+    const dl = ((lng2 - lng1) * Math.PI) / 180;
+    const a = Math.sin(dp / 2) * Math.sin(dp / 2) + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Math.round(R * c);
+  }
+
   async function captureFromCamera() {
-    if (!cameraRef.current || !cameraReady) return;
+    if (!cameraRef.current || !cameraReady || photoCapturing) return;
+
+    setPhotoCapturing(true);
     setBlurWarning(false);
+
+    if (capturedGps) {
+      try {
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
+        if (pos?.coords) {
+          const dist = computeDistanceMeters(capturedGps.latitude, capturedGps.longitude, pos.coords.latitude, pos.coords.longitude);
+          if (dist > 50) {
+            setPhotoCapturing(false);
+            setOutOfAreaAlert({ visible: true, distance: dist });
+            return;
+          }
+        }
+      } catch {}
+    }
+
+    // Double check that the CameraView is still mounted after asynchronous location yields
+    if (!cameraRef.current) {
+      setPhotoCapturing(false);
+      return;
+    }
+
     try {
       const photo = await cameraRef.current.takePictureAsync({ quality: 1, skipProcessing: false });
-      if (!photo?.uri) return;
+      if (!photo?.uri) {
+        setPhotoCapturing(false);
+        return;
+      }
       const capturedAt = getPHTNow();
       const setter = activeCameraTab === "before" ? setPhotoBefore : activeCameraTab === "after" ? setPhotoAfter : setPhotoTag;
       const qualitySetter = activeCameraTab === "before" ? setQualityBefore : activeCameraTab === "after" ? setQualityAfter : setQualityTag;
@@ -968,6 +1007,8 @@ export default function DestinationPoleScreen() {
       }
     } catch (e: any) {
       Alert.alert("Photo Error", e?.message ?? "Failed to capture photo.");
+    } finally {
+      setPhotoCapturing(false);
     }
   }
 
@@ -1627,11 +1668,16 @@ export default function DestinationPoleScreen() {
               </Pressable>
 
               <Pressable
-                style={[styles.cameraCaptureBtn, { borderColor: accentColor, opacity: cameraReady ? 1 : 0.4 }]}
+                style={({ pressed }) => [
+                  styles.cameraCaptureBtn,
+                  { borderColor: accentColor, opacity: cameraReady ? 1 : 0.4 },
+                  pressed && { transform: [{ scale: 0.94 }] }
+                ]}
                 onPress={captureFromCamera}
-                disabled={!cameraReady}
+                disabled={!cameraReady || photoCapturing}
+                hitSlop={{ top: 30, bottom: 30, left: 30, right: 30 }}
               >
-                <View style={[styles.cameraCaptureInner, { backgroundColor: accentColor }]} />
+                <View style={[styles.cameraCaptureInner, { backgroundColor: accentColor }, photoCapturing && { opacity: 0.4 }]} />
               </Pressable>
 
               {(() => {
@@ -1693,6 +1739,37 @@ export default function DestinationPoleScreen() {
                   <Text style={styles.modalPrimaryBtnText}>Retake</Text>
                 </Pressable>
               </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ── Premium Out of Area Alert Modal ── */}
+        <Modal
+          visible={!!outOfAreaAlert?.visible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setOutOfAreaAlert(null)}
+        >
+          <View style={styles.modalBackdrop}>
+            <View style={styles.qualityAlertCard}>
+              <View style={[styles.qualityAlertIconWrap, { backgroundColor: "#FFF1F2", borderColor: "#FECDD3" }]}>
+                <Text style={{ fontSize: 28 }}>📍</Text>
+              </View>
+              <Text style={styles.qualityAlertTitle}>Too Far From Pole</Text>
+              <Text style={styles.qualityAlertBody}>
+                You must be within <Text style={styles.qualityAlertBold}>50 meters</Text> of the captured destination pole coordinates to take authentic site photos.{"\n\n"}
+                Current distance: <Text style={{ fontWeight: "800", color: "#111827" }}>{outOfAreaAlert?.distance} meters</Text>.
+              </Text>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.qualityRetakeBtn,
+                  { backgroundColor: accentColor, width: "100%" },
+                  pressed && styles.pressedDown,
+                ]}
+                onPress={() => setOutOfAreaAlert(null)}
+              >
+                <Text style={styles.qualityRetakeBtnText}>Understood</Text>
+              </Pressable>
             </View>
           </View>
         </Modal>

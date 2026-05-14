@@ -24,8 +24,9 @@ function PolesVicinityMap({ locs }: { locs: { lat: number; lng: number }[] }) {
   const maxLat = Math.max(...locs.map(p => p.lat));
   const minLng = Math.min(...locs.map(p => p.lng));
   const maxLng = Math.max(...locs.map(p => p.lng));
-  const centerLat = (minLat + maxLat) / 2;
-  const centerLng = (minLng + maxLng) / 2;
+  // Centroid — centers on where poles cluster, not skewed by outliers
+  const centerLat = locs.reduce((a, p) => a + p.lat, 0) / locs.length;
+  const centerLng = locs.reduce((a, p) => a + p.lng, 0) / locs.length;
 
   // Compute zoom so bounding box fits in ~55% of container (leaves padding around box)
   const w = size?.w ?? 320;
@@ -152,7 +153,11 @@ function NodeCard({ node, onPress }: { node: SkycableNode; onPress: () => void }
       <View style={s.cardBody}>
         <View style={s.info}>
           <Text style={s.nodeName}>{node.name}</Text>
-          <Text style={s.nodeSub} numberOfLines={1}>{node.barangay_name || "—"}, {node.city || "—"}</Text>
+          {(() => {
+            const locText = [node.barangay_name, node.city].filter(Boolean).join(", ");
+            if (!locText) return null;
+            return <Text style={s.nodeSub} numberOfLines={1}>{locText}</Text>;
+          })()}
         </View>
         <View style={[s.badge, { backgroundColor: sc.bg }]}>
           <View style={[s.badgeDot, { backgroundColor: sc.color }]} />
@@ -308,7 +313,7 @@ export default function NodesScreen() {
               <NodeCard
                 key={node.id}
                 node={node}
-                onPress={() => router.push({ pathname: "/teardowns/poles", params: { nodeId: node.id, nodeName: node.name, nodeTeamId: node.team_id ?? node.team?.id ?? "" } })}
+                onPress={() => router.push({ pathname: "/teardowns/poles", params: { nodeId: node.id, nodeName: node.name, nodeTeamId: node.team_id ?? node.team?.id ?? "", reportType: node.report_type ?? "" } })}
               />
             )}
           />

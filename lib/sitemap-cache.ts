@@ -25,6 +25,9 @@ async function fetchAndCacheSpans(nodeId: number): Promise<void> {
       }
     }
 
+    // Cache the full list for the node (useful for warehouse/summary screens)
+    await cacheSet(`spans_node_${nodeId}`, all).catch(() => {});
+
     // Cache per pole using the same key select-pair.tsx reads
     await Promise.allSettled(
       Object.entries(byPole).map(([poleId, spans]) =>
@@ -42,8 +45,8 @@ export async function prefetchSitemap(token: string, force = false): Promise<voi
   try {
     if (!force) {
       const lastSynced = await cacheGet<number>("sitemap_last_synced_at").catch(() => null);
-      // Skip heavy prefetch loop if successfully synced within the last 4 hours
-      if (lastSynced && Date.now() - lastSynced < 4 * 60 * 60 * 1000) {
+      // Skip heavy prefetch loop if successfully synced within the last 24 hours
+      if (lastSynced && Date.now() - lastSynced < 24 * 60 * 60 * 1000) {
         return;
       }
     }
@@ -53,26 +56,23 @@ export async function prefetchSitemap(token: string, force = false): Promise<voi
     const areas = await getAreas(token);
     await cacheSet("sitemap_areas", areas);
 
-    await Promise.allSettled(
-      areas.map(async (area) => {
-        try {
-          const { data: nodes } = await getNodes(area.id, token);
-          await cacheSet(`sitemap_nodes_${area.id}`, nodes);
+    // Run sequentially to avoid hammering the backend with dozens of parallel requests
+    for (const area of areas) {
+      try {
+        const { data: nodes } = await getNodes(area.id, token);
+        await cacheSet(`sitemap_nodes_${area.id}`, nodes);
 
-          await Promise.allSettled(
-            nodes.map(async (node) => {
-              try {
-                const poles = await getNodePoles(node.id, token);
-                await cacheSet(`sitemap_poles_${node.id}`, poles);
+        for (const node of nodes) {
+          try {
+            const poles = await getNodePoles(node.id, token);
+            await cacheSet(`sitemap_poles_${node.id}`, poles);
 
-                // Prefetch spans for every pole in this node in one request
-                await fetchAndCacheSpans(node.id);
-              } catch {}
-            }),
-          );
-        } catch {}
-      }),
-    );
+            // Prefetch spans for every pole in this node in one request
+            await fetchAndCacheSpans(node.id);
+          } catch {}
+        }
+      } catch {}
+    }
 
     await cacheSet("sitemap_last_synced_at", Date.now()).catch(() => {});
   } catch {} finally {

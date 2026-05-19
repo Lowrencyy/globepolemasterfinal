@@ -20,57 +20,82 @@ function latLngToTileFrac(lat: number, lng: number, z: number) {
 
 function VicinityMap({ locs }: { locs: { lat: number; lng: number }[] }) {
   const [size, setSize] = useState<{ w: number; h: number } | null>(null);
-  const onLayout = (e: LayoutChangeEvent) => { const { width, height } = e.nativeEvent.layout; setSize({ w: width, h: height }); };
-
-  const minLat = Math.min(...locs.map(p => p.lat));
-  const maxLat = Math.max(...locs.map(p => p.lat));
-  const minLng = Math.min(...locs.map(p => p.lng));
-  const maxLng = Math.max(...locs.map(p => p.lng));
-  const centerLat = (minLat + maxLat) / 2;
-  const centerLng = (minLng + maxLng) / 2;
+  const onLayout = (e: LayoutChangeEvent) => {
+    const { width, height } = e.nativeEvent.layout;
+    setSize({ w: width, h: height });
+  };
 
   const w = size?.w ?? 320;
   const h = size?.h ?? 150;
-  const latSpan = Math.max(maxLat - minLat, 0.0005);
-  const lngSpan = Math.max(maxLng - minLng, 0.0005);
-  const zLng = Math.log2((w * 0.55 * 360) / (256 * lngSpan));
-  const zLat = Math.log2((h * 0.55 * 180) / (256 * latSpan));
-  const zoom = Math.max(10, Math.min(16, Math.floor(Math.min(zLng, zLat))));
+  const hasLocs = locs.length > 0;
+
+  // Use bounding-box midpoint so the view is always perfectly centered on the data
+  const lats = hasLocs ? locs.map(p => p.lat) : [];
+  const lngs = hasLocs ? locs.map(p => p.lng) : [];
+  const minLat = hasLocs ? Math.min(...lats) : 12.8797;
+  const maxLat = hasLocs ? Math.max(...lats) : 12.8797;
+  const minLng = hasLocs ? Math.min(...lngs) : 121.774;
+  const maxLng = hasLocs ? Math.max(...lngs) : 121.774;
+  const centerLat = (minLat + maxLat) / 2;
+  const centerLng = (minLng + maxLng) / 2;
+
+  // Auto-zoom: fit bounding box with padding; allow z8 for large areas, cap at z14
+  let zoom = 9;
+  if (hasLocs && locs.length > 1) {
+    const latSpan = Math.max(maxLat - minLat, 0.001);
+    const lngSpan = Math.max(maxLng - minLng, 0.001);
+    const zLng = Math.log2((w * 0.7 * 360) / (256 * lngSpan));
+    const zLat = Math.log2((h * 0.7 * 180) / (256 * latSpan));
+    zoom = Math.max(8, Math.min(14, Math.floor(Math.min(zLng, zLat))));
+  } else if (hasLocs) {
+    zoom = 14;
+  }
 
   const { xFrac, yFrac, tileX, tileY } = latLngToTileFrac(centerLat, centerLng, zoom);
-  const fracX = xFrac - tileX; const fracY = yFrac - tileY;
-  const tileBase = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${tileY}`;
+  const fracX = xFrac - tileX;
+  const fracY = yFrac - tileY;
 
-  const scale = size ? Math.max(size.w / TILE_PX, size.h / TILE_PX) : 1;
-  const imgW = TILE_PX * scale; const imgH = TILE_PX * scale;
-  const offsetX = size ? size.w / 2 - fracX * imgW : 0;
-  const offsetY = size ? size.h / 2 - fracY * imgH : 0;
-
-  // Bounding box overlay
-  let boxLeft = 0, boxTop = 0, boxW = 0, boxH = 0, showBox = false;
-  if (size && latSpan > 0.0005 && lngSpan > 0.0005) {
-    const sw = latLngToTileFrac(minLat, minLng, zoom);
-    const ne = latLngToTileFrac(maxLat, maxLng, zoom);
-    boxLeft = offsetX + (sw.xFrac - tileX) * imgW;
-    boxTop  = offsetY + (ne.yFrac - tileY) * imgH;
-    boxW = (ne.xFrac - sw.xFrac) * imgW;
-    boxH = (sw.yFrac - ne.yFrac) * imgH;
-    showBox = boxW > 2 && boxH > 2;
-  }
+  const scale = size ? Math.max(w / TILE_PX, h / TILE_PX) : 1;
+  const imgW = TILE_PX * scale;
+  const imgH = TILE_PX * scale;
+  const offsetX = size ? w / 2 - fracX * imgW : 0;
+  const offsetY = size ? h / 2 - fracY * imgH : 0;
 
   return (
     <View style={StyleSheet.absoluteFillObject} onLayout={onLayout}>
-      <Image source={{ uri: `${tileBase}/${tileX - 1}` }} style={{ position: "absolute", left: offsetX - imgW, top: offsetY, width: imgW, height: imgH }} resizeMode="cover" />
-      <Image source={{ uri: `${tileBase}/${tileX}` }} style={{ position: "absolute", left: offsetX, top: offsetY, width: imgW, height: imgH }} resizeMode="cover" />
-      <Image source={{ uri: `${tileBase}/${tileX + 1}` }} style={{ position: "absolute", left: offsetX + imgW, top: offsetY, width: imgW, height: imgH }} resizeMode="cover" />
-      {/* Pole dots */}
-      {size && locs.map((p, i) => {
+      {/* 3×3 tile grid — covers full vertical + horizontal extent */}
+      {([-1, 0, 1] as const).flatMap(dy =>
+        ([-1, 0, 1] as const).map(dx => (
+          <Image
+            key={`${dx}-${dy}`}
+            source={{ uri: `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${tileY + dy}/${tileX + dx}` }}
+            style={{ position: "absolute", left: offsetX + dx * imgW, top: offsetY + dy * imgH, width: imgW, height: imgH }}
+            resizeMode="cover"
+          />
+        ))
+      )}
+      {/* Pole dots — only when GPS data is available */}
+      {size && hasLocs && locs.map((p, i) => {
         const { xFrac: px, yFrac: py } = latLngToTileFrac(p.lat, p.lng, zoom);
-        return <View key={i} style={{ position: "absolute", left: offsetX + (px - tileX) * imgW - 3, top: offsetY + (py - tileY) * imgH - 3, width: 6, height: 6, borderRadius: 3, backgroundColor: "#FFF", borderWidth: 1.5, borderColor: "#F59E0B" }} />;
+        return (
+          <View
+            key={i}
+            style={{
+              position: "absolute",
+              left: offsetX + (px - tileX) * imgW - 4,
+              top: offsetY + (py - tileY) * imgH - 4,
+              width: 8, height: 8, borderRadius: 4,
+              backgroundColor: "#F59E0B",
+              borderWidth: 1.5, borderColor: "#FFF",
+            }}
+          />
+        );
       })}
-      {/* Bounding box */}
-      {showBox && (
-        <View style={{ position: "absolute", left: boxLeft, top: boxTop, width: boxW, height: boxH, borderWidth: 2, borderColor: "#F59E0B", backgroundColor: "rgba(245,158,11,0.10)", borderRadius: 3 }} />
+      {/* Dim overlay + label when no GPS cached yet */}
+      {!hasLocs && (
+        <View style={{ ...StyleSheet.absoluteFillObject as any, backgroundColor: "rgba(0,0,0,0.35)", alignItems: "center", justifyContent: "center" }}>
+          <Text style={{ color: "#FFF", fontSize: 11, fontWeight: "700", opacity: 0.85 }}>No GPS data cached</Text>
+        </View>
       )}
     </View>
   );
@@ -100,21 +125,13 @@ function AreaCard({ area, onPress }: { area: SkycableArea; onPress: () => void }
     })();
   }, [area.id]);
 
-  const hasMap = locs.length > 0;
-
   return (
     <TouchableOpacity style={s.cardContainer} activeOpacity={0.8} onPress={onPress}>
       <View style={s.heroMapShell}>
-        {hasMap ? (
-          <VicinityMap locs={locs} />
-        ) : (
-          <Image source={require("../../assets/images/telcovantage-logo.png")} style={s.noGpsLogo} resizeMode="contain" />
-        )}
-        {hasMap && (
-          <View style={s.mapAreaLabel}>
-            <Text style={s.mapAreaLabelText} numberOfLines={1}>{area.name}</Text>
-          </View>
-        )}
+        <VicinityMap locs={locs} />
+        <View style={s.mapAreaLabel}>
+          <Text style={s.mapAreaLabelText} numberOfLines={1}>{area.name}</Text>
+        </View>
       </View>
 
       <View style={s.cardBody}>
@@ -171,8 +188,8 @@ export default function AreasScreen() {
       const cached = await cacheGet<SkycableArea[]>(CACHE_KEY);
       if (cached?.length) {
         setAreas(cached);
-        setLoading(false);
       }
+      setLoading(false); // Always unblock UI after cache check — don't block on network
 
       // Always fetch — team filter must always be applied
       try {
@@ -182,8 +199,6 @@ export default function AreasScreen() {
         setOffline(false);
       } catch {
         if (!cached?.length) setOffline(true);
-      } finally {
-        setLoading(false);
       }
     }
     loadAreas();

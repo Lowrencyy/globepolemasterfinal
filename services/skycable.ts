@@ -81,6 +81,232 @@ export const startPoleTeardown = async (nodeId: number, poleId: number, token: s
   await api.request(`/skycable/nodes/${nodeId}/poles/${poleId}`, { method: "PUT", body: JSON.stringify({ date_start: dateStart }) }, token);
 };
 
+// ─── Delivery / Warehouse types ──────────────────────────────────────────────
+// Source of truth: GET /skycable/teardowns returns TeardownLog records.
+// Each completed teardown has the actual collected quantities already recorded.
+
+export interface TeardownLog {
+  id: number;
+  status: string;
+  actual_cable: number | null;
+  expected_cable: number | null;
+  nodes_collected: number;
+  amplifiers_collected: number;
+  extenders_collected: number;
+  tsc_collected: number;
+  powersupply_collected: number;
+  ps_housing_collected: number;
+  start_time: string;
+  end_time: string | null;
+  team?: { id: number; name: string } | null;
+  span?: { span_code?: string | null; node?: { id: number; name: string } | null } | null;
+}
+
+// Warehouse staging flow:
+// submitted → at_subcon_warehouse → in_transit → at_warehouse → processing → final_warehouse → sold | pulled_out
+export type DeliveryStatus =
+  | "submitted"
+  | "at_subcon_warehouse"
+  | "in_transit"
+  | "at_warehouse"
+  | "processing"
+  | "final_warehouse"
+  | "sold"
+  | "pulled_out";
+
+export const DELIVERY_STATUS_LABELS: Record<DeliveryStatus, string> = {
+  submitted:           "Submitted",
+  at_subcon_warehouse: "At Subcon Warehouse",
+  in_transit:          "In Transit",
+  at_warehouse:        "At Warehouse",
+  processing:          "Processing",
+  final_warehouse:     "Final Warehouse",
+  sold:                "Sold",
+  pulled_out:          "Pulled Out",
+};
+
+export const DELIVERY_STATUS_COLORS: Record<DeliveryStatus, string> = {
+  submitted:           "#64748b",
+  at_subcon_warehouse: "#0b6cff",
+  in_transit:          "#f59e0b",
+  at_warehouse:        "#8b5cf6",
+  processing:          "#06b6d4",
+  final_warehouse:     "#059669",
+  sold:                "#10b981",
+  pulled_out:          "#ef4444",
+};
+
+// One entry per movement in the chain of custody
+export interface DeliveryMovement {
+  id: number;
+  delivery_id: number;
+  from_stage: string | null;
+  to_stage: string;
+  location_name: string;
+  notes?: string | null;
+  moved_by?: { id: number; name: string } | null;
+  timestamp: string;
+}
+
+export interface TeardownDelivery {
+  id: number;
+  token: string;           // e.g. TDL-20260519-A3F2
+  date: string;
+  status: DeliveryStatus;
+  current_location?: string | null;
+  total_cable: number;
+  total_node: number;
+  total_amplifier: number;
+  total_extender: number;
+  total_tsc: number;
+  total_psu: number;
+  total_psu_case: number;
+  teardown_count: number;
+  notes?: string | null;
+  team?: { id: number; name: string } | null;
+  submitted_by?: { id: number; name: string } | null;
+  movements?: DeliveryMovement[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface DeliveryTotals {
+  cable: number;
+  node: number;
+  amplifier: number;
+  extender: number;
+  tsc: number;
+  psu: number;
+  psuCase: number;
+}
+
+/** Aggregate actual collected quantities from teardown logs for a given date */
+export function calcDeliveryTotals(logs: TeardownLog[]): DeliveryTotals {
+  return logs.reduce(
+    (acc, l) => {
+      acc.cable     += l.actual_cable          ?? 0;
+      acc.node      += l.nodes_collected       ?? 0;
+      acc.amplifier += l.amplifiers_collected  ?? 0;
+      acc.extender  += l.extenders_collected   ?? 0;
+      acc.tsc       += l.tsc_collected         ?? 0;
+      acc.psu       += l.powersupply_collected ?? 0;
+      acc.psuCase   += l.ps_housing_collected  ?? 0;
+      return acc;
+    },
+    { cable: 0, node: 0, amplifier: 0, extender: 0, tsc: 0, psu: 0, psuCase: 0 }
+  );
+}
+
+/** Filter teardown logs to a specific PHT date (yyyy-mm-dd) */
+export function filterLogsByDate(logs: TeardownLog[], date: string): TeardownLog[] {
+  return logs.filter(l => {
+    const ts = l.end_time ?? l.start_time;
+    if (!ts) return false;
+    // Convert UTC ISO to PHT (UTC+8) date
+    const pht = new Date(new Date(ts).getTime() + 8 * 3600 * 1000);
+    return pht.toISOString().slice(0, 10) === date;
+  });
+}
+
+/** GET /skycable/teardowns — all teardown logs (filter by date client-side) */
+export const getTeardownLogs = async (token: string): Promise<TeardownLog[]> => {
+  const res = await api.request<TeardownLog[] | { data: TeardownLog[] }>(
+    "/skycable/teardowns?per_page=500", {}, token
+  );
+  return Array.isArray(res) ? res : (res as any)?.data ?? [];
+};
+
+/** GET /skycable/deliveries — list of submitted daily deliveries */
+export const getDeliveries = async (token: string, date?: string): Promise<TeardownDelivery[]> => {
+  const qs = date ? `?date=${date}` : "";
+  try {
+    const res = await api.request<TeardownDelivery[] | { data: TeardownDelivery[] }>(
+      `/skycable/deliveries${qs}`, {}, token
+    );
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch {
+    return [];
+  }
+};
+
+/** Generate a unique human-readable tracking token for a delivery batch */
+export function generateDeliveryToken(date: string): string {
+  const compact = date.replace(/-/g, "");                              // 20260519
+  const rand = Math.random().toString(36).slice(2, 6).toUpperCase();  // A3F2
+  return `TDL-${compact}-${rand}`;
+}
+
+/** POST /skycable/deliveries — submit today's teardown as a warehouse delivery */
+export const submitDelivery = async (
+  token: string,
+  payload: {
+    token: string;
+    date: string;
+    teardown_log_ids: number[];
+    totals: DeliveryTotals;
+    notes?: string | null;
+  }
+): Promise<TeardownDelivery> => {
+  return api.request<TeardownDelivery>("/skycable/deliveries", {
+    method: "POST",
+    body: JSON.stringify({
+      token:               payload.token,
+      date:                payload.date,
+      teardown_log_ids:    payload.teardown_log_ids,
+      total_cable:         payload.totals.cable,
+      total_node:          payload.totals.node,
+      total_amplifier:     payload.totals.amplifier,
+      total_extender:      payload.totals.extender,
+      total_tsc:           payload.totals.tsc,
+      total_psu:           payload.totals.psu,
+      total_psu_case:      payload.totals.psuCase,
+      notes:               payload.notes ?? null,
+    }),
+  }, token);
+};
+
+/**
+ * POST /skycable/deliveries/:id/move
+ * Advance a delivery to the next warehouse/stage in the chain.
+ */
+export const moveDelivery = async (
+  token: string,
+  deliveryId: number,
+  payload: { to_stage: DeliveryStatus; location_name: string; notes?: string | null }
+): Promise<TeardownDelivery> => {
+  return api.request<TeardownDelivery>(`/skycable/deliveries/${deliveryId}/move`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, token);
+};
+
+/**
+ * POST /skycable/deliveries/:id/sold
+ * Mark delivery as sold/distributed at final stage.
+ */
+export const markDeliverySold = async (token: string, deliveryId: number, notes?: string): Promise<void> => {
+  await api.request(`/skycable/deliveries/${deliveryId}/sold`, {
+    method: "POST",
+    body: JSON.stringify({ notes: notes ?? null }),
+  }, token);
+};
+
+/**
+ * POST /skycable/deliveries/:id/pullout
+ * Mark delivery as pulled out / returned.
+ */
+export const markDeliveryPullout = async (token: string, deliveryId: number, notes?: string): Promise<void> => {
+  await api.request(`/skycable/deliveries/${deliveryId}/pullout`, {
+    method: "POST",
+    body: JSON.stringify({ notes: notes ?? null }),
+  }, token);
+};
+
+/** POST /skycable/deliveries/:id/approve — warehouse in-charge receives delivery at subcon warehouse */
+export const approveDelivery = async (token: string, deliveryId: number): Promise<void> => {
+  await api.request(`/skycable/deliveries/${deliveryId}/approve`, { method: "POST" }, token);
+};
+
 export const downloadSitemapData = async (token: string): Promise<boolean> => {
   try {
     const { cacheSet } = await import("@/lib/cache");

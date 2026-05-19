@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -1 \"C:\\\\globe-app\\\\globe-app\\\\src\\\\pages\\\\sites\" \"C:\\\\globe-app\\\\globe-app\\\\src\\\\pages\\\\nodes\" \"C:\\\\globe-app\\\\globe-app\\\\src\\\\pages\\\\spans\")",
+      "Read(//c/globe-app/globe-app/src/pages/sites/**)"
+    ]
+  }
+}

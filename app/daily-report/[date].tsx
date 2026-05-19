@@ -24,7 +24,7 @@ const BORDER = "#E7ECF2";
 
 const CACHE_PREFIX = "daily_report_preview_";
 
-const USE_FAKE_DATA = true;
+const USE_FAKE_DATA = false;
 
 const FAKE_DATE = "2026-05-12";
 

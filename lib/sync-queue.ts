@@ -182,17 +182,57 @@ export async function imageQueueRemove(id: string): Promise<void> {
 
 // ── Upload helpers ────────────────────────────────────────────────────────────
 
-async function buildForm(entry: QueueEntry): Promise<FormData> {
+// Internal photo key → backend field name for storeDirect & upload-image
+const PHOTO_FIELD_MAP: Record<string, string> = {
+  from_tag:    "from_pole_tag",
+  to_tag:      "to_pole_tag",
+  before_span: "bunching",
+};
+
+function resolveFieldName(key: string): string {
+  return PHOTO_FIELD_MAP[key] ?? key;
+}
+
+// Metadata-only form — photos are uploaded separately after the record is created.
+// Bundling 6 photos (~18 MB) in one POST over ngrok reliably causes timeout.
+async function buildMetadataForm(entry: QueueEntry): Promise<FormData> {
   const form = new FormData();
   form.append("local_id", entry.local_id);
   for (const [k, v] of Object.entries(entry.fields)) form.append(k, v);
-  for (const [fieldName, uri] of Object.entries(entry.photoPaths)) {
-    const info = await FileSystem.getInfoAsync(uri);
-    if (info.exists) {
-      form.append(fieldName, { uri, name: `${fieldName}.jpg`, type: "image/jpeg" } as any);
-    }
-  }
   return form;
+}
+
+async function uploadPhotosForEntry(entry: QueueEntry, reportId: string): Promise<void> {
+  const uploads = Object.entries(entry.photoPaths).map(async ([internalKey, uri]) => {
+    const info = await FileSystem.getInfoAsync(uri);
+    if (!info.exists) return;
+
+    const fieldName  = resolveFieldName(internalKey);
+    const isToPole   = fieldName.startsWith("to_");
+    const isBunching = fieldName === "bunching";
+
+    let imageType: string;
+    if (isBunching)                         imageType = "bunching";
+    else if (fieldName.includes("pole_tag")) imageType = "pole_tag";
+    else if (fieldName.includes("after"))    imageType = "after";
+    else                                     imageType = "before";
+
+    const poleId   = isToPole ? (entry.toPoleId   ?? "") : (entry.fromPoleId ?? "");
+    const poleCode = isToPole ? (entry.fields.to_pole_code ?? "pole") : (entry.fields.from_pole_code ?? "pole");
+
+    const form = new FormData();
+    form.append("report_id",      reportId);
+    form.append("pole_id",        poleId);
+    form.append("node_id",        entry.nodeId ?? "");
+    form.append("pole_code",      poleCode);
+    form.append("image_type",     imageType);
+    form.append("inventory_type", "skycable");
+    form.append("idempotency_key", `${entry.local_id}_${fieldName}`);
+    form.append("image", { uri, name: `${fieldName}.jpg`, type: "image/jpeg" } as any);
+    await api.post("/teardown/upload-image", form);
+  });
+
+  await Promise.allSettled(uploads); // best-effort; don't fail the submission over photos
 }
 
 async function cleanupAfterSuccess(entry: QueueEntry): Promise<void> {
@@ -241,7 +281,7 @@ export async function processSyncQueue(): Promise<SyncResult> {
   await writeQueue(marked);
 
   const results = await Promise.allSettled(
-    actionable.map(entry => buildForm(entry).then(form => api.post("/teardown-logs", form))),
+    actionable.map(entry => buildMetadataForm(entry).then(form => api.post("/teardown-logs", form))),
   );
 
   let submitted = 0;
@@ -259,7 +299,12 @@ export async function processSyncQueue(): Promise<SyncResult> {
     if (result.status === "fulfilled") {
       submitted++;
       final[idx].status = "synced";
-      console.log(`[ONLINE_UPLOAD_SUCCESS] local_id=${entry.local_id}`);
+      const reportId = String((result.value as any)?.data?.id ?? "");
+      console.log(`[ONLINE_UPLOAD_SUCCESS] local_id=${entry.local_id} report_id=${reportId}`);
+      // Upload photos separately now that we have a report ID
+      if (reportId) {
+        await uploadPhotosForEntry(entry, reportId);
+      }
       await cleanupAfterSuccess(entry);
     } else {
       const err = result.reason as any;
@@ -267,9 +312,11 @@ export async function processSyncQueue(): Promise<SyncResult> {
       const newRetry = entry.retryCount + 1;
 
       if (httpStatus === 409) {
-        // Already on server
+        // Already on server — get report id from error body if available and upload photos
         submitted++;
         final[idx].status = "synced";
+        const existingId = String(err?.response?.data?.id ?? "");
+        if (existingId) await uploadPhotosForEntry(entry, existingId);
         await cleanupAfterSuccess(entry);
       } else if (httpStatus === 400 || httpStatus === 422 || httpStatus === 404) {
         // Bad data — won't help to retry
@@ -367,4 +414,11 @@ export async function processImageQueue(): Promise<void> {
   }
 
   await writeImageQueue(final);
+}
+export async function clearAllQueues(): Promise<void> {
+  try {
+    await FileSystem.deleteAsync(QUEUE_FILE, { idempotent: true });
+    await FileSystem.deleteAsync(IMAGES_FILE, { idempotent: true });
+    await FileSystem.deleteAsync(OFFLINE_IMAGES_DIR, { idempotent: true });
+  } catch { /* ignore */ }
 }

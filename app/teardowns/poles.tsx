@@ -4,7 +4,8 @@ import { cacheGet, cacheSet } from "@/lib/cache";
 import { getPHTNow } from "@/lib/display-time";
 import { gpsQueueReadAll } from "@/lib/gps-queue";
 import { simpleQueuePush } from "@/lib/simple-queue";
-import { getNodeDetail, getNodePoles, SkycablePole, startNodeTeardown } from "@/services/skycable";
+import { getNodeDetail, getNodePoles, SkycablePole, startNodeTeardown, startPoleTeardown } from "@/services/skycable";
+import * as Location from "expo-location";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import {
@@ -135,136 +136,119 @@ function StaticTileMap({ lat, lng }: { lat: number; lng: number }) {
   );
 }
 
-// ─── Multi-point vicinity map ────────────────────────────────────────────────
-function VicinityMap({
-  locs,
-}: {
-  locs: { lat: number; lng: number; cleared: boolean }[];
-}) {
-  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
-
-  const onLayout = (e: LayoutChangeEvent) => {
-    const { width, height } = e.nativeEvent.layout;
-    setSize({ w: width, h: height });
-  };
-
-  if (!locs.length) {
-    return <View style={StyleSheet.absoluteFillObject} onLayout={onLayout} />;
-  }
-
-  const lats = locs.map(l => l.lat);
-  const lngs = locs.map(l => l.lng);
-
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const minLng = Math.min(...lngs);
-  const maxLng = Math.max(...lngs);
-
-  // Centroid — centers on where poles cluster, not skewed by outliers
-  const centerLat = lats.reduce((a, b) => a + b, 0) / lats.length;
-  const centerLng = lngs.reduce((a, b) => a + b, 0) / lngs.length;
-
-  const w = size?.w ?? 320;
-  const h = size?.h ?? 180;
-
-  const latSpan = Math.max(maxLat - minLat, 0.001);
-  const lngSpan = Math.max(maxLng - minLng, 0.001);
-
-  const zLng = Math.log2((w * 0.6 * 360) / (256 * lngSpan));
-  const zLat = Math.log2((h * 0.6 * 180) / (256 * latSpan));
-  const zoom = Math.max(12, Math.min(17, Math.floor(Math.min(zLng, zLat))));
-
-  const { xFrac, yFrac, tileX, tileY } = latLngToTileFrac(centerLat, centerLng, zoom);
-
-  const fracX = xFrac - tileX;
-  const fracY = yFrac - tileY;
-
-  const scale = size ? Math.max(size.w / TILE_PX, size.h / TILE_PX) : 1;
-  const imgW = TILE_PX * scale;
-  const imgH = TILE_PX * scale;
-
-  const offsetX = size ? size.w / 2 - fracX * imgW : 0;
-  const offsetY = size ? size.h / 2 - fracY * imgH : 0;
-
-  const tileBase = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${tileY}`;
-
-  return (
-    <View style={StyleSheet.absoluteFillObject} onLayout={onLayout}>
-      <Image
-        source={{ uri: `${tileBase}/${tileX - 1}` }}
-        style={{
-          position: "absolute",
-          left: offsetX - imgW,
-          top: offsetY,
-          width: imgW,
-          height: imgH,
-        }}
-        resizeMode="cover"
-      />
-      <Image
-        source={{ uri: `${tileBase}/${tileX}` }}
-        style={{
-          position: "absolute",
-          left: offsetX,
-          top: offsetY,
-          width: imgW,
-          height: imgH,
-        }}
-        resizeMode="cover"
-      />
-      <Image
-        source={{ uri: `${tileBase}/${tileX + 1}` }}
-        style={{
-          position: "absolute",
-          left: offsetX + imgW,
-          top: offsetY,
-          width: imgW,
-          height: imgH,
-        }}
-        resizeMode="cover"
-      />
-
-      {size &&
-        locs.map((p, i) => {
-          const { xFrac: px, yFrac: py } = latLngToTileFrac(p.lat, p.lng, zoom);
-          const left = offsetX + (px - tileX) * imgW - 5;
-          const top = offsetY + (py - tileY) * imgH - 5;
-
-          return (
-            <View
-              key={i}
-              style={{
-                position: "absolute",
-                left,
-                top,
-                width: 10,
-                height: 10,
-                borderRadius: 5,
-                backgroundColor: p.cleared ? "#10b981" : "#f59e0b",
-                borderWidth: 1.5,
-                borderColor: "#FFFFFF",
-              }}
-            />
-          );
-        })}
-    </View>
-  );
-}
-
-// ─── Full Leaflet map HTML for WebView preview ───────────────────────────────
-function buildPolesMapHtml(
-  poles: { lat: number; lng: number; cleared: boolean; code: string }[]
-): string {
-  const data = JSON.stringify(poles);
-
+// ─── Multi-point vicinity map (WebView Leaflet) ──────────────────────────────
+function buildVicinityMapHtml(locs: { lat: number; lng: number; cleared: boolean }[]): string {
+  const locsJson = JSON.stringify(locs);
   return `<!DOCTYPE html><html><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;}
-html,body,#map{width:100%;height:100%;background:#f8fafc;}
-.leaflet-container{background:#f8fafc;font-family:system-ui,-apple-system,sans-serif;}
+html,body,#map{width:100%;height:100%;overflow:hidden;background:#1a1a2e;}
+.leaflet-container{width:100%;height:100%;background:#1a1a2e;}
+.pp{width:9px;height:9px;border-radius:50%;border:1.5px solid rgba(255,255,255,0.95);box-shadow:0 2px 6px rgba(0,0,0,.5);}
+</style>
+</head><body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function(){
+  var locs=${locsJson};
+  var map=L.map('map',{zoomControl:false,attributionControl:false,dragging:false,scrollWheelZoom:false,doubleClickZoom:false,touchZoom:false,keyboard:false}).setView([14.5995,120.9842],13);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19}).addTo(map);
+  if(!locs.length)return;
+  var bounds=[];
+  locs.forEach(function(l){
+    var c=l.cleared?'#10b981':'#f59e0b';
+    L.marker([l.lat,l.lng],{icon:L.divIcon({className:'',html:'<div class="pp" style="background:'+c+'"></div>',iconSize:[9,9],iconAnchor:[4,4]})}).addTo(map);
+    bounds.push([l.lat,l.lng]);
+  });
+  setTimeout(function(){
+    map.invalidateSize();
+    if(bounds.length>1)map.fitBounds(bounds,{padding:[24,24],maxZoom:17});
+    else if(bounds.length===1)map.setView(bounds[0],17);
+  },200);
+})();
+</script>
+</body></html>`;
+}
+
+function VicinityMap({
+  locs,
+}: {
+  locs: { lat: number; lng: number; cleared: boolean }[];
+}) {
+  if (!locs.length) {
+    return <View style={StyleSheet.absoluteFillObject} />;
+  }
+
+  const mapKey = `${locs.length}-${locs[0]?.lat}-${locs[locs.length - 1]?.lat}`;
+  const html = buildVicinityMapHtml(locs);
+
+  return (
+    <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+      <WebView
+        key={mapKey}
+        source={{ html, baseUrl: "https://gis-pole-map.local/" }}
+        style={{ flex: 1 }}
+        originWhitelist={["*"]}
+        scrollEnabled={false}
+        javaScriptEnabled
+        domStorageEnabled
+        mixedContentMode="always"
+        allowFileAccess
+        allowUniversalAccessFromFileURLs
+        cacheEnabled={false}
+        androidLayerType="hardware"
+        textZoom={100}
+        setSupportMultipleWindows={false}
+      />
+    </View>
+  );
+}
+
+// ─── Full Leaflet map HTML for WebView preview ───────────────────────────────
+// Copied from explore.tsx buildBaseMapHtml — same init pattern that's proven to work
+function buildPolesMapHtml(): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body,#map{
+  width:100%;
+  height:100%;
+  overflow:hidden;
+  background:#0d1117;
+}
+.leaflet-container{
+  width:100%;
+  height:100%;
+  background:#0d1117;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+#fallback{
+  position:absolute;
+  inset:0;
+  z-index:999;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:24px;
+  background:#0d1117;
+  color:#94a3b8;
+  font-size:13px;
+  font-weight:800;
+  pointer-events:none;
+}
+#fallback.ready{
+  display:none;
+}
 .pp{
   width:13px;
   height:13px;
@@ -272,138 +256,130 @@ html,body,#map{width:100%;height:100%;background:#f8fafc;}
   border:2px solid rgba(255,255,255,0.98);
   box-shadow:0 0 0 1px rgba(15,23,42,0.15),0 5px 12px rgba(0,0,0,0.35);
 }
-.popup-wrap{min-width:140px;}
-.popup-title{font-size:13px;font-weight:900;color:#111827;}
-.popup-badge{
-  margin-top:6px;
-  display:inline-block;
-  padding:3px 8px;
-  border-radius:999px;
-  font-size:10px;
-  font-weight:900;
-}
+.pw{min-width:170px;font-family:system-ui,sans-serif;}
+.pt{font-size:13px;font-weight:900;color:#111827;margin-bottom:5px;}
+.pb{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:800;}
+.pstart{margin-top:8px;width:100%;padding:7px 0;border-radius:8px;background:#0B7A5A;color:#fff;font-size:12px;font-weight:900;border:none;cursor:pointer;}
 .leaflet-popup-content-wrapper{
-  border-radius:14px;
-  box-shadow:0 10px 24px rgba(0,0,0,0.15);
+  border-radius:16px;
+  background:#ffffff;
+  color:#111827;
+  border:1px solid rgba(15,23,42,0.08);
+  box-shadow:0 12px 28px rgba(0,0,0,0.16);
 }
+.leaflet-popup-content{margin:12px 14px;}
+.leaflet-popup-tip{background:#ffffff;}
+@keyframes gps-pulse{0%{opacity:0.7;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4)}}
 </style>
-</head><body>
+</head>
+<body>
 <div id="map"></div>
+<div id="fallback">Loading Map...</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-window.bootMap=function(){
-  var map=L.map("map",{zoomControl:false,attributionControl:false,preferCanvas:true});
-  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{maxZoom:19}).addTo(map);
+(function(){
+  var map = null;
+  var markerGroup = null;
+  var PH_CENTER = [14.5995, 120.9842];
 
-  var poles=${data};
-  var bounds=[];
+  function post(data){
+    try{
+      if(window.ReactNativeWebView){
+        window.ReactNativeWebView.postMessage(JSON.stringify(data));
+      }
+    }catch(e){}
+  }
 
-  poles.forEach(function(p){
-    if(typeof p.lat === "number" && typeof p.lng === "number" && p.lat !== 0) {
-      var color=p.cleared?"#10b981":"#f59e0b";
-      var label=p.cleared?"Completed":"Pending";
-      var icon=L.divIcon({
-        className:"",
-        html:'<div class="pp" style="background:'+color+'"></div>',
-        iconSize:[13,13],
-        iconAnchor:[6,6]
+  function hideFallback(){
+    var el = document.getElementById("fallback");
+    if(el) el.className = "ready";
+  }
+
+  function validLatLng(lat,lng){
+    lat = Number(lat); lng = Number(lng);
+    return Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+  }
+
+  // Store poles by index so onclick never needs string escaping
+  var _store = {};
+  window._tap = function(i){
+    var p = _store[i];
+    if(p) post({type:'start', pole_id:p.pole_id, id:p.id, code:p.code});
+  };
+
+  window.setPoles = function(poles){
+    if(!map || !markerGroup) return;
+    markerGroup.clearLayers();
+    _store = {};
+    var bounds = [];
+    poles.forEach(function(p, i){
+      if(!validLatLng(p.lat, p.lng)) return;
+      _store[i] = p;
+      var c = p.status==='cleared' ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
+      var lbl = p.status==='cleared' ? 'Completed' : p.status==='in_progress' ? 'Ongoing' : 'Pending';
+      var icon = L.divIcon({
+        className: "",
+        html: '<div class="pp" style="background:'+c+'"></div>',
+        iconSize: [13,13],
+        iconAnchor: [6,6]
       });
+      var btn = p.status!=='cleared'
+        ? '<button class="pstart" onclick="window._tap('+i+')">Start Teardown</button>'
+        : '';
+      var pop = '<div class="pw"><div class="pt">'+p.code+'</div><div class="pb" style="background:'+c+'22;color:'+c+'"><span style="width:6px;height:6px;border-radius:50%;background:'+c+';display:inline-block;margin-right:4px"></span>'+lbl+'</div>'+btn+'</div>';
+      L.marker([p.lat, p.lng], {icon: icon}).addTo(markerGroup).bindPopup(pop);
+      bounds.push([p.lat, p.lng]);
+    });
+    setTimeout(function(){
+      map.invalidateSize(true);
+      if(bounds.length > 1) map.fitBounds(bounds, {padding:[50,50], maxZoom:18});
+      else if(bounds.length === 1) map.setView(bounds[0], 17);
+    }, 300);
+  };
 
-      L.marker([p.lat,p.lng],{icon:icon})
-        .addTo(map)
-        .bindPopup(
-          '<div class="popup-wrap">' +
-            '<div class="popup-title">'+p.code+'</div>' +
-            '<div class="popup-badge" style="background:'+color+'22;color:'+color+'">'+label+'</div>' +
-          '</div>'
-        );
+  function init(){
+    if(map) return;
+    map = L.map("map", {zoomControl:true, attributionControl:false, preferCanvas:true}).setView(PH_CENTER, 13);
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {maxZoom:19}).addTo(map);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png", {maxZoom:21, opacity:0.9, subdomains:"abcd"}).addTo(map);
+    markerGroup = L.layerGroup().addTo(map);
+    hideFallback();
+    post({type:"MAP_READY"});
+    // User location + compass arrow — injected from React Native via setLoc/setHdg
+    var _userMarker = null;
+    var _locIcon = L.divIcon({
+      className:'',
+      html:'<div style="position:relative;width:28px;height:28px;display:flex;align-items:center;justify-content:center;">'
+        +'<div style="position:absolute;width:46px;height:46px;border-radius:50%;background:rgba(37,99,235,0.18);top:50%;left:50%;animation:gps-pulse 1.8s ease-out infinite;"></div>'
+        +'<div id="u-arrow" style="display:flex;align-items:center;justify-content:center;transform:rotate(0deg);transition:transform 0.3s;">'
+        +'<svg width="22" height="22" viewBox="0 0 24 24"><polygon points="12,2 20,22 12,17 4,22" fill="#2563EB" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"/></svg>'
+        +'</div></div>',
+      iconSize:[28,28], iconAnchor:[14,14]
+    });
+    window.setLoc = function(lat, lng){
+      if(!map) return;
+      if(!_userMarker){
+        _userMarker = L.marker([lat,lng],{icon:_locIcon,zIndexOffset:999}).addTo(map);
+      } else {
+        _userMarker.setLatLng([lat,lng]);
+      }
+    };
+    window.setHdg = function(deg){
+      var el = document.getElementById('u-arrow');
+      if(el) el.style.transform = 'rotate('+deg+'deg)';
+    };
+  }
 
-      bounds.push([p.lat,p.lng]);
-    }
-  });
-
-  setTimeout(function(){
-    map.invalidateSize(true);
-    if(bounds.length===1){
-      map.setView(bounds[0],17);
-    } else if(bounds.length>1){
-      map.fitBounds(bounds,{padding:[48,48],maxZoom:18});
-    } else {
-      map.setView([12.8797,121.774],6);
-    }
-  }, 250);
-};
+  window.onload = init;
+  setTimeout(init, 1000);
+})();
 </script>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onload="bootMap()"></script>
-</body></html>`;
-}
-
-// ─── Map Preview Modal ───────────────────────────────────────────────────────
-function MapPreviewModal({
-  visible,
-  onClose,
-  poles,
-  nodeName,
-}: {
-  visible: boolean;
-  onClose: () => void;
-  poles: { lat: number; lng: number; cleared: boolean; code: string }[];
-  nodeName: string;
-}) {
-  const html = useMemo(() => buildPolesMapHtml(poles), [poles]);
-  const insets = useSafeAreaInsets();
-  const completedCount = poles.filter(p => p.cleared).length;
-
-  return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <View style={{ flex: 1, backgroundColor: "#F8FAFC", position: "relative" }}>
-        <View style={StyleSheet.absoluteFillObject}>
-          <WebView
-            source={{ html }}
-            style={{ flex: 1, backgroundColor: "#F8FAFC" }}
-            originWhitelist={["*"]}
-            javaScriptEnabled
-            domStorageEnabled
-            scrollEnabled={false}
-            mixedContentMode="always"
-            androidLayerType="hardware"
-            cacheEnabled={false}
-          />
-        </View>
-
-        <View style={[mp.floatingTopCard, { top: Math.max(insets.top + 8, 12) }]}>
-          <View style={mp.headerTopRow}>
-            <View style={mp.titleWrap}>
-              <Text style={mp.title}>{nodeName}</Text>
-              <Text style={mp.subtitle}>
-                {poles.length} poles · {completedCount} completed ↻
-              </Text>
-            </View>
-
-            <TouchableOpacity style={mp.closeBtn} onPress={onClose} activeOpacity={0.7}>
-              <X size={18} color="#64748B" />
-            </TouchableOpacity>
-          </View>
-
-          <View style={mp.dropdownRow}>
-            <View style={mp.dropdown}>
-              <View style={[mp.legendDot, { backgroundColor: "#10b981" }]} />
-              <Text style={mp.dropdownLabel}>COMPLETED</Text>
-              <Text style={[mp.dropdownText, { color: "#10b981" }]}>{completedCount}</Text>
-            </View>
-
-            <View style={mp.dropdown}>
-              <View style={[mp.legendDot, { backgroundColor: "#f59e0b" }]} />
-              <Text style={mp.dropdownLabel}>PENDING</Text>
-              <Text style={[mp.dropdownText, { color: "#f59e0b" }]}>{poles.length - completedCount}</Text>
-            </View>
-          </View>
-        </View>
-      </View>
-    </Modal>
-  );
+</body>
+</html>`;
 }
 
 const mp = StyleSheet.create({
+  // ── Top card — exact match of explore.tsx floatingTopCard ──
   floatingTopCard: {
     position: "absolute",
     left: 16,
@@ -443,10 +419,10 @@ const mp = StyleSheet.create({
     marginTop: 2,
   },
   closeBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    backgroundColor: "transparent",
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#F1F5F9",
     alignItems: "center",
     justifyContent: "center",
   },
@@ -457,36 +433,82 @@ const mp = StyleSheet.create({
   },
   dropdown: {
     flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
+    minHeight: 38,
+    paddingHorizontal: 10,
+    borderRadius: 999,
     backgroundColor: "#FFFFFF",
-    borderRadius: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
     borderWidth: 1,
     borderColor: "#E2E8F0",
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.04,
-    shadowRadius: 4,
-    elevation: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 4,
   },
   legendDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
+    width: 7,
+    height: 7,
+    borderRadius: 999,
   },
   dropdownLabel: {
     fontSize: 9,
-    fontWeight: "900",
+    fontWeight: "800",
     color: "#94A3B8",
-    letterSpacing: 0.5,
+    textTransform: "uppercase",
   },
-  dropdownText: {
+  dropdownValue: {
     fontSize: 12,
     fontWeight: "900",
     marginLeft: "auto",
+  },
+
+  // ── Bottom card — exact match of explore.tsx floatingNoGpsCard ──
+  floatingBottomCard: {
+    position: "absolute",
+    left: 16,
+    right: 16,
+    bottom: 40,
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: "rgba(255, 255, 255, 0.88)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.9)",
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 18,
+    elevation: 7,
+    zIndex: 8,
+  },
+  bottomTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0F172A",
+    marginBottom: 8,
+  },
+  badgeRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    justifyContent: "center",
+  },
+  glassBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  badgeDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  badgeText: {
+    fontSize: 11,
+    fontWeight: "900",
   },
 });
 
@@ -665,6 +687,65 @@ export default function PolesScreen() {
 
   const [mapPreviewVisible, setMapPreviewVisible] = useState(false);
 
+  // ── Inline map overlay (WebView always mounted so CDN loads in background) ─
+  const insets = useSafeAreaInsets();
+  const mapWvRef = useRef<any>(null);
+  const [mapHtml] = useState(() => buildPolesMapHtml());
+  const [mapReady, setMapReady] = useState(false);
+  // Cache last known position/heading so we can inject immediately on MAP_READY
+  const lastPosRef = useRef<{ lat: number; lng: number } | null>(null);
+  const lastHdgRef = useRef<number>(0);
+  // Always-current ref for mapPolePins so MAP_READY never reads a stale closure
+  const mapPolePinsRef = useRef(mapPolePins);
+
+  // Keep ref in sync so MAP_READY handler always uses the latest poles
+  mapPolePinsRef.current = mapPolePins;
+
+  useEffect(() => {
+    if (!mapPreviewVisible) setMapReady(false);
+  }, [mapPreviewVisible]);
+
+  useEffect(() => {
+    if (!mapReady || !mapPreviewVisible) return;
+    const j = JSON.stringify(mapPolePins);
+    mapWvRef.current?.injectJavaScript(`if(window.setPoles)window.setPoles(${j});true;`);
+  }, [mapReady, mapPolePins, mapPreviewVisible]);
+
+  // ── Live GPS position + native compass heading → injected into map WebView ─
+  useEffect(() => {
+    let posSub: Location.LocationSubscription | null = null;
+    let hdgSub: Location.LocationSubscription | null = null;
+
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== "granted") return;
+
+        posSub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1500, distanceInterval: 1 },
+          loc => {
+            const { latitude: lat, longitude: lng } = loc.coords;
+            lastPosRef.current = { lat, lng };
+            mapWvRef.current?.injectJavaScript(`if(window.setLoc)window.setLoc(${lat},${lng});true;`);
+          }
+        );
+
+        if (typeof (Location as any).watchHeadingAsync === "function") {
+          hdgSub = await (Location as any).watchHeadingAsync((h: any) => {
+            const deg = h.trueHeading ?? h.magHeading ?? 0;
+            lastHdgRef.current = deg;
+            mapWvRef.current?.injectJavaScript(`if(window.setHdg)window.setHdg(${deg});true;`);
+          });
+        }
+      } catch {}
+    })();
+
+    return () => {
+      posSub?.remove();
+      hdgSub?.remove();
+    };
+  }, []);
+
   // ── Add Pole modal (pole_report only) ────────────────────────────────────
   const [addPoleVisible, setAddPoleVisible]     = useState(false);
   const [newPoleCode, setNewPoleCode]           = useState("");
@@ -751,22 +832,30 @@ export default function PolesScreen() {
         // Always fetch fresh from API regardless of cache
         getNodePoles(Number(nodeId), token)
           .then(async data => {
-            // Preserve locally cached coordinates if the server response is missing or stale
             const enhancedData = data.map(freshPole => {
-              if (!freshPole.pole?.lat || !freshPole.pole?.lng) {
-                const cachedMatch = cached?.find(c => String(c.pole_id) === String(freshPole.pole_id));
+              const cachedMatch = cached?.find(c => String(c.pole_id) === String(freshPole.pole_id));
+              let result = { ...freshPole };
+
+              // Preserve locally cached GPS coordinates if server response is missing
+              if (!result.pole?.lat || !result.pole?.lng) {
                 if (cachedMatch?.pole?.lat && cachedMatch?.pole?.lng) {
-                  return {
-                    ...freshPole,
-                    pole: {
-                      ...freshPole.pole,
-                      lat: cachedMatch.pole.lat,
-                      lng: cachedMatch.pole.lng,
-                    },
-                  };
+                  result = { ...result, pole: { ...result.pole, lat: cachedMatch.pole.lat, lng: cachedMatch.pole.lng } };
                 }
               }
-              return freshPole;
+
+              // Preserve in_progress status when:
+              // • cache says the pole was started (date_start set + in_progress)
+              // • backend still returns pending (update in-flight or queued offline)
+              // This prevents the "blink back to pending" on return from pole-detail.
+              if (result.pole?.skycable_status === "pending" && cachedMatch?.date_start && cachedMatch?.pole?.skycable_status === "in_progress") {
+                result = {
+                  ...result,
+                  date_start: cachedMatch.date_start,
+                  pole: { ...result.pole, skycable_status: "in_progress" as const },
+                };
+              }
+
+              return result;
             });
             const merged = await mergeGps(enhancedData);
             cacheSet(CACHE_KEY, merged).catch(() => {});
@@ -817,8 +906,10 @@ export default function PolesScreen() {
         .map(p => ({
           lat: parseFloat(p.pole.lat),
           lng: parseFloat(p.pole.lng),
-          cleared: p.pole.skycable_status === "cleared",
+          status: p.pole.skycable_status ?? "pending",
           code: p.pole.pole_code ?? "Pole",
+          id: p.id,
+          pole_id: p.pole.id,
         })),
     [poles]
   );
@@ -967,7 +1058,7 @@ export default function PolesScreen() {
   }
 
   return (
-    <>
+    <View style={{ flex: 1 }}>
       <Stack.Screen options={{ headerShown: false }} />
       <StatusBar barStyle="dark-content" backgroundColor="#F4F6F8" />
 
@@ -981,12 +1072,128 @@ export default function PolesScreen() {
         onLater={dismissGate}
       />
 
-      <MapPreviewModal
-        visible={mapPreviewVisible}
-        onClose={() => setMapPreviewVisible(false)}
-        poles={mapPolePins}
-        nodeName={nodeName || "Node"}
-      />
+      {/* ── Always-mounted map overlay — WebView kept alive so CDN loads in background ── */}
+      <View
+        style={[StyleSheet.absoluteFillObject, { zIndex: mapPreviewVisible ? 99 : -1, opacity: mapPreviewVisible ? 1 : 0 }]}
+        pointerEvents={mapPreviewVisible ? "auto" : "none"}
+      >
+        <View style={[StyleSheet.absoluteFillObject, { backgroundColor: "#0d1117" }]}>
+          <WebView
+            ref={mapWvRef}
+            key={`pm-${nodeId}-${mapPolePins.length}`}
+            source={{ html: mapHtml, baseUrl: "https://gis-pole-map.local/" }}
+            style={{ flex: 1 }}
+            originWhitelist={["*"]}
+            scrollEnabled={false}
+            javaScriptEnabled
+            domStorageEnabled
+            geolocationEnabled
+            mixedContentMode="always"
+            allowFileAccess
+            allowUniversalAccessFromFileURLs
+            cacheEnabled={true}
+            androidLayerType="hardware"
+            textZoom={100}
+            setSupportMultipleWindows={false}
+            onMessage={e => {
+              try {
+                const msg = JSON.parse(e.nativeEvent.data);
+                if (msg.type === "MAP_READY") {
+                  setMapReady(true);
+                  // Use ref — never reads a stale closure value
+                  const j = JSON.stringify(mapPolePinsRef.current);
+                  mapWvRef.current?.injectJavaScript(`if(window.setPoles)window.setPoles(${j});true;`);
+                  // Immediately show current location — don't wait for next watcher tick
+                  if (lastPosRef.current) {
+                    const { lat, lng } = lastPosRef.current;
+                    mapWvRef.current?.injectJavaScript(
+                      `if(window.setLoc)window.setLoc(${lat},${lng});if(window.setHdg)window.setHdg(${lastHdgRef.current});true;`
+                    );
+                  }
+                  return;
+                }
+                if (msg.type === "start") {
+                  setMapPreviewVisible(false);
+
+                  const now = getPHTNow();
+                  const CACHE_KEY = `sitemap_poles_${nodeId}`;
+
+                  // 1. Optimistic local state update
+                  setPoles(prev => {
+                    const updated = prev.map(p =>
+                      p.id === msg.id
+                        ? { ...p, date_start: now, pole: { ...p.pole, skycable_status: "in_progress" as const } }
+                        : p
+                    );
+                    // 2. Write updated list to cache immediately so useFocusEffect
+                    //    reads in_progress on return — not the stale pending value
+                    cacheSet(CACHE_KEY, updated).catch(() => {});
+                    return updated;
+                  });
+
+                  // 3. Backend sync — fire-and-forget; queue if offline
+                  if (nodeId && token) {
+                    startPoleTeardown(Number(nodeId), msg.id, token, now).catch(async (err: any) => {
+                      if (!err?.response?.status) {
+                        await simpleQueuePush({
+                          method: "put",
+                          url: `/skycable/nodes/${nodeId}/poles/${msg.id}`,
+                          body: { date_start: now },
+                        }).catch(() => {});
+                      }
+                    });
+                  }
+
+                  router.push({ pathname: "/teardowns/pole-detail", params: { pole_id: String(msg.pole_id), node_id: nodeId ?? "", node_name: nodeName, report_type: reportType ?? "full_report" } } as any);
+                }
+              } catch {}
+            }}
+          />
+        </View>
+
+        {/* Floating top card */}
+        <View style={[mp.floatingTopCard, { top: Math.max(insets.top + 8, 12) }]}>
+          <View style={mp.headerTopRow}>
+            <View style={mp.titleWrap}>
+              <Text style={mp.title}>{nodeName || "Node"}</Text>
+              <Text style={mp.subtitle}>{mapPolePins.length} poles · {mapPolePins.filter(p => p.status === "cleared").length} completed ↻</Text>
+            </View>
+            <TouchableOpacity style={mp.closeBtn} onPress={() => setMapPreviewVisible(false)} activeOpacity={0.7}>
+              <X size={18} color="#64748B" />
+            </TouchableOpacity>
+          </View>
+          <View style={mp.dropdownRow}>
+            <View style={mp.dropdown}>
+              <View style={[mp.legendDot, { backgroundColor: "#10b981" }]} />
+              <Text style={mp.dropdownLabel}>DONE</Text>
+              <Text style={[mp.dropdownValue, { color: "#10b981" }]}>{mapPolePins.filter(p => p.status === "cleared").length}</Text>
+            </View>
+            <View style={mp.dropdown}>
+              <View style={[mp.legendDot, { backgroundColor: "#6366f1" }]} />
+              <Text style={mp.dropdownLabel}>ONGOING</Text>
+              <Text style={[mp.dropdownValue, { color: "#6366f1" }]}>{mapPolePins.filter(p => p.status === "in_progress").length}</Text>
+            </View>
+            <View style={mp.dropdown}>
+              <View style={[mp.legendDot, { backgroundColor: "#f59e0b" }]} />
+              <Text style={mp.dropdownLabel}>PENDING</Text>
+              <Text style={[mp.dropdownValue, { color: "#f59e0b" }]}>{mapPolePins.filter(p => p.status !== "cleared" && p.status !== "in_progress").length}</Text>
+            </View>
+          </View>
+        </View>
+
+        {/* Bottom no-GPS card */}
+        {poles.filter(p => !p.pole?.lat || !p.pole?.lng).length > 0 && (
+          <View style={mp.floatingBottomCard} pointerEvents="none">
+            <Text style={mp.bottomTitle}>{poles.filter(p => !p.pole?.lat || !p.pole?.lng).length} without GPS</Text>
+            <View style={mp.badgeRow}>
+              <View style={[mp.glassBadge, { backgroundColor: "rgba(255,251,235,0.92)" }]}>
+                <View style={[mp.badgeDot, { backgroundColor: "#f59e0b" }]} />
+                <Text style={[mp.badgeText, { color: "#f59e0b" }]}>{poles.filter(p => !p.pole?.lat || !p.pole?.lng).length} pending</Text>
+              </View>
+            </View>
+          </View>
+        )}
+      </View>
 
       {/* ── Add Pole Modal (pole_report only) ── */}
       <Modal visible={addPoleVisible} transparent animationType="slide" onRequestClose={() => setAddPoleVisible(false)}>
@@ -1444,7 +1651,7 @@ export default function PolesScreen() {
           </View>
         )}
       </SafeAreaView>
-    </>
+    </View>
   );
 }
 

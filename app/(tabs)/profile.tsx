@@ -28,12 +28,20 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { BASE_URL } from "@/lib/api";
+import { cacheSet } from "@/lib/cache";
 import { useRouter } from "expo-router";
+import {
+  processSyncQueue,
+  processImageQueue,
+  queueCount,
+} from "@/lib/sync-queue";
+import { getAreas, getNodes, getNodePoles } from "@/services/skycable";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const API_BASE_URL = BASE_URL;
 
-const HEALTH_ENDPOINT = "/skycable/poles/all";
-const SYNC_ENDPOINT = "/skycable/poles/all";
+const HEALTH_ENDPOINT = "/ping";
+const SYNC_ENDPOINT = "/ping";
 
 type StepStatus = "idle" | "running" | "success" | "error";
 
@@ -87,6 +95,24 @@ export default function ProfileScreen() {
   const [modalTitle, setModalTitle] = React.useState("");
   const [modalSubtitle, setModalSubtitle] = React.useState("");
   const [modalSteps, setModalSteps] = React.useState<ModalStep[]>([]);
+  
+  // Real-time sync tracking
+  const [lastSyncDate, setLastSyncDate] = React.useState("—");
+  const [pendingSyncCount, setPendingSyncCount] = React.useState(0);
+
+  React.useEffect(() => {
+    const checkQueue = async () => {
+      const count = await queueCount();
+      setPendingSyncCount(count);
+      
+      const last = await AsyncStorage.getItem("last_sync_date");
+      if (last) setLastSyncDate(last);
+    };
+    
+    checkQueue();
+    const interval = setInterval(checkQueue, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const initials = (user?.first_name?.[0] ?? "—").toUpperCase();
   const roleLabel = user?.role ?? "Field Staff";
@@ -254,153 +280,93 @@ export default function ProfileScreen() {
   };
 
   const runSyncData = async () => {
-    if (busyAction) return;
+    if (busyAction || !token) return;
+
+    const teamId = (user as any)?.team_id ?? null;
+    const pendingCount = await queueCount();
 
     const steps: ModalStep[] = [
-      {
-        id: "prepare",
-        label: "Preparing sync queue",
-        status: "idle",
-      },
-      {
-        id: "files",
-        label: "Syncing local files",
-        status: "idle",
-      },
-      {
-        id: "reports",
-        label: "Syncing daily reports",
-        status: "idle",
-      },
-      {
-        id: "media",
-        label: "Syncing photos and attachments",
-        status: "idle",
-      },
-      {
-        id: "server",
-        label: "Sending sync request to backend",
-        status: "idle",
-      },
-      {
-        id: "finish",
-        label: "Final sync status",
-        status: "idle",
-      },
+      { id: "upload", label: "Upload pending field reports", status: "idle" },
+      { id: "areas", label: "Fetch areas", status: "idle" },
+      { id: "nodes", label: "Fetch nodes", status: "idle" },
+      { id: "poles", label: "Fetch poles for each node", status: "idle" },
+      { id: "finish", label: "Cache saved — ready for offline", status: "idle" },
     ];
 
     setBusyAction("sync");
-    openProcessModal(
-      "Sync Data",
-      "Syncing files, reports, photos, and pending offline records.",
-      steps
-    );
-
-    let activeStep = "prepare";
+    openProcessModal("Sync Data", "Downloading all data from backend…", steps);
 
     try {
-      activeStep = "prepare";
-      updateStep(activeStep, {
-        status: "running",
-        detail: "Scanning pending offline records...",
-      });
-      await wait(700);
-
-      updateStep(activeStep, {
-        status: "success",
-        detail: "Sync queue prepared.",
-      });
-
-      activeStep = "files";
-      updateStep(activeStep, {
-        status: "running",
-        detail: "Checking local files waiting for upload...",
-      });
-      await wait(900);
-
-      updateStep(activeStep, {
-        status: "success",
-        detail: "Local files checked.",
-      });
-
-      activeStep = "reports";
-      updateStep(activeStep, {
-        status: "running",
-        detail: "Checking daily reports and field records...",
-      });
-      await wait(900);
-
-      updateStep(activeStep, {
-        status: "success",
-        detail: "Reports checked.",
-      });
-
-      activeStep = "media";
-      updateStep(activeStep, {
-        status: "running",
-        detail: "Checking photos, signatures, and attachments...",
-      });
-      await wait(900);
-
-      updateStep(activeStep, {
-        status: "success",
-        detail: "Media files checked.",
-      });
-
-      activeStep = "server";
-      updateStep(activeStep, {
-        status: "running",
-        detail: "Connecting to backend sync endpoint...",
-      });
-
-      if (!API_BASE_URL) {
-        throw new Error("Backend URL is not configured.");
-      }
-
-      const baseUrl = cleanBaseUrl(API_BASE_URL);
-      const syncUrl = `${baseUrl}${SYNC_ENDPOINT}`;
-
-      const response = await fetchWithTimeout(
-        syncUrl,
-        {
-          method: "GET",
-          headers: {
-            Accept: "application/json",
-            "ngrok-skip-browser-warning": "true",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-        },
-        15000
-      );
-
-      updateStep(activeStep, {
-        status: response.ok ? "success" : "error",
-        detail: `Backend sync response: ${response.status}`,
-      });
-
-      activeStep = "finish";
-
-      if (response.ok) {
-        updateStep(activeStep, {
-          status: "success",
-          detail: "Sync completed successfully.",
+      // 1. Upload queue
+      updateStep("upload", { status: "running", detail: pendingCount > 0 ? `Flushing ${pendingCount} pending items…` : "Checking queue…" });
+      if (pendingCount > 0) {
+        const res = await processSyncQueue();
+        await processImageQueue();
+        const remaining = await queueCount();
+        setPendingSyncCount(remaining);
+        updateStep("upload", {
+          status: res.failed > 0 ? "error" : "success",
+          detail: `${res.submitted} submitted${res.failed > 0 ? `, ${res.failed} failed` : ""}`,
         });
       } else {
-        updateStep(activeStep, {
-          status: "error",
-          detail: `Sync request failed with status ${response.status}.`,
-        });
+        updateStep("upload", { status: "success", detail: "Nothing pending — skipped." });
       }
-    } catch (error: any) {
-      updateStep(activeStep, {
-        status: "error",
-        detail: getErrorMessage(error),
-      });
+
+      // 2. Fetch areas
+      updateStep("areas", { status: "running", detail: "Fetching from server…" });
+      const areas = await getAreas(token, teamId);
+      const areasCacheKey = teamId ? `sitemap_areas_team_${teamId}` : "sitemap_areas";
+      await cacheSet(areasCacheKey, areas);
+      updateStep("areas", { status: "success", detail: `${areas.length} area${areas.length !== 1 ? "s" : ""} cached.` });
+
+      // 3. Fetch nodes for every area
+      updateStep("nodes", { status: "running", detail: "Fetching nodes…" });
+      let totalNodes = 0;
+      const allNodes: { areaId: number; nodes: any[] }[] = [];
+      for (const area of areas) {
+        const res = await getNodes(area.id, token, teamId);
+        const nodes = res.data;
+        await cacheSet(`sitemap_nodes_${area.id}`, nodes);
+        allNodes.push({ areaId: area.id, nodes });
+        totalNodes += nodes.length;
+        updateStep("nodes", { status: "running", detail: `${totalNodes} nodes fetched…` });
+      }
+      updateStep("nodes", { status: "success", detail: `${totalNodes} node${totalNodes !== 1 ? "s" : ""} cached.` });
+
+      // 4. Fetch poles for every node (chunked 5 at a time)
+      updateStep("poles", { status: "running", detail: "Fetching poles…" });
+      let totalPoles = 0;
+      const allNodesList = allNodes.flatMap(a => a.nodes);
+      const chunkSize = 5;
+      for (let i = 0; i < allNodesList.length; i += chunkSize) {
+        const chunk = allNodesList.slice(i, i + chunkSize);
+        await Promise.all(chunk.map(async (node) => {
+          try {
+            const poles = await getNodePoles(node.id, token);
+            await cacheSet(`sitemap_poles_${node.id}`, poles);
+            totalPoles += poles.length;
+          } catch {
+            // Non-fatal — continue with other nodes
+          }
+        }));
+        updateStep("poles", { status: "running", detail: `${Math.min(i + chunkSize, allNodesList.length)}/${allNodesList.length} nodes done…` });
+      }
+      updateStep("poles", { status: "success", detail: `${totalPoles} pole${totalPoles !== 1 ? "s" : ""} cached.` });
+
+      // 5. Save last sync timestamp
+      const now = new Date();
+      const formatted = `${now.getMonth() + 1}/${now.getDate()} ${now.getHours()}:${now.getMinutes().toString().padStart(2, "0")}`;
+      setLastSyncDate(formatted);
+      await AsyncStorage.setItem("last_sync_date", formatted);
 
       updateStep("finish", {
+        status: "success",
+        detail: `${areas.length} areas · ${totalNodes} nodes · ${totalPoles} poles ready offline.`,
+      });
+    } catch (error: any) {
+      updateStep("finish", {
         status: "error",
-        detail:
-          "Sync did not complete. Check backend URL, sync endpoint, or auth requirements.",
+        detail: error?.message || "Sync failed. Check connection.",
       });
     } finally {
       setBusyAction(null);
@@ -501,14 +467,17 @@ export default function ProfileScreen() {
     {
       icon: <User size={22} color="#374151" />,
       label: "Delivery\nStatus",
+      onPress: () => router.push("/delivery" as any),
     },
     {
       icon: <Settings size={22} color="#374151" />,
       label: "Warehouse",
+      onPress: () => router.push("/warehouse" as any),
     },
     {
       icon: <Shield size={22} color="#374151" />,
       label: "Daily\nReports",
+      onPress: () => router.push("/daily-report" as any),
     },
     {
       icon: <Bell size={22} color="#374151" />,
@@ -521,7 +490,7 @@ export default function ProfileScreen() {
         ) : (
           <RefreshCw size={22} color="#374151" />
         ),
-      label: busyAction === "sync" ? "Syncing..." : "Sync Data",
+      label: busyAction === "sync" ? "Syncing..." : "Download\nData",
       onPress: runSyncData,
     },
   ];
@@ -622,7 +591,7 @@ export default function ProfileScreen() {
         <View style={styles.statsCard}>
           <View style={styles.statItem}>
             <Text style={styles.statLabel}>Pending Sync</Text>
-            <Text style={[styles.statValue, { color: "#EF4444" }]}>0</Text>
+            <Text style={[styles.statValue, { color: pendingSyncCount > 0 ? "#EF4444" : "#374151" }]}>{pendingSyncCount}</Text>
             <Text style={styles.statSub}>items</Text>
           </View>
 
@@ -630,7 +599,7 @@ export default function ProfileScreen() {
 
           <View style={styles.statItem}>
             <Text style={styles.statLabel}>Sync Status</Text>
-            <Text style={[styles.statValue, { color: "#374151" }]}>—</Text>
+            <Text style={[styles.statValue, { color: "#374151", fontSize: 16 }]}>{lastSyncDate}</Text>
             <Text style={styles.statSub}>last sync</Text>
           </View>
 
@@ -702,7 +671,7 @@ export default function ProfileScreen() {
             <View style={styles.modalHeader}>
               <View style={styles.modalHeaderIcon}>
                 {busyAction === "sync" ? (
-                  <RefreshCw size={24} color="#0B7A5A" />
+                  <HardDrive size={24} color="#0B7A5A" />
                 ) : busyAction === "network" ? (
                   <Wifi size={24} color="#0B7A5A" />
                 ) : (

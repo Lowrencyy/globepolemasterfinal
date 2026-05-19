@@ -4,6 +4,22 @@ import { tokenStore } from "@/lib/token";
 import { setBridgeToken } from "@/lib/token-bridge";
 import { startNetSync, stopNetSync, setNetSyncToken } from "@/lib/net-sync";
 import { startLocationTracking, stopLocationTracking } from "@/lib/location-tracker";
+import { clearAllCache, cacheSet } from "@/lib/cache";
+import { clearAllQueues } from "@/lib/sync-queue";
+import { getAreas } from "@/services/skycable";
+
+// Prefetch teardown areas right after login/rehydration so the
+// teardown screen always has data even on the very first navigation.
+async function prefetchCoreData(token: string, user: GlobeUser) {
+  try {
+    const teamId = (user as any)?.team_id ?? null;
+    const cacheKey = teamId ? `sitemap_areas_team_${teamId}` : "sitemap_areas";
+    const areas = await getAreas(token, teamId);
+    await cacheSet(cacheKey, areas);
+  } catch {
+    // Silent — prefetch is best-effort, screen will retry on mount
+  }
+}
 
 type AuthContextType = {
   isLoggedIn: boolean;
@@ -40,20 +56,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const isNew = await tokenStore.isNewInstall();
       if (isNew) {
         await tokenStore.clear();
+        await clearAllCache();
+        await clearAllQueues();
         await tokenStore.markInstalled();
         return; // isLoggedIn stays false → redirected to login
       }
 
       const saved = await tokenStore.get();
+      const savedUser = await tokenStore.getUser();
+
       if (saved) {
         setToken(saved);
         setBridgeToken(saved);
         setNetSyncToken(saved);
         startNetSync();
         startLocationTracking();
+        // Prefetch teardown areas in background so they're cached before first navigation
+        if (savedUser) prefetchCoreData(saved, savedUser).catch(() => {});
       }
 
-      const savedUser = await tokenStore.getUser();
       if (savedUser) {
         setUser(savedUser);
         if (savedUser.password_reset_required) setMustChangePassword(true);
@@ -73,6 +94,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     startLocationTracking();
     await tokenStore.set(res.token);
     await tokenStore.setUser(res.user);
+    // Prefetch teardown areas immediately after login so cache is warm
+    prefetchCoreData(res.token, res.user).catch(() => {});
     return { mustChangePassword: needsReset };
   }
 

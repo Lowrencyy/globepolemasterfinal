@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 import {
+  ActivityIndicator,
   View,
   Text,
   StyleSheet,
@@ -13,7 +14,9 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { ChevronLeft } from "lucide-react-native";
-import { FAKE_LOGS, SpanVicinityMap } from "./[date]";
+import { SpanVicinityMap, type TeardownLog } from "./[date]";
+import api from "@/lib/api";
+import { useEffect } from "react";
 
 const GREEN = "#0B7A5A";
 const BLUE = "#6366F1";
@@ -27,12 +30,49 @@ export default function SpanPreviewScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams();
 
-  const logItem = useMemo(() => {
-    const targetId = Number(id);
-    return FAKE_LOGS.find((l) => l.id === targetId) ?? FAKE_LOGS[0];
+  const [logItem, setLogItem] = useState<TeardownLog | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function fetchDetail() {
+      try {
+        setLoading(true);
+        const { data } = await api.get(`/skycable/teardowns/${id}`);
+        setLogItem(data?.data ?? data);
+      } catch (err) {
+        console.error("Failed to fetch report detail:", err);
+      } finally {
+        setLoading(false);
+      }
+    }
+    if (id) fetchDetail();
   }, [id]);
 
-  if (!logItem) return null;
+  if (loading) {
+    return (
+      <View style={[s.container, { justifyContent: 'center', alignItems: 'center' }]}>
+        <ActivityIndicator size="large" color={GREEN} />
+        <Text style={{ marginTop: 12, color: MUTED, fontWeight: '600' }}>Loading Preview...</Text>
+      </View>
+    );
+  }
+
+  if (!logItem) {
+    return (
+      <SafeAreaView style={s.container}>
+        <View style={s.header}>
+          <TouchableOpacity onPress={() => router.back()} style={s.backBtn}>
+            <ChevronLeft size={22} color={SLATE} />
+          </TouchableOpacity>
+          <Text style={s.title}>Not Found</Text>
+        </View>
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 40 }}>
+           <Text style={{ fontSize: 18, fontWeight: '900', color: SLATE }}>No Daily Report Found</Text>
+           <Text style={{ textAlign: 'center', color: MUTED, marginTop: 8 }}>The requested report record could not be retrieved from the backend.</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   const fromCode = logItem.span?.fromPole?.pole?.pole_code ?? "--";
   const toCode = logItem.span?.toPole?.pole?.pole_code ?? "--";

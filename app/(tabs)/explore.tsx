@@ -339,15 +339,7 @@ function mapApiPoleToPin(row: any, index: number): PolePin {
   };
 }
 
-function buildMapHtml(
-  mode: "nodes" | "poles",
-  payload: unknown[],
-  bounds: number[][],
-): string {
-  const modeJson = safeJson(mode);
-  const payloadJson = safeJson(payload);
-  const boundsJson = safeJson(bounds);
-
+function buildBaseMapHtml(): string {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -360,12 +352,12 @@ html,body,#map{
   width:100%;
   height:100%;
   overflow:hidden;
-  background:#f8fafc;
+  background:#0d1117;
 }
 .leaflet-container{
   width:100%;
   height:100%;
-  background:#f8fafc;
+  background:#0d1117;
   font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 }
 #fallback{
@@ -377,9 +369,8 @@ html,body,#map{
   justify-content:center;
   text-align:center;
   padding:24px;
-  background:#f8fafc;
-  color:#64748b;
-  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:#0d1117;
+  color:#94a3b8;
   font-size:13px;
   font-weight:800;
   pointer-events:none;
@@ -395,7 +386,7 @@ html,body,#map{
   box-shadow:0 0 0 1px rgba(15,23,42,0.15),0 5px 12px rgba(0,0,0,0.35);
 }
 .node-pill{
-  background:#4f46e5;
+  background:#3b82f6;
   color:#ffffff;
   font-size:11px;
   font-weight:900;
@@ -457,22 +448,17 @@ html,body,#map{
 .leaflet-popup-tip{
   background:#ffffff;
 }
-.leaflet-popup-close-button{
-  color:#64748b!important;
-}
 </style>
 </head>
-
 <body>
 <div id="map"></div>
-<div id="fallback">Loading map...</div>
-
+<div id="fallback">Loading Map...</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 (function(){
-  var MODE = ${modeJson};
-  var PAYLOAD = ${payloadJson};
-  var BOUNDS = ${boundsJson};
-  var PH_CENTER = [12.8797,121.7740];
+  var map = null;
+  var markerGroup = null;
+  var PH_CENTER = [14.5995, 120.9842];
 
   function post(data){
     try{
@@ -482,191 +468,71 @@ html,body,#map{
     }catch(e){}
   }
 
-  function fallbackText(text){
-    var el = document.getElementById("fallback");
-    if(el) el.innerHTML = text;
-  }
-
   function hideFallback(){
     var el = document.getElementById("fallback");
     if(el) el.className = "ready";
   }
 
-  function safe(value){
-    var text = String(value === null || value === undefined ? "" : value);
-    var lookup = {
-      "&":"&amp;",
-      "<":"&lt;",
-      ">":"&gt;",
-      '"':"&quot;",
-      "'":"&#39;"
-    };
-    return text.replace(/[&<>"']/g,function(ch){ return lookup[ch]; });
-  }
-
   function validLatLng(lat,lng){
-    lat = Number(lat);
-    lng = Number(lng);
-    return Number.isFinite(lat) &&
-      Number.isFinite(lng) &&
-      lat >= -90 &&
-      lat <= 90 &&
-      lng >= -180 &&
-      lng <= 180 &&
-      !(Math.abs(lat) < 0.000001 && Math.abs(lng) < 0.000001);
+    lat = Number(lat); lng = Number(lng);
+    return Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
   }
 
-  function statusLabel(status){
-    return status === "completed" ? "Completed" : "Pending";
-  }
+  window.updateMap = function(mode, payload, bounds){
+    if(!map || !markerGroup) return;
+    markerGroup.clearLayers();
 
-  function selectNode(nodeName){
-    post({ type:"SELECT_NODE", node:nodeName });
-  }
-
-  window.leafletFailed = function(){
-    fallbackText("Map library failed to load. Check device internet permission / connection.");
-    post({ type:"MAP_ERROR", message:"Leaflet failed to load. Check internet permission or connection." });
-  };
-
-  window.bootMap = function(){
-    if(!window.L){
-      window.leafletFailed();
-      return;
-    }
-
-    try{
-      var map = L.map("map",{
-        zoomControl:false,
-        attributionControl:false,
-        zoomSnap:0.25,
-        preferCanvas:true
-      });
-
-      var tileErrorSent = false;
-
-      var base = L.tileLayer(
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        {
-          maxZoom:19,
-          attribution:"Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
-          crossOrigin:true
-        }
-      );
-
-      base.on("tileerror",function(){
-        if(tileErrorSent) return;
-        tileErrorSent = true;
-        post({ type:"TILE_ERROR", message:"Base map tiles failed to load." });
-      });
-
-      base.addTo(map);
-
-      if(Array.isArray(PAYLOAD)){
-        if(MODE === "nodes"){
-          PAYLOAD.forEach(function(item){
-            if(!validLatLng(item.lat,item.lng)) return;
-
-            var hasPending = Number(item.pending || 0) > 0;
-            var dotColor = hasPending ? "#f59e0b" : "#10b981";
-            var nodeLabel = safe(item.node || "Node");
-
-            var icon = L.divIcon({
-              className:"",
-              html:
-                '<div class="node-pill">' +
-                  '<span class="node-pill-dot" style="background:'+dotColor+'"></span>' +
-                  '<span>'+nodeLabel+'</span>' +
-                '</div>',
-              iconSize:null
-            });
-
-            var marker = L.marker([Number(item.lat),Number(item.lng)],{ icon:icon }).addTo(map);
-
-            marker.on("click",function(){
-              selectNode(item.node);
-            });
-
-            marker.bindPopup(
-              '<div class="popup-wrap">' +
-                '<div class="popup-title">'+nodeLabel+'</div>' +
-                '<div class="popup-sub">'+Number(item.total || 0)+' GPS poles</div>' +
-                '<div class="popup-sub" style="color:#10b981">'+Number(item.completed || 0)+' completed</div>' +
-                '<div class="popup-sub" style="color:#f59e0b">'+Number(item.pending || 0)+' pending</div>' +
-              '</div>'
-            );
+    if(Array.isArray(payload)){
+      payload.forEach(function(item){
+        if(!validLatLng(item.lat, item.lng)) return;
+        var icon;
+        if(mode === "nodes"){
+          var hasPending = Number(item.pending || 0) > 0;
+          var dotColor = hasPending ? "#f59e0b" : "#10b981";
+          icon = L.divIcon({
+            className: "",
+            html: '<div class="node-pill"><span class="node-pill-dot" style="background:'+dotColor+'"></span><span>'+(item.node||"Node")+'</span></div>',
+            iconSize: null
           });
-        }else{
-          PAYLOAD.forEach(function(p){
-            if(!validLatLng(p.lat,p.lng)) return;
-
-            var status = p.status === "completed" ? "completed" : "pending";
-            var color = status === "completed" ? "#10b981" : "#f59e0b";
-
-            var icon = L.divIcon({
-              className:"",
-              html:'<div class="pp" style="background:'+color+'"></div>',
-              iconSize:[13,13],
-              iconAnchor:[6,6]
-            });
-
-            var marker = L.marker([Number(p.lat),Number(p.lng)],{ icon:icon }).addTo(map);
-
-            marker.bindPopup(
-              '<div class="popup-wrap">' +
-                '<div class="popup-title">'+safe(p.pole_code || "Pole")+'</div>' +
-                (p.node ? '<div class="popup-node">'+safe(p.node)+'</div>' : '') +
-                (p.barangay ? '<div class="popup-sub">'+safe(p.barangay)+'</div>' : '') +
-                '<div class="popup-badge" style="background:'+color+'22;color:'+color+'">'+statusLabel(status)+'</div>' +
-              '</div>'
-            );
+        } else {
+          var color = item.status === "completed" ? "#10b981" : "#f59e0b";
+          icon = L.divIcon({
+            className: "",
+            html: '<div class="pp" style="background:'+color+'"></div>',
+            iconSize: [13,13],
+            iconAnchor: [6,6]
           });
         }
-      }
 
-      var fitBounds = [];
+        var marker = L.marker([item.lat, item.lng], {icon: icon}).addTo(markerGroup);
+        if(mode === "nodes"){
+          marker.on("click", function(){ post({type:"SELECT_NODE", node:item.node}); });
+          marker.bindPopup('<div class="popup-wrap"><div class="popup-title">'+item.node+'</div><div class="popup-sub">'+(item.total||0)+' poles</div><div class="popup-sub" style="color:#10b981">'+(item.completed||0)+' completed</div><div class="popup-sub" style="color:#f59e0b">'+(item.pending||0)+' pending</div></div>');
+        } else {
+          marker.bindPopup('<div class="popup-wrap"><div class="popup-title">'+(item.pole_code||"Pole")+'</div>'+(item.node?'<div class="popup-node">'+item.node+'</div>':'')+(item.barangay?'<div class="popup-sub">'+item.barangay+'</div>':'')+'<div class="popup-badge" style="background:'+(item.status==="completed"?"#10b981":"#f59e0b")+'22;color:'+(item.status==="completed"?"#10b981":"#f59e0b")+'">'+(item.status==="completed"?"Completed":"Pending")+'</div></div>');
+        }
+      });
+    }
 
-      if(Array.isArray(BOUNDS)){
-        BOUNDS.forEach(function(pair){
-          if(Array.isArray(pair) && pair.length >= 2 && validLatLng(pair[0],pair[1])){
-            fitBounds.push([Number(pair[0]),Number(pair[1])]);
-          }
-        });
-      }
-
-      if(fitBounds.length === 1){
-        map.setView(fitBounds[0],17);
-      }else if(fitBounds.length > 1){
-        map.fitBounds(fitBounds,{ padding:[48,48], maxZoom:17 });
-      }else{
-        map.setView(PH_CENTER,6);
-      }
-
-      setTimeout(function(){
-        map.invalidateSize(true);
-      },100);
-
-      setTimeout(function(){
-        map.invalidateSize(true);
-        hideFallback();
-        post({
-          type:"MAP_READY",
-          mode:MODE,
-          count:Array.isArray(PAYLOAD) ? PAYLOAD.length : 0
-        });
-      },350);
-    }catch(e){
-      fallbackText("Map failed to render.");
-      post({ type:"MAP_ERROR", message:String(e && e.message ? e.message : e) });
+    if(Array.isArray(bounds) && bounds.length > 0){
+      var validBounds = bounds.filter(function(b){ return validLatLng(b[0], b[1]); });
+      if(validBounds.length === 1) map.setView(validBounds[0], 17);
+      else if(validBounds.length > 1) map.fitBounds(validBounds, {padding:[48,48], maxZoom:17});
     }
   };
+
+  function init(){
+    if(map) return;
+    map = L.map("map", {zoomControl:false, attributionControl:false, preferCanvas:true}).setView(PH_CENTER, 12);
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {maxZoom:19}).addTo(map);
+    markerGroup = L.layerGroup().addTo(map);
+    hideFallback();
+    post({type:"MAP_READY"});
+  }
+
+  window.onload = init;
+  setTimeout(init, 1000); // fallback
 })();
-</script>
-
-<script
-  src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-  onload="bootMap()"
-  onerror="leafletFailed()">
 </script>
 </body>
 </html>`;
@@ -682,6 +548,7 @@ export default function PoleMapScreen() {
   const [loading, setLoading] = useState(true);
   const [fetching, setFetching] = useState(false);
   const [mapIssue, setMapIssue] = useState<string | null>(null);
+  const [isFromCache, setIsFromCache] = useState(false);
 
   const [selectedSite, setSelectedSite] = useState<string>("all");
   const [selectedNode, setSelectedNode] = useState<string>("all");
@@ -696,10 +563,11 @@ export default function PoleMapScreen() {
   const [statusModalVisible, setStatusModalVisible] = useState(false);
   const [searchModalVisible, setSearchModalVisible] = useState(false);
 
-  const [mapHtml, setMapHtml] = useState(() => buildMapHtml("poles", [], []));
+  const [mapReady, setMapReady] = useState(false);
+  const [mapHtml] = useState(() => buildBaseMapHtml());
 
   const fetchPins = useCallback(
-    async (bustCache = false) => {
+    async () => {
       if (!token) {
         setLoading(false);
         return;
@@ -708,15 +576,23 @@ export default function PoleMapScreen() {
       const teamId = user?.team_id ?? null;
       const activeCacheKey = teamId ? `pole_map_pins_team_${teamId}` : CACHE_KEY;
 
-      if (bustCache) {
-        try { await cacheSet(activeCacheKey, null); } catch {}
-      }
-
+      // 1. Instant cache load
       try {
         const cached = await cacheGet<PolePin[]>(activeCacheKey);
         if (cached && cached.length > 0) {
           setPins(cached);
+          setIsFromCache(true);
           setLoading(false);
+        }
+      } catch {}
+
+      // 2. Load persistent filter state
+      try {
+        const savedState = await cacheGet<any>(`pole_map_state_${user?.id || "anon"}`);
+        if (savedState) {
+          if (savedState.selectedSite) setSelectedSite(savedState.selectedSite);
+          if (savedState.selectedNode) setSelectedNode(savedState.selectedNode);
+          if (savedState.selectedStatus) setSelectedStatus(savedState.selectedStatus);
         }
       } catch {}
 
@@ -727,7 +603,6 @@ export default function PoleMapScreen() {
 
         if (teamId) {
           const areas = await getAreas(token, teamId);
-
           const allNodes = (
             await Promise.all(
               areas.map((area) =>
@@ -745,10 +620,7 @@ export default function PoleMapScreen() {
                   poles.map((sp): PolePin => {
                     const lat = sp.pole?.lat ? parseFloat(sp.pole.lat) : null;
                     const lng = sp.pole?.lng ? parseFloat(sp.pole.lng) : null;
-                    const validCoords =
-                      lat !== null &&
-                      lng !== null &&
-                      isValidLatLng(lat, lng);
+                    const validCoords = lat !== null && lng !== null && isValidLatLng(lat, lng);
                     return {
                       id: sp.pole?.id ?? sp.pole_id,
                       pole_code: sp.pole?.pole_code ?? `POLE-${sp.pole_id}`,
@@ -764,7 +636,6 @@ export default function PoleMapScreen() {
                 .catch(() => []),
             ),
           );
-
           all = poleLists.flat();
         } else {
           const { data } = await api.get("/skycable/poles/all");
@@ -772,13 +643,8 @@ export default function PoleMapScreen() {
           all = rows.map(mapApiPoleToPin);
         }
 
-        if (__DEV__) {
-          console.log("PoleMap total pins:", all.length);
-          console.log("PoleMap GPS:", all.filter((p) => p.has_gps).length,
-            "without GPS:", all.filter((p) => !p.has_gps).length);
-        }
-
         setPins(all);
+        setIsFromCache(false);
         await cacheSet(activeCacheKey, all);
       } catch (error) {
         if (__DEV__) console.log("PoleMap fetch failed:", error);
@@ -790,10 +656,20 @@ export default function PoleMapScreen() {
     [token, user],
   );
 
+  // Persistence of filters
+  useEffect(() => {
+    if (user?.id) {
+      cacheSet(`pole_map_state_${user.id}`, {
+        selectedSite,
+        selectedNode,
+        selectedStatus
+      }).catch(() => {});
+    }
+  }, [selectedSite, selectedNode, selectedStatus, user?.id]);
+
   useFocusEffect(
     useCallback(() => {
-      fetchPins(didInitialFetch.current);
-      didInitialFetch.current = true;
+      fetchPins();
     }, [fetchPins]),
   );
 
@@ -934,29 +810,33 @@ export default function PoleMapScreen() {
   }, [selectedSite, selectedNode, statusScopedPins]);
 
   useEffect(() => {
+    if (!mapReady) return;
+
+    let mode: "nodes" | "poles" = "poles";
+    let payload: any[] = [];
+    let bounds: number[][] = [];
+
     if (selectedSite !== "all" && selectedNode === "all") {
-      const bounds = nodeCentroids.map((c) => [c.lat, c.lng]);
-
-      setMapHtml(buildMapHtml("nodes", nodeCentroids, bounds));
-      return;
-    }
-
-    const mappablePoles = gpsPoles
-      .filter((p) => p.lat !== null && p.lng !== null)
-      .map((p) => ({
+      mode = "nodes";
+      payload = nodeCentroids;
+      bounds = nodeCentroids.map((c) => [c.lat, c.lng]);
+    } else {
+      mode = "poles";
+      payload = gpsPoles.map((p) => ({
         id: p.id,
         pole_code: p.pole_code,
-        lat: p.lat as number,
-        lng: p.lng as number,
+        lat: p.lat,
+        lng: p.lng,
         status: normalizeStatus(p.status),
         barangay: p.barangay,
         node: p.node,
       }));
+      bounds = payload.map((p) => [p.lat, p.lng]);
+    }
 
-    const bounds = mappablePoles.map((p) => [p.lat, p.lng]);
-
-    setMapHtml(buildMapHtml("poles", mappablePoles, bounds));
-  }, [selectedSite, selectedNode, gpsPoles, nodeCentroids]);
+    const script = `window.updateMap(${safeJson(mode)}, ${safeJson(payload)}, ${safeJson(bounds)});`;
+    webRef.current?.injectJavaScript(script);
+  }, [mapReady, selectedSite, selectedNode, gpsPoles, nodeCentroids]);
 
   const handleSelectSite = (siteName: string) => {
     setSelectedSite(siteName);
@@ -975,6 +855,7 @@ export default function PoleMapScreen() {
       }
 
       if (parsed.type === "MAP_READY") {
+        setMapReady(true);
         setMapIssue(null);
         return;
       }
@@ -1080,7 +961,7 @@ export default function PoleMapScreen() {
             mixedContentMode="always"
             allowFileAccess
             allowUniversalAccessFromFileURLs
-            cacheEnabled={false}
+            cacheEnabled={true}
             androidLayerType="hardware"
             textZoom={100}
             setSupportMultipleWindows={false}
@@ -1100,7 +981,14 @@ export default function PoleMapScreen() {
       <View style={[s.floatingTopCard, { top: Math.max(insets.top + 8, 12) }]}>
         <View style={s.headerTopRow}>
           <View style={s.titleWrap}>
-            <Text style={s.title}>Site Pole Map Preview</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Text style={s.title}>Site Pole Map Preview</Text>
+              {isFromCache && !fetching && (
+                <View style={{ backgroundColor: "#F59E0B22", borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: "#F59E0B55" }}>
+                  <Text style={{ color: "#F59E0B", fontSize: 9, fontWeight: "700", letterSpacing: 0.5 }}>CACHED</Text>
+                </View>
+              )}
+            </View>
             <Text style={s.subtitle}>
               {loading
                 ? "Indexing poles..."

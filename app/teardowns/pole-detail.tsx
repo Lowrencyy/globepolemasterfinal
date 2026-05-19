@@ -36,6 +36,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import { WebView } from "react-native-webview";
+import { buildPoleMapHtml, StaticTileMap } from "./components";
 
 type PhotoField = {
   uri: string;
@@ -106,77 +107,6 @@ type PoleSlot = {
   expanded: boolean;
 };
 
-function buildPoleMapHtml(lat: number, lng: number, accentColor: string, satellite = false) {
-  const tileUrl = satellite
-    ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-    : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
-  const tileOpts = satellite
-    ? 'maxZoom:19,attribution:""'
-    : 'subdomains:"abcd",maxZoom:20,attribution:""';
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;}
-html,body,#map{width:100%;height:100%;background:#0d1117;}
-.leaflet-div-icon{background:none!important;border:none!important;}
-.leaflet-control-attribution{display:none!important;}
-.leaflet-control-zoom{display:none!important;}
-.pin-wrap{display:flex;flex-direction:column;align-items:center;}
-.pin-ring{
-  width:36px;height:36px;border-radius:50%;
-  background:${accentColor}22;
-  border:2px solid ${accentColor}88;
-  display:flex;align-items:center;justify-content:center;
-  animation:ring-pulse 2s infinite;
-}
-.pin-dot{
-  width:14px;height:14px;border-radius:50%;
-  background:${accentColor};
-  border:2.5px solid #fff;
-  box-shadow:0 2px 8px rgba(0,0,0,0.5);
-}
-@keyframes ring-pulse{
-  0%{box-shadow:0 0 0 0 ${accentColor}55;}
-  70%{box-shadow:0 0 0 16px ${accentColor}00;}
-  100%{box-shadow:0 0 0 0 ${accentColor}00;}
-}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-var map=L.map('map',{
-  zoomControl:false,
-  scrollWheelZoom:false,
-  dragging:true,
-  doubleClickZoom:true,
-  touchZoom:true,
-  attributionControl:false
-}).setView([${lat},${lng}],18);
-
-L.tileLayer('${tileUrl}',{${tileOpts}}).addTo(map);
-
-var icon=L.divIcon({
-  className:'',
-  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div></div>',
-  iconSize:[36,36],
-  iconAnchor:[18,18]
-});
-
-L.marker([${lat},${lng}],{icon:icon}).addTo(map);
-
-setTimeout(function(){
-  map.invalidateSize();
-  map.setView([${lat},${lng}],18);
-}, 250);
-</script>
-</body>
-</html>`;
-}
 
 function sanitize(s?: string) {
   return (s ?? "")
@@ -559,6 +489,8 @@ export default function PoleDetailScreen() {
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
   const [gpsCapturedAt, setGpsCapturedAt] = useState("");
+  // true = GPS came from sitemap APK (valid, no re-capture needed)
+  const [gpsFromSitemap, setGpsFromSitemap] = useState(false);
   const [gpsConfirmModal, setGpsConfirmModal] = useState(false);
   const [gpsSuccessModal, setGpsSuccessModal] = useState(false);
   const [poleLoading, setPoleLoading] = useState(true);
@@ -735,7 +667,20 @@ export default function PoleDetailScreen() {
     // Restore teardown started state.
     // For pole_report: auto-start on first open (no gate needed — lineman
     // just created this pole and navigated here to capture it immediately).
-    cacheGet<{ startedAt: string; startMs?: number }>(teardownStartedKey).then(v => {
+    cacheGet<{ startedAt: string; startMs?: number }>(teardownStartedKey).then(async v => {
+      // If backend reset this pole to 'pending' (e.g. new span added), clear local started-cache
+      // so the Start button shows again even if we previously started it.
+      if (v?.startedAt && node_id) {
+        try {
+          const polesList = await cacheGet<any[]>(`sitemap_poles_${node_id}`);
+          const match = polesList?.find((p) => String(p.pole_id) === String(pole_id));
+          if (match?.pole?.skycable_status === 'pending') {
+            await cacheSet(teardownStartedKey, null).catch(() => {});
+            return; // fall through to show Start button
+          }
+        } catch {}
+      }
+
       if (v?.startedAt) {
         setTeardownStarted(true);
         setPoleStartedAt(v.startedAt);
@@ -800,6 +745,7 @@ export default function PoleDetailScreen() {
           if (match?.pole?.lat && match?.pole?.lng) {
             setLat(parseFloat(match.pole.lat));
             setLng(parseFloat(match.pole.lng));
+            setGpsFromSitemap(true); // sitemap APK pre-placed these coords
           }
         }
       })
@@ -819,22 +765,25 @@ export default function PoleDetailScreen() {
 
     const SPANS_KEY = `spans_pole_${pole_id}`;
     cacheGet<Span[]>(SPANS_KEY).then((cached) => {
-      if (cached?.length) setSpans(cached);
-    });
+      if (cached?.length) {
+        setSpans(cached);
+        return; // Skip background fetch if we have cache
+      }
 
-    api
-      .get(`/skycable/spans?node_id=${node_id}`)
-      .then(({ data }) => {
-        const all: Span[] = Array.isArray(data) ? data : (data?.data ?? []);
-        const list = all.filter(
-          (s) =>
-            String(s.from_pole?.pole?.id) === String(pole_id) ||
-            String(s.to_pole?.pole?.id) === String(pole_id),
-        );
-        cacheSet(SPANS_KEY, list);
-        setSpans(list);
-      })
-      .catch(() => {});
+      api
+        .get(`/skycable/spans?node_id=${node_id}`)
+        .then(({ data }) => {
+          const all: Span[] = Array.isArray(data) ? data : (data?.data ?? []);
+          const list = all.filter(
+            (s) =>
+              String(s.from_pole?.pole?.id) === String(pole_id) ||
+              String(s.to_pole?.pole?.id) === String(pole_id),
+          );
+          cacheSet(SPANS_KEY, list);
+          setSpans(list);
+        })
+        .catch(() => {});
+    });
 
     api
       .get(`/poles/${pole_id}`)
@@ -853,6 +802,8 @@ export default function PoleDetailScreen() {
           };
           setGpsDraftState(draft);
           cacheSet(gpsDraftKey, draft).catch(() => {});
+          // Only mark as sitemap if capturedAt is empty (not a device capture)
+          if (!d.gps_captured_at) setGpsFromSitemap(true);
         }
 
         setPoleLoading(false);
@@ -1214,10 +1165,13 @@ export default function PoleDetailScreen() {
       const file         = tab === "before" ? F.before : tab === "after" ? F.after : F.tag;
 
       // ── Show raw photo immediately so the user sees it right away ──
+      // Stamp a generation number so the background can be cancelled if
+      // the user taps "Retake" before processing finishes.
+      const thisGen = ++captureGenRef.current;
       setter(createPhotoField(photo.uri, file));
       // Release the capture lock now — user can interact again
-      setTimeout(() => { 
-        isCapturingRef.current = false; 
+      setTimeout(() => {
+        isCapturingRef.current = false;
         setPhotoCapturing(false);
       }, 400);
 
@@ -1225,6 +1179,8 @@ export default function PoleDetailScreen() {
       (async () => {
         try {
           const saved = await savePhotoDraft(file, photo.uri, buildStampLines(tab), lat, lng);
+          // Abort if user already retook or cleared the photo
+          if (captureGenRef.current !== thisGen) return;
           setter(saved);
           cacheSet(`photo_captured_at_${pole_id}_${tab}`, capturedAt).catch(() => {});
 
@@ -1236,6 +1192,8 @@ export default function PoleDetailScreen() {
           }
 
           const variance = await checkPhotoQuality(saved.fileUri);
+          // Abort if user already retook or cleared the photo
+          if (captureGenRef.current !== thisGen) return;
           const pct = varianceToPercent(variance);
           qualitySetter(pct);
           cacheSet(
@@ -1314,8 +1272,9 @@ export default function PoleDetailScreen() {
       return;
     }
 
-    // If GPS already captured, trigger custom confirmation modal
-    if (lat !== null && lng !== null) {
+    // If sitemap GPS is set but no device capture yet, capture immediately (don't ask to confirm)
+    // If already captured on device, show confirmation to overwrite
+    if (lat !== null && lng !== null && !gpsFromSitemap) {
       setGpsConfirmModal(true);
       return;
     }
@@ -1345,6 +1304,7 @@ export default function PoleDetailScreen() {
       };
 
       setGpsDraftState(draft);
+      setGpsFromSitemap(false); // actual device capture — overrides sitemap GPS
       await cacheSet(gpsDraftKey, draft).catch(() => {});
 
       // Update the parent poles list cache so the map appears instantly
@@ -1412,6 +1372,9 @@ export default function PoleDetailScreen() {
     });
   const [blurWarning, setBlurWarning] = useState(false);
   const [photoCapturing, setPhotoCapturing] = useState(false);
+  // Incremented on every retake/clear — background capture callbacks check
+  // this and discard their results if the generation has moved on.
+  const captureGenRef = useRef(0);
   const [outOfAreaAlert, setOutOfAreaAlert] = useState<{ visible: boolean; distance: number } | null>(null);
 
 
@@ -1429,14 +1392,14 @@ export default function PoleDetailScreen() {
       : "Acquiring GPS Signal...";
 
   const gpsSecondaryLabel = hasGps
-    ? street || "Location saved"
+    ? gpsFromSitemap
+      ? "📍 Sitemap GPS — pre-placed by sitemap APK"
+      : street ? `📱 ${street}` : "📱 Captured on this device"
     : gpsAccuracy === null
-      ? "Acquiring signal…"
+      ? "⚠️ Required — acquiring signal…"
       : gpsAccuracy <= REQUIRED_GPS_ACCURACY_METERS
-        ? `Accuracy: ${gpsAccuracy}m • Ready to capture`
-        : gpsAccuracy <= 20
-          ? `Accuracy: ${gpsAccuracy}m • Tap to capture`
-          : `Accuracy: ${gpsAccuracy}m • Weak signal — tap to capture anyway`;
+        ? `⚠️ Required — accuracy ${gpsAccuracy}m, ready to capture`
+        : `⚠️ Required — accuracy ${gpsAccuracy}m, tap to capture`;
 
   function handleSavePoleNameEdit() {
     const trimmed = editNameDraft.trim();
@@ -1541,6 +1504,26 @@ export default function PoleDetailScreen() {
     timerStartRef.current = startNumeric;
     setTeardownStarted(true);
 
+    // Instantly update parent list cache so status changes from pending to in_progress immediately
+    const listKey = `sitemap_poles_${node_id}`;
+    const listCache = await cacheGet<any[]>(listKey).catch(() => null);
+    if (listCache) {
+      const updated = listCache.map((p) => {
+        if (String(p.pole_id) === String(pole_id) && p.pole) {
+          return {
+            ...p,
+            date_start: p.date_start || now,
+            pole: {
+              ...p.pole,
+              skycable_status: "in_progress",
+            },
+          };
+        }
+        return p;
+      });
+      await cacheSet(listKey, updated).catch(() => {});
+    }
+
     // 2. Transmit sync patch payload live; defer to offline queue adapter if network unreachable
     try {
       await api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
@@ -1561,6 +1544,23 @@ export default function PoleDetailScreen() {
         }).catch(() => {});
       }
     }
+
+    // 3. Also push node to in_progress if it's still pending
+    try {
+      await api.put(`/skycable/nodes/${node_id}`, {
+        status: "in_progress",
+        date_start: now,
+      });
+    } catch (err: any) {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "put",
+          url: `/skycable/nodes/${node_id}`,
+          body: { status: "in_progress", date_start: now },
+        }).catch(() => {});
+      }
+    }
+
     setStartingPole(false);
   }
 
@@ -1572,6 +1572,29 @@ export default function PoleDetailScreen() {
       const nowFinished = getPHTNow();
       setPoleFinishedAt(nowFinished);
       cacheSet(`teardown_finished_${pole_id}`, nowFinished).catch(() => {});
+
+      // Instantly update parent list cache so status changes to completed immediately
+      if (node_id && pole_id) {
+        const listKey = `sitemap_poles_${node_id}`;
+        cacheGet<any[]>(listKey).then(listCache => {
+          if (listCache) {
+            const updated = listCache.map((p) => {
+              if (String(p.pole_id) === String(pole_id) && p.pole) {
+                return {
+                  ...p,
+                  cleared_at: p.cleared_at || nowFinished,
+                  pole: {
+                    ...p.pole,
+                    skycable_status: "cleared",
+                  },
+                };
+              }
+              return p;
+            });
+            cacheSet(listKey, updated).catch(() => {});
+          }
+        }).catch(() => {});
+      }
 
       // Synchronize finished status to backend server; queue if offline
       api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
@@ -1790,6 +1813,30 @@ export default function PoleDetailScreen() {
 
       const res: any = await api.post(`/poles/${pole_id}/report`, form);
       const reportId = res?.data?.id;
+
+      // Instantly update parent list cache so status changes to completed immediately
+      const nowFinished = getPHTNow();
+      if (node_id && pole_id) {
+        const listKey = `sitemap_poles_${node_id}`;
+        cacheGet<any[]>(listKey).then(listCache => {
+          if (listCache) {
+            const updated = listCache.map((p) => {
+              if (String(p.pole_id) === String(pole_id) && p.pole) {
+                return {
+                  ...p,
+                  cleared_at: p.cleared_at || nowFinished,
+                  pole: {
+                    ...p.pole,
+                    skycable_status: "cleared",
+                  },
+                };
+              }
+              return p;
+            });
+            cacheSet(listKey, updated).catch(() => {});
+          }
+        }).catch(() => {});
+      }
 
       // Sequential upload to the new unified endpoint
       const photosToUpload = [
@@ -2081,10 +2128,7 @@ export default function PoleDetailScreen() {
                 styles.gpsCardButton,
                 hasGps
                   ? styles.gpsCardButtonSuccess
-                  : {
-                      borderColor: `${accentColor}35`,
-                      backgroundColor: "#FFFFFF",
-                    },
+                  : styles.gpsCardButtonRequired,
                 pressed && !gpsCapturing && styles.pressedDown,
               ]}
               onPress={captureGps}
@@ -2100,6 +2144,8 @@ export default function PoleDetailScreen() {
               >
                 {gpsCapturing || (poleLoading && !hasGps) ? (
                   <ActivityIndicator color={accentColor} size="small" />
+                ) : hasGps && lat && lng ? (
+                  <StaticTileMap lat={lat} lng={lng} />
                 ) : (
                   <Text style={[styles.gpsIcon, { color: accentColor }]}>
                     📍
@@ -2863,10 +2909,10 @@ export default function PoleDetailScreen() {
                 const photo = activeCameraTab === "before" ? photoBefore : activeCameraTab === "after" ? photoAfter : photoTag;
                 const photoQuality = activeCameraTab === "before" ? qualityBefore : activeCameraTab === "after" ? qualityAfter : qualityTag;
                 const clearPhoto = activeCameraTab === "before"
-                  ? () => { setPhotoBefore(null); setQualityBefore(null); cacheSet(`pole_quality_before_${pole_id}`, null).catch(() => {}); }
+                  ? () => { captureGenRef.current++; setBlurWarning(false); setPhotoBefore(null); setQualityBefore(null); cacheSet(`pole_quality_before_${pole_id}`, null).catch(() => {}); }
                   : activeCameraTab === "after"
-                  ? () => { setPhotoAfter(null); setQualityAfter(null); cacheSet(`pole_quality_after_${pole_id}`, null).catch(() => {}); }
-                  : () => { setPhotoTag(null); setQualityTag(null); cacheSet(`pole_quality_tag_${pole_id}`, null).catch(() => {}); };
+                  ? () => { captureGenRef.current++; setBlurWarning(false); setPhotoAfter(null); setQualityAfter(null); cacheSet(`pole_quality_after_${pole_id}`, null).catch(() => {}); }
+                  : () => { captureGenRef.current++; setBlurWarning(false); setPhotoTag(null); setQualityTag(null); cacheSet(`pole_quality_tag_${pole_id}`, null).catch(() => {}); };
                 if (photo && !blurWarning) {
                   const badgeColor = photoQuality === null ? "#6b7280"
                     : photoQuality >= 80 ? "#22c55e"
@@ -2949,6 +2995,7 @@ export default function PoleDetailScreen() {
                               <Pressable
                                 style={[styles.blurRetakeBtn, { backgroundColor: accentColor }]}
                                 onPress={() => {
+                                  captureGenRef.current++; // cancel any pending background
                                   setBlurWarning(false);
                                   if (activeCameraTab === "before") { setPhotoBefore(null); setQualityBefore(null); cacheSet(`pole_quality_before_${pole_id}`, null).catch(() => {}); }
                                   else if (activeCameraTab === "after") { setPhotoAfter(null); setQualityAfter(null); cacheSet(`pole_quality_after_${pole_id}`, null).catch(() => {}); }
@@ -3843,6 +3890,11 @@ const styles = StyleSheet.create({
   gpsCardButtonSuccess: {
     backgroundColor: "#F7FBF9",
     borderColor: "#CFE7DB",
+  },
+  gpsCardButtonRequired: {
+    backgroundColor: "#FFFBEB",
+    borderColor: "#F59E0B",
+    borderWidth: 1.5,
   },
 
   gpsIconWrap: {

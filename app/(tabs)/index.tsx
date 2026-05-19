@@ -29,7 +29,6 @@ import {
 import { saveDisplayTime, getWebTimeOffset } from "@/lib/display-time";
 
 import {
-  Box,
   Calendar,
   ChevronRight,
   Clock,
@@ -45,7 +44,7 @@ const { width } = Dimensions.get("window");
 const PAGE_PADDING = 22;
 const CARD_WIDTH = width - PAGE_PADDING * 2;
 const CARD_GAP = 16;
-const ACTION_CARD_HEIGHT = 86;
+const ACTION_CARD_HEIGHT = 148;
 
 const WEATHER_BACKGROUNDS = {
   sunny: require("@/assets/images/weather-image/sunny.jpg"),
@@ -428,15 +427,6 @@ export default function HomeScreen() {
 
           <View style={styles.actionGridBig}>
             <BigActionCard
-              icon={<Box size={24} color="#2563EB" />}
-              title="NAP Inventory"
-              subtitle="Manage NAP box inventory"
-              iconBg="#EFF6FF"
-              accentColor="#2563EB"
-              onPress={() => router.push("/naps" as any)}
-            />
-
-            <BigActionCard
               icon={<Map size={24} color="#059669" />}
               title="Teardown"
               subtitle="Open teardown process"
@@ -612,19 +602,21 @@ function BigActionCard({
     >
       <View style={[styles.actionAccent, { backgroundColor: accentColor }]} />
 
-      <View style={styles.actionLeftCluster}>
-        <View style={[styles.actionIconBoxBig, { backgroundColor: iconBg }]}>
-          {icon}
+      <View style={styles.actionCardInner}>
+        <View style={styles.actionCardTop}>
+          <View style={[styles.actionIconBoxBig, { backgroundColor: iconBg }]}>
+            {icon}
+          </View>
+          <View style={[styles.actionGoPill, { backgroundColor: accentColor + "18", borderColor: accentColor + "40" }]}>
+            <Text style={[styles.actionGoText, { color: accentColor }]}>Open</Text>
+            <ChevronRight size={13} color={accentColor} />
+          </View>
         </View>
 
-        <View style={styles.actionArrow}>
-          <ChevronRight size={17} color="#94A3B8" />
+        <View style={styles.actionTextContentBig}>
+          <Text style={styles.actionTitleBig}>{title}</Text>
+          <Text style={styles.actionSubtitleBig}>{subtitle}</Text>
         </View>
-      </View>
-
-      <View style={styles.actionTextContentBig}>
-        <Text style={styles.actionTitleBig}>{title}</Text>
-        <Text style={styles.actionSubtitleBig}>{subtitle}</Text>
       </View>
     </Pressable>
   );
@@ -1122,21 +1114,19 @@ const styles = StyleSheet.create({
     width: CARD_WIDTH,
     height: ACTION_CARD_HEIGHT,
     backgroundColor: "#FFFFFF",
-    paddingHorizontal: 16,
-    borderRadius: 22,
+    paddingHorizontal: 20,
+    paddingVertical: 18,
+    borderRadius: 24,
     borderWidth: 1,
     borderColor: "#EAF0F7",
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "stretch",
     gap: 14,
     shadowColor: "#0F172A",
-    shadowOffset: {
-      width: 0,
-      height: 6,
-    },
-    shadowOpacity: 0.04,
-    shadowRadius: 10,
-    elevation: 2,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.06,
+    shadowRadius: 14,
+    elevation: 3,
   },
 
   actionCardPressed: {
@@ -1154,39 +1144,56 @@ const styles = StyleSheet.create({
     borderBottomRightRadius: 999,
   },
 
-  actionLeftCluster: {
+  actionCardInner: {
+    flex: 1,
+    paddingVertical: 4,
+    gap: 12,
+  },
+
+  actionCardTop: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
   },
 
   actionIconBoxBig: {
-    width: 48,
-    height: 48,
-    borderRadius: 16,
+    width: 56,
+    height: 56,
+    borderRadius: 18,
     alignItems: "center",
     justifyContent: "center",
   },
 
-  actionArrow: {
-    display: "none",
+  actionGoPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+
+  actionGoText: {
+    fontSize: 12,
+    fontWeight: "800",
   },
 
   actionTextContentBig: {
-    flex: 1,
-    justifyContent: "center",
+    gap: 3,
   },
 
   actionTitleBig: {
-    fontSize: 17,
+    fontSize: 19,
     fontWeight: "900",
     color: "#0F172A",
-    marginBottom: 2,
+    letterSpacing: -0.3,
   },
 
   actionSubtitleBig: {
     fontSize: 13,
     fontWeight: "600",
     color: "#64748B",
-    lineHeight: 17,
+    lineHeight: 18,
   },
 });

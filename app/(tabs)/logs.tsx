@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronLeft,
   Clock3,
+  FileText,
   Hash,
   Image as ImageIcon,
   MapPin,
@@ -31,7 +32,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-import { BASE_URL } from "@/lib/api";
+import api, { BASE_URL } from "@/lib/api";
 import { getBridgeToken } from "@/lib/token-bridge";
 import { tokenStore } from "@/lib/token";
 
@@ -468,13 +469,6 @@ function ServerConnectionAttempting({
             <View style={s.connectionStatusPill}>
               <RefreshCcw size={13} color={GREEN} />
               <Text style={s.connectionStatusText}>Retrying connection</Text>
-            </View>
-
-            <View style={s.endpointBox}>
-              <Text style={s.endpointLabel}>Endpoint</Text>
-              <Text selectable style={s.endpointText} numberOfLines={2}>
-                {endpoint}
-              </Text>
             </View>
 
             {lastError ? (
@@ -915,81 +909,44 @@ export default function LogsScreen() {
 
   const endpointUrl = TEARDOWN_LOGS_ENDPOINT;
 
+  const isMounted = useRef(true);
   useEffect(() => {
-    let mounted = true;
-    let activeController: AbortController | null = null;
-
-    async function loadLogs() {
-      const controller = new AbortController();
-      activeController = controller;
-
-      const timeout = setTimeout(() => {
-        controller.abort();
-      }, REQUEST_TIMEOUT_MS);
-
-      try {
-        setIsAttempting(true);
-
-        const token = getBridgeToken() ?? await tokenStore.get();
-        const response = await fetch(endpointUrl, {
-          method: "GET",
-          headers: {
-            Accept: "application/json",
-            "ngrok-skip-browser-warning": "true",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeout);
-
-        if (!response.ok) {
-          throw new Error(`Backend responded with HTTP ${response.status}`);
-        }
-
-        const payload = await response.json();
-        const nextLogs = extractLogsFromResponse(payload);
-
-        if (!mounted) return;
-
-        if (nextLogs.length > 0) {
-          setLogs(nextLogs);
-          setLastError(null);
-          setLastSyncedAt(new Date());
-          setIsAttempting(false);
-        } else {
-          setLastError("Backend reached, but no teardown logs returned yet.");
-          setIsAttempting(true);
-        }
-      } catch (error) {
-        clearTimeout(timeout);
-
-        if (!mounted) return;
-
-        const message =
-          error instanceof Error
-            ? error.name === "AbortError"
-              ? "Connection timeout. Backend did not respond within 3 seconds."
-              : error.message
-            : "Unable to reach backend.";
-
-        setLastError(message);
-        setIsAttempting(true);
-      }
-    }
-
-    loadLogs();
-
-    const interval = setInterval(() => {
-      loadLogs();
-    }, RETRY_INTERVAL_MS);
-
+    isMounted.current = true;
     return () => {
-      mounted = false;
-      activeController?.abort();
-      clearInterval(interval);
+      isMounted.current = false;
     };
-  }, [endpointUrl]);
+  }, []);
+
+  const loadLogs = useCallback(async () => {
+    try {
+      setIsAttempting(true);
+      const result = await api.get("/skycable/teardowns");
+      const nextLogs = extractLogsFromResponse(result.data);
+
+      if (!isMounted.current) return;
+
+      if (nextLogs.length > 0) {
+        setLogs(nextLogs);
+        setLastError(null);
+        setLastSyncedAt(new Date());
+        setIsAttempting(false);
+      } else {
+        setLogs([]);
+        setLastError("No teardown reports found in backend database.");
+        setIsAttempting(false);
+      }
+    } catch (error: any) {
+      if (!isMounted.current) return;
+      setLastError(error?.message || "Unable to reach backend.");
+      setIsAttempting(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadLogs();
+    const interval = setInterval(loadLogs, RETRY_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [loadLogs]);
 
   const sortedLogs = useMemo(() => {
     return [...logs].sort((a, b) => {
@@ -1052,13 +1009,50 @@ export default function LogsScreen() {
     setViewerTitle(title);
   };
 
-  if (!featuredLog || !featured) {
+  if (isAttempting && !sortedLogs.length) {
     return (
       <ServerConnectionAttempting
         onBack={() => router.back()}
         lastError={lastError}
         endpoint={endpointUrl}
       />
+    );
+  }
+
+  // Handle empty state gracefully instead of showing loading screen
+  if (!sortedLogs.length) {
+    return (
+      <>
+        <Stack.Screen options={{ headerShown: false }} />
+        <SafeAreaView style={s.container}>
+           <View style={s.connectionTopBar}>
+            <TouchableOpacity
+              activeOpacity={0.85}
+              onPress={() => router.back()}
+              style={s.connectionBackBtn}
+            >
+              <ChevronLeft size={22} color={SLATE} />
+            </TouchableOpacity>
+            <View style={{ flex: 1 }}>
+              <Text style={s.connectionTopTitle}>Teardown Logs</Text>
+            </View>
+          </View>
+          <View style={s.connectionBody}>
+            <View style={s.connectionCard}>
+              <Zap size={48} color={MUTED} style={{ marginBottom: 16 }} />
+              <Text style={s.connectionTitle}>No logs found</Text>
+              <Text style={s.connectionText}>There are no teardown reports associated with your account yet.</Text>
+              <TouchableOpacity 
+                style={[s.connectionStatusPill, { marginTop: 24 }]} 
+                onPress={() => loadLogs()}
+              >
+                <RefreshCcw size={13} color={GREEN} />
+                <Text style={s.connectionStatusText}>Refresh Data</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </SafeAreaView>
+      </>
     );
   }
 
@@ -1374,28 +1368,13 @@ const s = StyleSheet.create({
   },
 
   endpointBox: {
-    width: "100%",
-    marginTop: 16,
-    padding: 12,
-    borderRadius: 16,
-    backgroundColor: "#F8FAFC",
-    borderWidth: 1,
-    borderColor: BORDER,
+    display: "none",
   },
-
   endpointLabel: {
-    fontSize: 10,
-    fontWeight: "900",
-    color: LIGHT_MUTED,
-    letterSpacing: 0.8,
-    textTransform: "uppercase",
+    display: "none",
   },
-
   endpointText: {
-    fontSize: 12,
-    fontWeight: "800",
-    color: SLATE,
-    marginTop: 4,
+    display: "none",
   },
 
   connectionError: {

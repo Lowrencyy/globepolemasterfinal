@@ -34,10 +34,10 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+
+type PhotoFile = { uri: string } | null;
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-
-type PhotoFile = { uri: string; name: string; type: string } | null;
 
 export function buildSpanMapHtml(
   fromLat: number,
@@ -81,6 +81,157 @@ setTimeout(function(){map.invalidateSize();},120);
 </script>
 </body></html>`;
 }
+
+export function buildPoleMapHtml(lat: number, lng: number, accentColor: string, satellite = false) {
+  const tileUrl = satellite
+    ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+    : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+  const tileOpts = satellite
+    ? 'maxZoom:19,attribution:""'
+    : 'subdomains:"abcd",maxZoom:20,attribution:""';
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body,#map{width:100%;height:100%;background:#0d1117;}
+.leaflet-div-icon{background:none!important;border:none!important;}
+.leaflet-control-attribution{display:none!important;}
+.leaflet-control-zoom{display:none!important;}
+.pin-wrap{display:flex;flex-direction:column;align-items:center;}
+.pin-ring{
+  width:36px;height:36px;border-radius:50%;
+  background:${accentColor}22;
+  border:2px solid ${accentColor}88;
+  display:flex;align-items:center;justify-content:center;
+  animation:ring-pulse 2s infinite;
+}
+.pin-dot{
+  width:14px;height:14px;border-radius:50%;
+  background:${accentColor};
+  border:2.5px solid #fff;
+  box-shadow:0 2px 8px rgba(0,0,0,0.5);
+}
+@keyframes ring-pulse{
+  0%{box-shadow:0 0 0 0 ${accentColor}55;}
+  70%{box-shadow:0 0 0 16px ${accentColor}00;}
+  100%{box-shadow:0 0 0 0 ${accentColor}00;}
+}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+var map=L.map('map',{
+  zoomControl:false,
+  scrollWheelZoom:false,
+  dragging:true,
+  doubleClickZoom:true,
+  touchZoom:true,
+  attributionControl:false
+}).setView([${lat},${lng}], 18);
+
+L.tileLayer('${tileUrl}',{${tileOpts}}).addTo(map);
+
+var icon=L.divIcon({
+  className:'',
+  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div></div>',
+  iconSize:[36,36],
+  iconAnchor:[18,18]
+});
+
+L.marker([${lat},${lng}],{icon:icon}).addTo(map);
+
+setTimeout(function(){
+  map.invalidateSize();
+  map.setView([${lat},${lng}], 18);
+}, 250);
+</script>
+</body>
+</html>`;
+}
+
+const TILE_PX = 256;
+const ZOOM = 18;
+
+function latLngToTileFrac(lat: number, lng: number, zoom: number) {
+  const n = Math.pow(2, zoom);
+  const xFrac = ((lng + 180) / 360) * n;
+  const yFrac =
+    ((1 - Math.log(Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180)) / Math.PI) / 2) * n;
+  return { xFrac, yFrac, tileX: Math.floor(xFrac), tileY: Math.floor(yFrac) };
+}
+
+export function StaticTileMap({ lat, lng }: { lat: number; lng: number }) {
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+  const { xFrac, yFrac, tileX, tileY } = latLngToTileFrac(lat, lng, ZOOM);
+
+  const tileUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY}/${tileX}`;
+  const tileUrlLeft = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY}/${tileX - 1}`;
+  const tileUrlRight = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY}/${tileX + 1}`;
+
+  const fracX = xFrac - tileX;
+  const fracY = yFrac - tileY;
+
+  const onLayout = (e: any) => {
+    const { width, height } = e.nativeEvent.layout;
+    setSize({ w: width, h: height });
+  };
+
+  const scale = size ? Math.max(size.w / TILE_PX, size.h / TILE_PX) * 2.2 : 2.2;
+  const imgW = TILE_PX * scale;
+  const imgH = TILE_PX * scale;
+  const offsetX = size ? size.w / 2 - fracX * imgW : 0;
+  const offsetY = size ? size.h / 2 - fracY * imgH : 0;
+
+  const PIN = 14;
+  const pinLeft = size ? size.w / 2 - PIN / 2 : 0;
+  const pinTop = size ? size.h / 2 - PIN / 2 : 0;
+
+  return (
+    <View style={{ ...StyleSheet.absoluteFillObject, overflow: "hidden", borderRadius: 18 }} onLayout={onLayout}>
+      <ExpoImage
+        source={{ uri: tileUrlLeft }}
+        style={{ position: "absolute", left: offsetX - imgW, top: offsetY, width: imgW, height: imgH }}
+        contentFit="cover"
+      />
+      <ExpoImage
+        source={{ uri: tileUrl }}
+        style={{ position: "absolute", left: offsetX, top: offsetY, width: imgW, height: imgH }}
+        contentFit="cover"
+      />
+      <ExpoImage
+        source={{ uri: tileUrlRight }}
+        style={{ position: "absolute", left: offsetX + imgW, top: offsetY, width: imgW, height: imgH }}
+        contentFit="cover"
+      />
+      {size && (
+        <View
+          style={{
+            position: "absolute",
+            left: pinLeft,
+            top: pinTop,
+            width: PIN,
+            height: PIN,
+            borderRadius: PIN / 2,
+            backgroundColor: "#EF4444",
+            borderWidth: 2,
+            borderColor: "#FFF",
+            shadowColor: "#000",
+            shadowOffset: { width: 0, height: 2 },
+            shadowOpacity: 0.3,
+            shadowRadius: 3,
+            elevation: 3,
+          }}
+        />
+      )}
+    </View>
+  );
+}
+
 
 function sanitize(s?: string) {
   return (s ?? "")
@@ -937,18 +1088,12 @@ export default function TeardownComponentsScreen() {
       before_span: "bunching",
     };
 
+    // Photos are uploaded separately after the metadata record is created.
+    // Do NOT bundle them here — 6×3MB over ngrok reliably causes timeout.
     const form = new FormData();
     form.append("local_id", local_id);
     for (const [key, value] of Object.entries(fields)) {
       form.append(key, value);
-    }
-    for (const [internalKey, uri] of Object.entries(photoPaths)) {
-      const fieldName = fieldNameMap[internalKey] ?? internalKey;
-      form.append(fieldName, {
-        uri,
-        name: `${fieldName}.jpg`,
-        type: "image/jpeg",
-      } as any);
     }
 
     if (params.from_pole_id) {
@@ -1071,48 +1216,25 @@ export default function TeardownComponentsScreen() {
           FileSystem.deleteAsync(poleDraftDir + `pole_${params.from_pole_id}_after.jpg`, { idempotent: true }).catch(() => {});
         }
 
-        // Mark the destination pole as cleared on the backend
+        // Record cleared_at on the skycable_poles pivot row — backend decides the
+        // actual skycable_status based on remaining spans (may be in_progress, not cleared).
         if (params.node_id && params.to_pole_id) {
           const clearedAt = getPHTNow();
           api.put(
             `/skycable/nodes/${params.node_id}/poles/${params.to_pole_id}`,
-            { cleared_at: clearedAt, skycable_status: "cleared" }
+            { cleared_at: clearedAt }
           ).catch(() => {});
-
-          // Patch the local cache so poles.tsx reflects cleared_at immediately
-          cacheGet<any[]>(`sitemap_poles_${params.node_id}`).then(cached => {
-            if (!cached?.length) return;
-            const updated = cached.map(p =>
-              String(p.pole_id) === String(params.to_pole_id)
-                ? { ...p, cleared_at: clearedAt, pole: { ...p.pole, skycable_status: "cleared" } }
-                : p
-            );
-            cacheSet(`sitemap_poles_${params.node_id}`, updated).catch(() => {});
-          }).catch(() => {});
+          // Invalidate local poles cache so poles.tsx re-fetches fresh status
+          cacheSet(`sitemap_poles_${params.node_id}`, null).catch(() => {});
         }
       })
       .catch(async (e: any) => {
         const status = e?.response?.status;
 
-        // Already on server — treat as success, still mark pole cleared
+        // Already on server — treat as success, invalidate cache for fresh status
         if (status === 409) {
           if (params.from_pole_id) cacheSet(`pole_submitted_${params.from_pole_id}`, true).catch(() => {});
-          if (params.node_id && params.to_pole_id) {
-            const clearedAt = getPHTNow();
-            api.put(
-              `/skycable/nodes/${params.node_id}/poles/${params.to_pole_id}`,
-              { cleared_at: clearedAt, skycable_status: "cleared" }
-            ).catch(() => {});
-            cacheGet<any[]>(`sitemap_poles_${params.node_id}`).then(cached => {
-              if (!cached?.length) return;
-              const updated = cached.map(p =>
-                String(p.pole_id) === String(params.to_pole_id)
-                  ? { ...p, cleared_at: clearedAt, pole: { ...p.pole, skycable_status: "cleared" } }
-                  : p
-              );
-              cacheSet(`sitemap_poles_${params.node_id}`, updated).catch(() => {});
-            }).catch(() => {});
-          }
+          if (params.node_id) cacheSet(`sitemap_poles_${params.node_id}`, null).catch(() => {});
           return;
         }
 
@@ -1139,10 +1261,15 @@ export default function TeardownComponentsScreen() {
           poleAfterPath: poleDraftDir + `pole_${params.from_pole_id}_after.jpg`,
         }).catch(() => {});
 
-        Alert.alert(
-          "Saved Offline",
-          `${reason}\n\nYour report is saved locally and will upload automatically when connection improves.`,
-        );
+        // Only alert for 401 — requires user action (re-login).
+        // 5xx / network / timeout are queued silently and retried automatically.
+        // The teardown-complete screen already confirms the data is captured.
+        if (isUnauth) {
+          Alert.alert(
+            "Session Expired",
+            "Your teardown report is saved locally. Please log out and log back in — it will upload automatically.",
+          );
+        }
       });
   }
 

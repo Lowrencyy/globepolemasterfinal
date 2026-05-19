@@ -39,6 +39,7 @@ import {
   type NapPort,
 } from "@/services/nap-box";
 import { getPoles, createPole, type Pole } from "@/services/pole";
+import { cacheGet, cacheSet } from "@/lib/cache";
 
 type NapStatus = "active" | "inactive" | "for_removal";
 
@@ -65,11 +66,25 @@ function NapDetailModal({ box, onClose }: { box: NapBox; onClose: () => void }) 
 
   useEffect(() => {
     if (box.ports) return;
-    setPortsLoading(true);
-    getNapBoxPorts(box.id, token!)
-      .then(setPorts)
-      .catch(() => {})
-      .finally(() => setPortsLoading(false));
+
+    const PORTS_CACHE_KEY = `nap_ports_${box.id}`;
+    
+    // Check cache first
+    cacheGet<NapPort[]>(PORTS_CACHE_KEY).then(cached => {
+      if (cached) {
+        setPorts(cached);
+        setPortsLoading(false);
+      }
+      
+      // Always fetch fresh
+      getNapBoxPorts(box.id, token!)
+        .then(fresh => {
+          setPorts(fresh);
+          cacheSet(PORTS_CACHE_KEY, fresh).catch(() => {});
+        })
+        .catch(() => {})
+        .finally(() => setPortsLoading(false));
+    });
   }, [box.id, box.ports, token]);
 
   const usedSlots = countUsedPorts(ports);
@@ -1190,8 +1205,20 @@ export default function NapsScreen() {
 
   const fetchNapBoxes = useCallback(
     async (isRefresh = false) => {
+      const CACHE_KEY = "nap_boxes_cache";
+
       if (isRefresh) setRefreshing(true);
-      else setLoading(true);
+      else {
+        // Instant load from cache
+        const cached = await cacheGet<NapBox[]>(CACHE_KEY);
+        if (cached) {
+          setNapBoxes(cached);
+          setLoading(false);
+        } else {
+          setLoading(true);
+        }
+      }
+      
       setError(null);
       
       // Attempt sync before fetching if online
@@ -1208,8 +1235,13 @@ export default function NapsScreen() {
       try {
         const res = await getNapBoxes(token!);
         setNapBoxes(res.data);
+        cacheSet(CACHE_KEY, res.data).catch(() => {});
       } catch (e: any) {
-        setError(e.message || "Failed to load NAP boxes.");
+        // If we have cache, don't show full error
+        const cached = await cacheGet<NapBox[]>(CACHE_KEY);
+        if (!cached) {
+          setError(e.message || "Failed to load NAP boxes.");
+        }
       } finally {
         setLoading(false);
         setRefreshing(false);

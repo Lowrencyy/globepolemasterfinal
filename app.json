@@ -1,21 +1,21 @@
 {
   "expo": {
     "name": "TelcoVantage PoleMaster",
-    "slug": "globe-mobileapp",
+    "slug": "telcovantage-polemaster",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/telco-mainlogo.png",
+    "icon": "./assets/images/app.png",
     "scheme": "globemobileapp",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.telcovantage.polemaster"
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#0B7A5A",
-        "foregroundImage": "./assets/images/telco-mainlogo.png"
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/images/app.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -33,22 +33,22 @@
           "image": "./assets/images/telco-mainlogo.png",
           "imageWidth": 220,
           "resizeMode": "contain",
-          "backgroundColor": "#0B7A5A",
+          "backgroundColor": "#FFFFFF",
           "dark": {
-            "backgroundColor": "#0B7A5A"
+            "backgroundColor": "#FFFFFF"
           }
         }
       ]
     ],
     "experiments": {
-      "typedRoutes": true,
-      "reactCompiler": true
+      "typedRoutes": true
     },
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "47c51a5f-e8c3-4967-8490-b7fc5f3d8f8a"
+        "projectId": "4a4b1c45-b33a-4296-8f49-d92f0c0d55cb"
       }
-    }
+    },
+    "owner": "vantagegroupofcompaniess-organization"
   }
 }

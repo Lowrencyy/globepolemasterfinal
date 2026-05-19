@@ -30,7 +30,7 @@ const BORDER = "#E7ECF2";
 const ORANGE = "#F59E0B";
 const CACHE_KEY = "daily_reports_cache_v3";
 
-const USE_FAKE_DATA = true;
+const USE_FAKE_DATA = false;
 
 type TeardownLog = {
   id: number;
@@ -48,83 +48,7 @@ type TeardownLog = {
   team?: { name: string } | null;
 };
 
-const FAKE_LOGS: TeardownLog[] = [
-  {
-    id: 1,
-    status: "submitted",
-    actual_cable: 120,
-    expected_cable: 150,
-    nodes_collected: 2,
-    amplifiers_collected: 1,
-    extenders_collected: 0,
-    tsc_collected: 1,
-    powersupply_collected: 0,
-    ps_housing_collected: 0,
-    start_time: "2026-05-12T08:30:00",
-    end_time: "2026-05-12T10:15:00",
-    team: { name: "Team Alpha" },
-  },
-  {
-    id: 2,
-    status: "backend_approved",
-    actual_cable: 85,
-    expected_cable: 100,
-    nodes_collected: 1,
-    amplifiers_collected: 0,
-    extenders_collected: 2,
-    tsc_collected: 0,
-    powersupply_collected: 1,
-    ps_housing_collected: 0,
-    start_time: "2026-05-12T11:00:00",
-    end_time: "2026-05-12T12:20:00",
-    team: { name: "Team Alpha" },
-  },
-  {
-    id: 3,
-    status: "pending",
-    actual_cable: 60,
-    expected_cable: 80,
-    nodes_collected: 0,
-    amplifiers_collected: 1,
-    extenders_collected: 1,
-    tsc_collected: 0,
-    powersupply_collected: 0,
-    ps_housing_collected: 1,
-    start_time: "2026-05-11T09:10:00",
-    end_time: "2026-05-11T10:05:00",
-    team: { name: "Team Bravo" },
-  },
-  {
-    id: 4,
-    status: "submitted",
-    actual_cable: 210,
-    expected_cable: 220,
-    nodes_collected: 3,
-    amplifiers_collected: 2,
-    extenders_collected: 1,
-    tsc_collected: 1,
-    powersupply_collected: 1,
-    ps_housing_collected: 1,
-    start_time: "2026-05-10T13:00:00",
-    end_time: "2026-05-10T15:45:00",
-    team: { name: "Team Charlie" },
-  },
-  {
-    id: 5,
-    status: "backend_approved",
-    actual_cable: 140,
-    expected_cable: 160,
-    nodes_collected: 2,
-    amplifiers_collected: 2,
-    extenders_collected: 0,
-    tsc_collected: 1,
-    powersupply_collected: 1,
-    ps_housing_collected: 0,
-    start_time: "2026-05-10T16:00:00",
-    end_time: "2026-05-10T17:35:00",
-    team: { name: "Team Charlie" },
-  },
-];
+const FAKE_LOGS: TeardownLog[] = [];
 
 function dayKey(iso: string) {
   return iso.slice(0, 10);

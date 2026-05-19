@@ -597,39 +597,38 @@ export default function SelectPairScreen() {
         if (active.length > 0) {
           setSpans(active);
           setStatus("ok");
+          return; // Skip background fetch if we already have valid data
         }
       }
-    });
 
-    api
-      .get(`/skycable/spans?node_id=${node_id}`)
-      .then(({ data }) => {
-        const all: Span[] = Array.isArray(data) ? data : (data?.data ?? []);
-        const list = all.filter(
-          (s) =>
-            String(s.from_pole?.pole?.id) === String(pole_id) ||
-            String(s.to_pole?.pole?.id) === String(pole_id),
-        );
-        cacheSet(CACHE_KEY, list);
+      api
+        .get(`/skycable/spans?node_id=${node_id}`)
+        .then(({ data }) => {
+          const all: Span[] = Array.isArray(data) ? data : (data?.data ?? []);
+          const list = all.filter(
+            (s) =>
+              String(s.from_pole?.pole?.id) === String(pole_id) ||
+              String(s.to_pole?.pole?.id) === String(pole_id),
+          );
+          cacheSet(CACHE_KEY, list);
 
-        const active = list.filter((s) => s.status !== "completed" && s.status !== "superseded");
+          const active = list.filter((s) => s.status !== "completed" && s.status !== "superseded");
 
-        if (active.length === 0) {
-          if (list.length > 0) setAllDone(true); // had spans but all completed
-          setStatus("empty");
-          return;
-        }
+          if (active.length === 0) {
+            if (list.length > 0) setAllDone(true); // had spans but all completed
+            setStatus("empty");
+            return;
+          }
 
-        if (active.length === 1) {
-          navigateToKabila(active[0]);
-          return;
-        }
+          if (active.length === 1) {
+            navigateToKabila(active[0]);
+            return;
+          }
 
-        setSpans(active);
-        setStatus("ok");
-      })
-      .catch(() => {
-        cacheGet<Span[]>(CACHE_KEY).then((cached) => {
+          setSpans(active);
+          setStatus("ok");
+        })
+        .catch(() => {
           if (!cached?.length) {
             setStatus("error");
           } else {
@@ -640,7 +639,7 @@ export default function SelectPairScreen() {
             }
           }
         });
-      });
+    });
   }, [pole_id, node_id, navigateToKabila]);
 
 

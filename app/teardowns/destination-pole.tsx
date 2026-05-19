@@ -32,7 +32,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import { WebView } from "react-native-webview";
-import { buildSpanMapHtml } from "./components";
+import { buildSpanMapHtml, buildPoleMapHtml, StaticTileMap } from "./components";
 
 const SLOTS = ["DA", "C1", "C2", "C3", "C4", "C5"] as const;
 const REQUIRED_GPS_ACCURACY_METERS = 10;
@@ -398,8 +398,13 @@ export default function DestinationPoleScreen() {
   const [landmark, setLandmark] = useState("");
 
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
-  const [capturedGps, setCapturedGps] = useState<GpsData | null>(null);
   const [gpsCapturing, setGpsCapturing] = useState(false);
+  const [capturedGps, setCapturedGps] = useState<GpsData | null>(null);
+  // true = GPS came from sitemap APK (pre-placed, no re-capture needed)
+  // false = GPS was captured on this device (or absent)
+  const [gpsFromSitemap, setGpsFromSitemap] = useState(false);
+  const [mapSatellite, setMapSatellite] = useState(false);
+  const [mapFullscreen, setMapFullscreen] = useState(false);
 
   const [showCameraModal, setShowCameraModal] = useState(false);
   const [activeCameraTab, setActiveCameraTab] = useState<"before" | "after" | "tag">("before");
@@ -417,6 +422,7 @@ export default function DestinationPoleScreen() {
       setCameraZoom(Math.min(1, Math.max(0, pinchBaseZoom.current + (e.scale - 1) * 0.5)));
     });
   const [blurWarning, setBlurWarning] = useState(false);
+  const captureGenRef = useRef(0);
 
 
   const [elapsedSecs, setElapsedSecs] = useState(0);
@@ -487,8 +493,10 @@ export default function DestinationPoleScreen() {
 
   const timerStartRef = useRef(Date.now());
   // Record ISO start time when lineman enters this screen — sent to backend as started_at
-  const startedAtRef  = useRef(new Date().toISOString());
-  const toPoleGpsRef = useRef<GpsData | null>(null);
+  const startedAtRef    = useRef(new Date().toISOString());
+  const toPoleGpsRef    = useRef<GpsData | null>(null);
+  const isCapturingRef  = useRef(false);
+  const prewarmedGps    = useRef<{ latitude: number; longitude: number } | null>(null);
   const locationWatcher = useRef<Location.LocationSubscription | null>(null);
   const blurCheckRef = useRef<WebView>(null);
   const blurResolverRef = useRef<((variance: number) => void) | null>(null);
@@ -532,21 +540,38 @@ export default function DestinationPoleScreen() {
     cacheGet<{ lat: number; lng: number }>(`pole_gps_${params.to_pole_id}`)
       .then(async (g) => {
         if (g?.lat && g?.lng) {
+          // Previously captured on this device
           setCapturedGps({
             latitude: g.lat,
             longitude: g.lng,
             accuracy: null,
             captured_at: new Date().toISOString(),
           });
+          setGpsFromSitemap(false);
         } else {
           const q = await gpsQueueGet(params.to_pole_id);
           if (q?.lat && q?.lng) {
+            // Queued GPS (captured offline on this device)
             setCapturedGps({
               latitude: q.lat,
               longitude: q.lng,
               accuracy: null,
               captured_at: await getDisplayTime(),
             });
+            setGpsFromSitemap(false);
+          } else {
+            // Fall back to sitemap cache — coordinates pre-placed by the sitemap APK
+            // These are the actual pole locations; no re-capture needed
+            const sitemapPoles = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`).catch(() => null);
+            const sitemapMatch = sitemapPoles?.find(p => String(p.pole_id) === String(params.to_pole_id));
+            if (sitemapMatch?.pole?.lat && sitemapMatch?.pole?.lng) {
+              const lat = parseFloat(sitemapMatch.pole.lat);
+              const lng = parseFloat(sitemapMatch.pole.lng);
+              if (Number.isFinite(lat) && Number.isFinite(lng)) {
+                setCapturedGps({ latitude: lat, longitude: lng, accuracy: null, captured_at: "" });
+                setGpsFromSitemap(true);
+              }
+            }
           }
         }
       })
@@ -560,18 +585,11 @@ export default function DestinationPoleScreen() {
           const lat = Number(d.map_latitude);
           const lng = Number(d.map_longitude);
           if (lat && lng) {
-            setCapturedGps(
-              (prev) =>
-                prev ?? {
-                  latitude: lat,
-                  longitude: lng,
-                  accuracy: null,
-                  captured_at: getPHTNow(),
-                },
-            );
-            cacheSet(`pole_gps_${params.to_pole_id}`, { lat, lng }).catch(
-              () => {},
-            );
+            setCapturedGps(prev => {
+              if (prev) return prev; // keep existing (device capture or sitemap)
+              setGpsFromSitemap(true); // came from backend sitemap data
+              return { latitude: lat, longitude: lng, accuracy: null, captured_at: getPHTNow() };
+            });
           }
         }
       })
@@ -739,6 +757,7 @@ export default function DestinationPoleScreen() {
             accuracy: loc.coords.accuracy,
             captured_at: new Date(loc.timestamp).toISOString(),
           };
+          prewarmedGps.current = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
           setGpsAccuracy(Math.round(loc.coords.accuracy ?? 999));
         },
       );
@@ -849,12 +868,11 @@ export default function DestinationPoleScreen() {
     setGpsCapturing(true);
     try {
       setCapturedGps({ ...coords });
+      setGpsFromSitemap(false); // overridden by actual device capture
       cacheSet(`pole_gps_${params.to_pole_id}`, {
         lat: coords.latitude,
         lng: coords.longitude,
       }).catch(() => {});
-
-      // GPS stored locally — will be sent with the teardown submission
       Alert.alert("GPS Captured", `Location saved.\n${coords.latitude.toFixed(6)}, ${coords.longitude.toFixed(6)}`);
     } finally {
       setGpsCapturing(false);
@@ -959,55 +977,69 @@ export default function DestinationPoleScreen() {
 
   async function captureFromCamera() {
     if (!cameraRef.current || !cameraReady || photoCapturing) return;
+    if (isCapturingRef.current) return;
+    isCapturingRef.current = true;
 
-    setPhotoCapturing(true);
     setBlurWarning(false);
 
-    if (capturedGps) {
-      try {
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
-        if (pos?.coords) {
-          const dist = computeDistanceMeters(capturedGps.latitude, capturedGps.longitude, pos.coords.latitude, pos.coords.longitude);
-          if (dist > 50) {
-            setPhotoCapturing(false);
-            setOutOfAreaAlert({ visible: true, distance: dist });
-            return;
-          }
-        }
-      } catch {}
-    }
-
-    // Double check that the CameraView is still mounted after asynchronous location yields
-    if (!cameraRef.current) {
-      setPhotoCapturing(false);
-      return;
+    // Use pre-warmed GPS for distance check — no blocking network call
+    if (capturedGps && prewarmedGps.current) {
+      const dist = computeDistanceMeters(
+        capturedGps.latitude, capturedGps.longitude,
+        prewarmedGps.current.latitude, prewarmedGps.current.longitude,
+      );
+      if (dist > 50) {
+        isCapturingRef.current = false;
+        setOutOfAreaAlert({ visible: true, distance: dist });
+        return;
+      }
     }
 
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 1, skipProcessing: false });
-      if (!photo?.uri) {
-        setPhotoCapturing(false);
-        return;
-      }
-      const capturedAt = getPHTNow();
-      const setter = activeCameraTab === "before" ? setPhotoBefore : activeCameraTab === "after" ? setPhotoAfter : setPhotoTag;
-      const qualitySetter = activeCameraTab === "before" ? setQualityBefore : activeCameraTab === "after" ? setQualityAfter : setQualityTag;
-      const file = activeCameraTab === "before" ? F.before : activeCameraTab === "after" ? F.after : F.tag;
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.92,
+        skipProcessing: true,
+        exif: false,
+      });
+      if (!photo?.uri) { isCapturingRef.current = false; return; }
+
+      const capturedAt  = getPHTNow();
+      const tab         = activeCameraTab;
+      const setter      = tab === "before" ? setPhotoBefore : tab === "after" ? setPhotoAfter : setPhotoTag;
+      const qualitySetter = tab === "before" ? setQualityBefore : tab === "after" ? setQualityAfter : setQualityTag;
+      const file        = tab === "before" ? F.before : tab === "after" ? F.after : F.tag;
+
+      // Show raw photo immediately
+      const thisGen = ++captureGenRef.current;
       setter(createPhotoField(photo.uri, file));
-      const saved = await savePhotoDraft(file, photo.uri, buildStampLines(activeCameraTab));
-      setter(saved);
-      cacheSet(`photo_captured_at_${params.to_pole_id}_${activeCameraTab}`, capturedAt).catch(() => {});
-      const variance = await checkPhotoQuality(saved.fileUri ?? photo.uri);
-      const pct = varianceToPercent(variance);
-      qualitySetter(pct);
-      const qualityKey = activeCameraTab === "before" ? `td_quality_before_${params.to_pole_id}` : activeCameraTab === "after" ? `td_quality_after_${params.to_pole_id}` : `td_quality_tag_${params.to_pole_id}`;
-      cacheSet(qualityKey, pct).catch(() => {});
-      if (variance < 80) {
-        setBlurWarning(true);
-      }
+      setTimeout(() => { isCapturingRef.current = false; setPhotoCapturing(false); }, 400);
+
+      // Stamp + quality check in background
+      (async () => {
+        try {
+          const saved = await savePhotoDraft(file, photo.uri, buildStampLines(tab));
+          if (captureGenRef.current !== thisGen) return;
+          setter(saved);
+          cacheSet(`photo_captured_at_${params.to_pole_id}_${tab}`, capturedAt).catch(() => {});
+
+          const variance = await checkPhotoQuality(saved.fileUri ?? photo.uri);
+          if (captureGenRef.current !== thisGen) return;
+          const pct = varianceToPercent(variance);
+          qualitySetter(pct);
+          const qualityKey = tab === "before" ? `td_quality_before_${params.to_pole_id}`
+            : tab === "after" ? `td_quality_after_${params.to_pole_id}`
+            : `td_quality_tag_${params.to_pole_id}`;
+          cacheSet(qualityKey, pct).catch(() => {});
+          if (variance < 80) setBlurWarning(true);
+        } catch {}
+      })();
+
     } catch (e: any) {
-      Alert.alert("Photo Error", e?.message ?? "Failed to capture photo.");
-    } finally {
+      const msg = (e?.message ?? "").toLowerCase();
+      if (!msg.includes("not running") && !msg.includes("already")) {
+        Alert.alert("Photo Error", "Failed to capture image. Make sure camera is ready and try again.");
+      }
+      isCapturingRef.current = false;
       setPhotoCapturing(false);
     }
   }
@@ -1079,17 +1111,17 @@ export default function DestinationPoleScreen() {
 
   const gpsTopLabel = hasGps
     ? `${capturedGps?.latitude.toFixed(6)}, ${capturedGps?.longitude.toFixed(6)}`
-    : "Captured GPS";
+    : "GPS Required";
 
   const gpsSecondaryLabel = hasGps
-    ? "Location saved"
+    ? gpsFromSitemap
+      ? "📍 Sitemap GPS — pre-placed by sitemap APK"
+      : "📱 Captured on this device"
     : gpsAccuracy === null
-      ? "Acquiring signal…"
+      ? "⚠️ Required — acquiring signal…"
       : gpsAccuracy <= REQUIRED_GPS_ACCURACY_METERS
-        ? `Accuracy: ${gpsAccuracy}m • Ready to capture`
-        : gpsAccuracy <= 20
-          ? `Accuracy: ${gpsAccuracy}m • Tap to capture`
-          : `Accuracy: ${gpsAccuracy}m • Weak signal — tap to capture anyway`;
+        ? `⚠️ Required — accuracy ${gpsAccuracy}m, ready to capture`
+        : `⚠️ Required — accuracy ${gpsAccuracy}m, tap to capture`;
 
   return (
     <>
@@ -1112,108 +1144,116 @@ export default function DestinationPoleScreen() {
         >
 
 
+          {/* ── Hero card (matches pole-detail.tsx) ── */}
           <View style={styles.heroCard}>
-            <View style={[styles.heroBg, { backgroundColor: accentColor }]} />
-            <View style={styles.heroNoise} />
-            <View style={styles.heroGlow} />
+            <View style={[styles.heroBg, { backgroundColor: "#0F172A" }]} />
+            <View style={[styles.heroGlowLeft,  { backgroundColor: accentColor }]} />
+            <View style={styles.heroGlowRight} />
+            <View style={styles.heroGlassOverlay} />
+
             <View style={styles.heroContent}>
-              <View style={styles.heroTopLine}>
-                <View style={styles.heroBadge}>
-                  <Text style={styles.heroBadgeText}>Destination Pole</Text>
-                </View>
-              </View>
-
-              <Pressable
-                onPress={() => {
-                  setEditToNameDraft(editedToPoleName);
-                  setEditToNameModalOpen(true);
-                }}
-                style={styles.heroTitleRow}
-              >
-                <Text style={[styles.heroTitle, { marginTop: 0, flexShrink: 1 }]} numberOfLines={2}>
-                  {editedToPoleName || params.to_pole_code || "Destination Pole"}
-                </Text>
-                <Text style={styles.heroEditIcon}>✎</Text>
-              </Pressable>
-
-              <Text style={styles.heroMeta} numberOfLines={1}>
-                {params.project_name || "—"} • {params.to_pole_code || "—"}
-              </Text>
-            </View>
-          </View>
-
-          <View style={styles.progressCard}>
-            <View style={styles.progressTopRow}>
-              <Text style={styles.progressTitle}>Completion Tracker</Text>
-              <View style={styles.timerBadge}>
-                <Text style={styles.timerText}>
-                  ⏱ {String(Math.floor(elapsedSecs / 60)).padStart(2, "0")}:
-                  {String(elapsedSecs % 60).padStart(2, "0")}
-                </Text>
-              </View>
-              <Text style={[styles.progressPercent, { color: accentColor }]}>
-                {progress.percent}%
-              </Text>
-            </View>
-
-            <View style={styles.trackerRow}>
-              <TrackerMini done={hasGps} label="GPS" />
-              <TrackerMini done={!!photoBefore} label="Before" />
-              <TrackerMini done={!!photoAfter} label="After" />
-              <TrackerMini done={!!photoTag} label="Tag" />
-              <TrackerMini done={!!slot} label="Slot" />
-              <TrackerMini done={!!landmark.trim()} label="Landmark" />
-            </View>
-
-            <ProgressWaveBar
-              progress={progress.percent}
-              accentColor={accentColor}
-            />
-          </View>
-
-          {/* ── Pole Teardown Session ─────────────────────────────────── */}
-          <View style={styles.sectionCard}>
-            {!poleStartedAt ? (
-              // Not yet started
-              <View style={styles.poleSessionGate}>
-                <View style={styles.poleSessionGateIcon}>
-                  <Play size={22} color="#0B7A5A" fill="#0B7A5A" />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.poleSessionGateTitle}>Start Pole Teardown</Text>
-                  <Text style={styles.poleSessionGateSub}>
-                    Record when you began working on this pole. Start time and duration are saved to the backend.
+              {/* Top line: badge + timer */}
+              <View style={[styles.heroTopLine, { justifyContent: "space-between" }]}>
+                <View style={[styles.heroBadge, {
+                  backgroundColor: `${accentColor}25`,
+                  borderColor: `${accentColor}50`,
+                  maxWidth: "70%",
+                }]}>
+                  <Text style={[styles.heroBadgeText, { color: "#A7F3D0" }]} numberOfLines={1}>
+                    📍  DESTINATION POLE
                   </Text>
                 </View>
-                <TouchableOpacity
-                  style={[styles.poleSessionStartBtn, poleStarting && { opacity: 0.6 }]}
-                  activeOpacity={0.8}
-                  onPress={handleStartPoleTeardown}
-                  disabled={poleStarting}
-                >
-                  {poleStarting
-                    ? <ActivityIndicator size="small" color="#FFFFFF" />
-                    : <Text style={styles.poleSessionStartBtnText}>Start</Text>
-                  }
-                </TouchableOpacity>
+                {poleStartedAt && (
+                  <View style={styles.heroTopTimerPill}>
+                    <Text style={styles.heroTopTimerIcon}>⏱</Text>
+                    <Text style={styles.heroTopTimerText}>
+                      {String(Math.floor(poleDuration / 60)).padStart(2, "0")}:{String(poleDuration % 60).padStart(2, "0")}
+                    </Text>
+                  </View>
+                )}
               </View>
-            ) : (
-              // Session active
-              <View style={styles.poleSessionActive}>
-                <View style={styles.poleSessionRow}>
-                  <Timer size={14} color="#0B7A5A" />
-                  <Text style={styles.poleSessionDuration}>{fmtDuration(poleDuration)}</Text>
-                  <View style={styles.poleSessionActiveBadge}>
-                    <View style={styles.poleSessionActiveDot} />
-                    <Text style={styles.poleSessionActiveBadgeText}>Active</Text>
+
+              {/* Title + edit */}
+              <View style={styles.heroMainBlock}>
+                <View style={styles.heroTitleRowWrapper}>
+                  <Text style={styles.heroTitle} numberOfLines={2}>
+                    {editedToPoleName || params.to_pole_code || "Destination Pole"}
+                  </Text>
+                  <TouchableOpacity
+                    style={styles.heroEditPill}
+                    onPress={() => { setEditToNameDraft(editedToPoleName); setEditToNameModalOpen(true); }}
+                  >
+                    <Text style={styles.heroEditPillIcon}>✎</Text>
+                    <Text style={styles.heroEditPillText}>EDIT</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* Integrated footer: summary table + progress */}
+              <View style={styles.heroIntegratedFooter}>
+                {/* Summary table */}
+                <View style={styles.heroSummaryTable}>
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>STARTED AT</Text>
+                    <Text style={styles.heroSummaryValue}>
+                      {poleStartedAt ? fmtPHT(poleStartedAt) : "—"}
+                    </Text>
+                  </View>
+                  <View style={styles.heroSummaryDivider} />
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>ELAPSED</Text>
+                    <Text style={[styles.heroSummaryValue, { color: poleStartedAt ? "#FBBF24" : "#94A3B8" }]}>
+                      {poleStartedAt ? fmtDuration(poleDuration) : "—"}
+                    </Text>
+                  </View>
+                  <View style={styles.heroSummaryDivider} />
+                  <View style={styles.heroSummaryCol}>
+                    <Text style={styles.heroSummaryLabel}>STATUS</Text>
+                    <Text style={[styles.heroSummaryValue, {
+                      color: !poleStartedAt ? "#94A3B8" : progress.percent >= 100 ? "#A7F3D0" : "#FBBF24",
+                    }]}>
+                      {!poleStartedAt ? "Pending" : progress.percent >= 100 ? "Ready" : "In Progress"}
+                    </Text>
                   </View>
                 </View>
-                <View style={styles.poleSessionMeta}>
-                  <Text style={styles.poleSessionMetaLabel}>Started</Text>
-                  <Text style={styles.poleSessionMetaValue}>{fmtPHT(poleStartedAt)}</Text>
+
+                {/* Start button — only when not yet started */}
+                {!poleStartedAt && (
+                  <TouchableOpacity
+                    style={[styles.heroPoleStartBtn, poleStarting && { opacity: 0.6 }]}
+                    activeOpacity={0.85}
+                    onPress={handleStartPoleTeardown}
+                    disabled={poleStarting}
+                  >
+                    {poleStarting
+                      ? <ActivityIndicator size="small" color="#FFFFFF" style={{ marginRight: 8 }} />
+                      : <Play size={14} color="#FFFFFF" fill="#FFFFFF" style={{ marginRight: 6 } as any} />}
+                    <Text style={styles.heroPoleStartBtnText}>
+                      {poleStarting ? "Starting…" : "Start Pole Teardown"}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {/* Progress section */}
+                <View style={styles.heroFooterHeaderRow}>
+                  <Text style={styles.heroFooterTitle}>PROGRESS</Text>
+                  <Text style={[styles.heroFooterPercentText, { color: accentColor }]}>
+                    {progress.percent}%
+                  </Text>
+                </View>
+                <View style={styles.heroTrackerNodesRow}>
+                  <TrackerMini done={hasGps}          label="GPS" />
+                  <TrackerMini done={!!photoBefore}   label="Before" />
+                  <TrackerMini done={!!photoAfter}    label="After" />
+                  <TrackerMini done={!!photoTag}      label="Tag" />
+                  <TrackerMini done={!!slot}          label="Slot" />
+                  <TrackerMini done={!!landmark.trim()} label="Landmark" />
+                </View>
+                <View style={{ marginTop: 4 }}>
+                  <ProgressWaveBar progress={progress.percent} accentColor={accentColor} />
                 </View>
               </View>
-            )}
+            </View>
           </View>
 
           <View style={styles.sectionCard}>
@@ -1243,53 +1283,49 @@ export default function DestinationPoleScreen() {
             />
 
             {hasGps && capturedGps ? (
-              <>
-                <View style={styles.spanPoleRow}>
-                  <View style={styles.spanPoleBox}>
-                    <View style={[styles.spanPoleDot, { backgroundColor: accentColor }]} />
-                    <Text style={[styles.spanPoleCode, { color: accentColor }]} numberOfLines={1}>{params.pole_code || "FROM"}</Text>
-                    <Text style={styles.spanPoleLabel}>From</Text>
-                  </View>
-                  <View style={styles.spanConnector}>
-                    <View style={[styles.spanLine, { borderColor: `${accentColor}50` }]} />
-                    {params.length_meters ? (
-                      <View style={[styles.spanDistBadge, { backgroundColor: `${accentColor}12` }]}>
-                        <Text style={[styles.spanDistText, { color: accentColor }]}>{params.length_meters}m</Text>
-                      </View>
-                    ) : null}
-                    <View style={[styles.spanLine, { borderColor: `${accentColor}50` }]} />
-                  </View>
-                  <View style={styles.spanPoleBox}>
-                    <View style={[styles.spanPoleDot, { backgroundColor: "#6366F1" }]} />
-                    <Text style={[styles.spanPoleCode, { color: "#6366F1" }]} numberOfLines={1}>{editedToPoleName || params.to_pole_code || "TO"}</Text>
-                    <Text style={styles.spanPoleLabel}>To</Text>
-                  </View>
+              <TouchableOpacity
+                activeOpacity={0.95}
+                onPress={() => setMapFullscreen(true)}
+                style={styles.gpsMapBox}
+              >
+                <WebView
+                  style={StyleSheet.absoluteFillObject}
+                  scrollEnabled={false}
+                  originWhitelist={["*"]}
+                  javaScriptEnabled
+                  domStorageEnabled
+                  mixedContentMode="always"
+                  source={{
+                    html: buildPoleMapHtml(
+                      capturedGps.latitude,
+                      capturedGps.longitude,
+                      accentColor,
+                      mapSatellite,
+                    ),
+                    baseUrl: "https://local.telcovantage/",
+                  }}
+                  cacheEnabled={false}
+                  pointerEvents="none"
+                />
+                <TouchableOpacity
+                  style={styles.mapLayerBtn}
+                  onPress={() => setMapSatellite((v) => !v)}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Text style={styles.mapLayerBtnText}>
+                    {mapSatellite ? "🗺 Map" : "🛰 Sat"}
+                  </Text>
+                </TouchableOpacity>
+                <View style={styles.mapExpandHint}>
+                  <Text style={styles.mapExpandHintText}>⛶ Tap to expand</Text>
                 </View>
-                <View style={styles.gpsMapBox}>
-                  <WebView
-                    style={StyleSheet.absoluteFillObject}
-                    scrollEnabled={false}
-                    originWhitelist={["*"]}
-                    javaScriptEnabled
-                    domStorageEnabled
-                    mixedContentMode="always"
-                    source={{
-                      html: buildSpanMapHtml(
-                        parseFloat(params.from_pole_latitude || "0"),
-                        parseFloat(params.from_pole_longitude || "0"),
-                        params.pole_code || "FROM",
-                        capturedGps.latitude,
-                        capturedGps.longitude,
-                        editedToPoleName || params.to_pole_code || "TO",
-                        accentColor,
-                        false,
-                      ),
-                      baseUrl: "https://local.telcovantage/",
-                    }}
-                    cacheEnabled={false}
-                  />
+                <View style={styles.mapCoordsOverlay}>
+                  <Text style={styles.mapCoordsText}>
+                    {capturedGps.latitude.toFixed(6)},{"  "}
+                    {capturedGps.longitude.toFixed(6)}
+                  </Text>
                 </View>
-              </>
+              </TouchableOpacity>
             ) : (
               <View style={styles.noGpsPlaceholder}>
                 <Image
@@ -1305,10 +1341,7 @@ export default function DestinationPoleScreen() {
                 styles.gpsCardButton,
                 hasGps
                   ? styles.gpsCardButtonSuccess
-                  : {
-                      borderColor: `${accentColor}35`,
-                      backgroundColor: "#FFFFFF",
-                    },
+                  : styles.gpsCardButtonRequired,
                 pressed && !gpsCapturing && styles.pressedDown,
               ]}
               onPress={captureGps}
@@ -1316,7 +1349,7 @@ export default function DestinationPoleScreen() {
             >
               <View
                 style={[
-                  styles.gpsBigIconWrap,
+                  styles.gpsIconWrap,
                   hasGps
                     ? { backgroundColor: `${accentColor}16` }
                     : { backgroundColor: `${accentColor}10` },
@@ -1324,8 +1357,13 @@ export default function DestinationPoleScreen() {
               >
                 {gpsCapturing ? (
                   <ActivityIndicator color={accentColor} size="small" />
+                ) : hasGps && capturedGps ? (
+                  <StaticTileMap
+                    lat={capturedGps.latitude}
+                    lng={capturedGps.longitude}
+                  />
                 ) : (
-                  <Text style={[styles.gpsEmoji, { color: accentColor }]}>
+                  <Text style={[styles.gpsIcon, { color: accentColor }]}>
                     📍
                   </Text>
                 )}
@@ -1466,12 +1504,15 @@ export default function DestinationPoleScreen() {
           <Pressable
             style={({ pressed }) => [
               styles.submitBtn,
-              { backgroundColor: accentColor },
-              pressed && styles.pressedDown,
+              { backgroundColor: progress.percent >= 100 ? accentColor : "#C9CED6" },
+              pressed && progress.percent >= 100 && styles.pressedDown,
             ]}
-            onPress={goToComponents}
+            onPress={progress.percent >= 100 ? goToComponents : undefined}
+            disabled={progress.percent < 100}
           >
-            <Text style={styles.submitText}>Start Teardown  →</Text>
+            <Text style={styles.submitText}>
+              {progress.percent >= 100 ? "Next  →" : "Complete required fields first"}
+            </Text>
           </Pressable>
         </View>
 
@@ -1567,10 +1608,10 @@ export default function DestinationPoleScreen() {
                 const photo = activeCameraTab === "before" ? photoBefore : activeCameraTab === "after" ? photoAfter : photoTag;
                 const photoQuality = activeCameraTab === "before" ? qualityBefore : activeCameraTab === "after" ? qualityAfter : qualityTag;
                 const clearPhoto = activeCameraTab === "before"
-                  ? () => { setPhotoBefore(null); setQualityBefore(null); cacheSet(`td_quality_before_${params.to_pole_id}`, null).catch(() => {}); }
+                  ? () => { captureGenRef.current++; setBlurWarning(false); setPhotoBefore(null); setQualityBefore(null); cacheSet(`td_quality_before_${params.to_pole_id}`, null).catch(() => {}); }
                   : activeCameraTab === "after"
-                  ? () => { setPhotoAfter(null); setQualityAfter(null); cacheSet(`td_quality_after_${params.to_pole_id}`, null).catch(() => {}); }
-                  : () => { setPhotoTag(null); setQualityTag(null); cacheSet(`td_quality_tag_${params.to_pole_id}`, null).catch(() => {}); };
+                  ? () => { captureGenRef.current++; setBlurWarning(false); setPhotoAfter(null); setQualityAfter(null); cacheSet(`td_quality_after_${params.to_pole_id}`, null).catch(() => {}); }
+                  : () => { captureGenRef.current++; setBlurWarning(false); setPhotoTag(null); setQualityTag(null); cacheSet(`td_quality_tag_${params.to_pole_id}`, null).catch(() => {}); };
                 if (photo && !blurWarning) {
                   const badgeColor = photoQuality === null ? "#6b7280"
                     : photoQuality >= 80 ? "#22c55e"
@@ -1578,7 +1619,7 @@ export default function DestinationPoleScreen() {
                     : photoQuality >= 50 ? "#f97316"
                     : "#ef4444";
                   return (
-                    <View style={{ flex: 1, backgroundColor: "#000" }}>
+                    <View style={{ flex: 1, width: "100%", alignSelf: "stretch", backgroundColor: "#000" }}>
                       <Pressable style={StyleSheet.absoluteFillObject} onPress={clearPhoto}>
                         <ExpoImage source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="contain" />
                         <View style={styles.cameraRetakeBadge}>
@@ -1634,6 +1675,7 @@ export default function DestinationPoleScreen() {
                               <Pressable
                                 style={[styles.blurRetakeBtn, { backgroundColor: accentColor }]}
                                 onPress={() => {
+                                  captureGenRef.current++;
                                   setBlurWarning(false);
                                   if (activeCameraTab === "before") { setPhotoBefore(null); setQualityBefore(null); cacheSet(`td_quality_before_${params.to_pole_id}`, null).catch(() => {}); }
                                   else if (activeCameraTab === "after") { setPhotoAfter(null); setQualityAfter(null); cacheSet(`td_quality_after_${params.to_pole_id}`, null).catch(() => {}); }
@@ -1871,17 +1913,17 @@ const styles = StyleSheet.create({
     marginTop: -2,
   },
 
+  // ── Hero card (matches pole-detail.tsx) ──────────────────────────────────
   heroCard: {
     borderRadius: 30,
     overflow: "hidden",
     marginBottom: 14,
-    minHeight: 164,
-    backgroundColor: "#0B7A5A",
+    backgroundColor: "#0F172A",
     shadowColor: "#000",
-    shadowOpacity: 0.14,
-    shadowRadius: 18,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 7,
+    shadowOpacity: 0.22,
+    shadowRadius: 22,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 10,
   },
 
   heroBg: {
@@ -1889,56 +1931,201 @@ const styles = StyleSheet.create({
     opacity: 1,
   },
 
-  heroNoise: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(255,255,255,0.03)",
+  heroGlowLeft: {
+    position: "absolute",
+    left: -60,
+    bottom: -60,
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    opacity: 0.18,
   },
 
-  heroGlow: {
+  heroGlowRight: {
     position: "absolute",
-    right: -30,
-    top: -20,
-    width: 180,
-    height: 180,
-    borderRadius: 999,
-    backgroundColor: "rgba(255,255,255,0.08)",
+    right: -40,
+    top: -40,
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: "rgba(99,102,241,0.12)",
+  },
+
+  heroGlassOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(15,23,42,0.55)",
   },
 
   heroContent: {
-    paddingHorizontal: 18,
-    paddingVertical: 18,
-    justifyContent: "space-between",
-    flex: 1,
+    paddingHorizontal: 20,
+    paddingVertical: 20,
   },
 
   heroTopLine: {
     flexDirection: "row",
-    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 14,
   },
 
   heroBadge: {
     alignSelf: "flex-start",
-    backgroundColor: "rgba(255,255,255,0.16)",
     paddingHorizontal: 12,
-    paddingVertical: 7,
+    paddingVertical: 6,
     borderRadius: 999,
+    borderWidth: 1,
   },
 
   heroBadgeText: {
-    color: "#FFFFFF",
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.8,
+  },
+
+  heroTopTimerPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "rgba(255,255,255,0.1)",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+
+  heroTopTimerIcon: {
     fontSize: 11,
-    fontWeight: "800",
-    letterSpacing: 0.3,
+  },
+
+  heroTopTimerText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#FFFFFF",
+    fontVariant: ["tabular-nums"] as any,
+  },
+
+  heroMainBlock: {
+    marginBottom: 16,
+  },
+
+  heroTitleRowWrapper: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
   },
 
   heroTitle: {
-    marginTop: 18,
-    fontSize: 28,
+    flex: 1,
+    fontSize: 26,
     fontWeight: "900",
     color: "#FFFFFF",
-    letterSpacing: -0.6,
+    letterSpacing: -0.5,
   },
 
+  heroEditPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    marginTop: 4,
+  },
+
+  heroEditPillIcon: {
+    fontSize: 12,
+    color: "rgba(255,255,255,0.8)",
+  },
+
+  heroEditPillText: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: "rgba(255,255,255,0.8)",
+    letterSpacing: 0.5,
+  },
+
+  // Integrated footer inside hero
+  heroIntegratedFooter: {
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderRadius: 18,
+    padding: 14,
+    gap: 12,
+  },
+
+  heroSummaryTable: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+
+  heroSummaryCol: {
+    flex: 1,
+    alignItems: "center",
+  },
+
+  heroSummaryLabel: {
+    fontSize: 8,
+    fontWeight: "900",
+    color: "rgba(255,255,255,0.45)",
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
+    marginBottom: 3,
+  },
+
+  heroSummaryValue: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#FFFFFF",
+    textAlign: "center",
+  },
+
+  heroSummaryDivider: {
+    width: 1,
+    height: 32,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    marginHorizontal: 2,
+  },
+
+  heroPoleStartBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(11,122,90,0.85)",
+    borderRadius: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: "rgba(167,243,208,0.3)",
+  },
+
+  heroPoleStartBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
+
+  heroFooterHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+
+  heroFooterTitle: {
+    fontSize: 9,
+    fontWeight: "900",
+    color: "rgba(255,255,255,0.45)",
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
+  },
+
+  heroFooterPercentText: {
+    fontSize: 14,
+    fontWeight: "900",
+  },
+
+  heroTrackerNodesRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+
+  // Keep heroMeta for any remaining usage
   heroTitleRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -2020,43 +2207,13 @@ const styles = StyleSheet.create({
   },
 
   heroMeta: {
-    marginTop: 8,
-    fontSize: 13,
-    color: "rgba(255,255,255,0.82)",
+    marginTop: 4,
+    fontSize: 12,
+    color: "rgba(255,255,255,0.5)",
     fontWeight: "600",
   },
 
-  progressCard: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 22,
-    padding: 14,
-    marginBottom: 18,
-    borderWidth: 1,
-    borderColor: "#EAECEF",
-    shadowColor: "#0F172A",
-    shadowOpacity: 0.035,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 2,
-  },
-
-  progressTopRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 10,
-  },
-
-  progressTitle: {
-    fontSize: 15,
-    fontWeight: "900",
-    color: "#111827",
-  },
-
-  progressPercent: {
-    fontSize: 13,
-    fontWeight: "900",
-  },
+  // progressCard removed — merged into hero integrated footer
 
   trackerRow: {
     flexDirection: "row",
@@ -2214,62 +2371,64 @@ const styles = StyleSheet.create({
     opacity: 0.15,
   },
   gpsMapBox: {
-    height: 180,
-    backgroundColor: "#F3F4F6",
-    borderRadius: 14,
+    height: 200,
+    borderRadius: 20,
     overflow: "hidden",
-    marginTop: 8,
-    marginBottom: 16,
+    marginBottom: 12,
+    backgroundColor: "#0d1117",
   },
-  spanPoleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 14,
+  mapLayerBtn: {
+    position: "absolute",
+    top: 10,
+    right: 10,
+    backgroundColor: "rgba(0,0,0,0.65)",
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+    zIndex: 10,
   },
-  spanPoleBox: {
-    flex: 1,
-    alignItems: "center",
-    gap: 4,
+  mapLayerBtnText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "700",
   },
-  spanPoleDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    marginBottom: 2,
+  mapExpandHint: {
+    position: "absolute",
+    top: 10,
+    left: 10,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    zIndex: 10,
   },
-  spanPoleCode: {
-    fontSize: 15,
-    fontWeight: "900",
-    textAlign: "center",
-  },
-  spanPoleLabel: {
+  mapExpandHintText: {
+    color: "rgba(255,255,255,0.85)",
     fontSize: 10,
     fontWeight: "600",
-    color: "#9CA3AF",
-    textTransform: "uppercase",
+  },
+  mapCoordsOverlay: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    paddingVertical: 7,
+    paddingHorizontal: 14,
+    zIndex: 10,
+  },
+  mapCoordsText: {
+    color: "#fff",
+    fontSize: 11,
+    fontFamily: "monospace",
+    fontWeight: "600",
+    textAlign: "center",
     letterSpacing: 0.5,
   },
-  spanConnector: {
-    flex: 2,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
-  spanLine: {
-    flex: 1,
-    borderTopWidth: 2,
-    borderStyle: "dashed",
-  },
-  spanDistBadge: {
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  spanDistText: {
-    fontSize: 11,
-    fontWeight: "800",
-  },
-
   gpsCardButton: {
     borderWidth: 1.25,
     borderRadius: 22,
@@ -2278,13 +2437,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
     backgroundColor: "#FFFFFF",
   },
-
   gpsCardButtonSuccess: {
     backgroundColor: "#F7FBF9",
     borderColor: "#CFE7DB",
   },
-
-  gpsBigIconWrap: {
+  gpsCardButtonRequired: {
+    backgroundColor: "#FFFBEB",
+    borderColor: "#F59E0B",
+    borderWidth: 1.5,
+  },
+  gpsIconWrap: {
     width: 56,
     height: 56,
     borderRadius: 18,
@@ -2292,16 +2454,13 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginRight: 12,
   },
-
-  gpsEmoji: {
+  gpsIcon: {
     fontSize: 24,
   },
-
   gpsTextWrap: {
     flex: 1,
     paddingRight: 10,
   },
-
   gpsEyebrow: {
     fontSize: 10,
     fontWeight: "900",
@@ -2310,14 +2469,12 @@ const styles = StyleSheet.create({
     marginBottom: 4,
     textTransform: "uppercase",
   },
-
   gpsCoordinateText: {
     fontSize: 16,
     lineHeight: 21,
     color: "#111827",
     fontWeight: "900",
   },
-
   gpsLocationText: {
     marginTop: 5,
     fontSize: 12,
@@ -2325,14 +2482,12 @@ const styles = StyleSheet.create({
     color: "#667085",
     fontWeight: "500",
   },
-
   gpsCapturedAt: {
     fontSize: 11,
     color: "#475467",
     fontWeight: "600",
     marginTop: 6,
   },
-
   gpsArrowWrap: {
     width: 34,
     height: 34,
@@ -2341,12 +2496,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   gpsArrow: {
     fontSize: 18,
     fontWeight: "900",
   },
-
   gpsPendingLabel: {
     fontSize: 11,
     color: "#B45309",

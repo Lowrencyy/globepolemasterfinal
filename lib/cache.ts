@@ -35,3 +35,13 @@ export async function cacheSet(key: string, value: unknown): Promise<void> {
     // ignore write errors
   }
 }
+export async function clearAllCache(): Promise<void> {
+  try {
+    const info = await FileSystem.getInfoAsync(CACHE_DIR);
+    if (info.exists) {
+      await FileSystem.deleteAsync(CACHE_DIR, { idempotent: true });
+    }
+  } catch {
+    // ignore errors
+  }
+}

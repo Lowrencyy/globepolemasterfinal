@@ -690,7 +690,7 @@ export default function TeardownComponentsScreen() {
         const path = dir + file;
         const info = await FileSystem.getInfoAsync(path);
         if (info.exists) {
-          result[key] = { uri: info.uri, name: file, type: "image/jpeg" };
+          result[key] = { uri: info.uri, name: file, type: "image/jpeg" } as any;
           if ("modificationTime" in info && info.modificationTime) {
             photoTimestamps.current[key] = new Date(
               info.modificationTime * 1000,
@@ -723,7 +723,7 @@ export default function TeardownComponentsScreen() {
         uri: cableInfo.uri,
         name: `${fromCode}_cable.jpg`,
         type: "image/jpeg",
-      });
+      } as any);
       if ("modificationTime" in cableInfo && cableInfo.modificationTime) {
         photoTimestamps.current.before_span = new Date(
           cableInfo.modificationTime * 1000,
@@ -875,7 +875,7 @@ export default function TeardownComponentsScreen() {
         uri: draftDir + fileName,
         name: fileName,
         type: "image/jpeg",
-      });
+      } as any);
     }
   }
 

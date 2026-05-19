@@ -1634,7 +1634,7 @@ export default function DestinationPoleScreen() {
                           </View>
                         </View>
                       </Pressable>
-                      {capturedGps?.lat && capturedGps?.lng && (
+                      {(capturedGps as any)?.lat && (capturedGps as any)?.lng && (
                         <View
                           style={{
                             position: "absolute",
@@ -1654,7 +1654,7 @@ export default function DestinationPoleScreen() {
                           <Text style={{ fontSize: 16, marginRight: 8 }}>📍</Text>
                           <View>
                             <Text style={{ color: "#FFF", fontSize: 12, fontWeight: "600" }}>Geotag Location</Text>
-                            <Text style={{ color: "#9CA3AF", fontSize: 11 }}>{capturedGps.lat.toFixed(6)}, {capturedGps.lng.toFixed(6)}</Text>
+                            <Text style={{ color: "#9CA3AF", fontSize: 11 }}>{(capturedGps as any).lat.toFixed(6)}, {(capturedGps as any).lng.toFixed(6)}</Text>
                           </View>
                         </View>
                       )}

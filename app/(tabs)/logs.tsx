@@ -17,7 +17,7 @@ import {
   X,
   Zap,
 } from "lucide-react-native";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
   Image,
@@ -1159,6 +1159,7 @@ export default function LogsScreen() {
             </View>
           </View>
 
+          {featured && (
           <View style={s.mapCard}>
             <View style={s.sectionHeader}>
               <View>
@@ -1186,6 +1187,7 @@ export default function LogsScreen() {
               nodeName={featured.nodeName}
             />
           </View>
+          )}
 
           <View style={s.logsHeader}>
             <View>

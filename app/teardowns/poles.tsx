@@ -4,6 +4,7 @@ import { cacheGet, cacheSet } from "@/lib/cache";
 import { getPHTNow } from "@/lib/display-time";
 import { gpsQueueReadAll } from "@/lib/gps-queue";
 import { simpleQueuePush } from "@/lib/simple-queue";
+import { getTileCacheDir, offlineTileLayerJs } from "@/lib/tile-cache";
 import { getNodeDetail, getNodePoles, SkycablePole, startNodeTeardown, startPoleTeardown } from "@/services/skycable";
 import * as Location from "expo-location";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -139,6 +140,7 @@ function StaticTileMap({ lat, lng }: { lat: number; lng: number }) {
 // ─── Multi-point vicinity map (WebView Leaflet) ──────────────────────────────
 function buildVicinityMapHtml(locs: { lat: number; lng: number; cleared: boolean }[]): string {
   const locsJson = JSON.stringify(locs);
+  const offlineJs = offlineTileLayerJs(getTileCacheDir());
   return `<!DOCTYPE html><html><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
@@ -156,7 +158,8 @@ html,body,#map{width:100%;height:100%;overflow:hidden;background:#1a1a2e;}
 (function(){
   var locs=${locsJson};
   var map=L.map('map',{zoomControl:false,attributionControl:false,dragging:false,scrollWheelZoom:false,doubleClickZoom:false,touchZoom:false,keyboard:false}).setView([14.5995,120.9842],13);
-  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19}).addTo(map);
+  ${offlineJs}
+  addOfflineTiles(map);
   if(!locs.length)return;
   var bounds=[];
   locs.forEach(function(l){
@@ -211,6 +214,7 @@ function VicinityMap({
 // ─── Full Leaflet map HTML for WebView preview ───────────────────────────────
 // Copied from explore.tsx buildBaseMapHtml — same init pattern that's proven to work
 function buildPolesMapHtml(): string {
+  const offlineJs = offlineTileLayerJs(getTileCacheDir());
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -340,7 +344,8 @@ html,body,#map{
   function init(){
     if(map) return;
     map = L.map("map", {zoomControl:true, attributionControl:false, preferCanvas:true}).setView(PH_CENTER, 13);
-    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {maxZoom:19}).addTo(map);
+    ${offlineJs}
+    addOfflineTiles(map);
     L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png", {maxZoom:21, opacity:0.9, subdomains:"abcd"}).addTo(map);
     markerGroup = L.layerGroup().addTo(map);
     hideFallback();
@@ -696,20 +701,12 @@ export default function PolesScreen() {
   const lastPosRef = useRef<{ lat: number; lng: number } | null>(null);
   const lastHdgRef = useRef<number>(0);
   // Always-current ref for mapPolePins so MAP_READY never reads a stale closure
-  const mapPolePinsRef = useRef(mapPolePins);
-
-  // Keep ref in sync so MAP_READY handler always uses the latest poles
-  mapPolePinsRef.current = mapPolePins;
+  // Initialized empty; synced on every render below (after mapPolePins is declared)
+  const mapPolePinsRef = useRef<ReturnType<typeof Array<any>>>([]);
 
   useEffect(() => {
     if (!mapPreviewVisible) setMapReady(false);
   }, [mapPreviewVisible]);
-
-  useEffect(() => {
-    if (!mapReady || !mapPreviewVisible) return;
-    const j = JSON.stringify(mapPolePins);
-    mapWvRef.current?.injectJavaScript(`if(window.setPoles)window.setPoles(${j});true;`);
-  }, [mapReady, mapPolePins, mapPreviewVisible]);
 
   // ── Live GPS position + native compass heading → injected into map WebView ─
   useEffect(() => {
@@ -826,8 +823,8 @@ export default function PolesScreen() {
       cacheGet<SkycablePole[]>(CACHE_KEY).then(async cached => {
         if (cached?.length) {
           setPoles(await mergeGps(cached));
-          setLoading(false);
         }
+        setLoading(false); // Always unblock UI after cache check
 
         // Always fetch fresh from API regardless of cache
         getNodePoles(Number(nodeId), token)
@@ -864,8 +861,7 @@ export default function PolesScreen() {
           })
           .catch(() => {
             if (!cached?.length) setOffline(true);
-          })
-          .finally(() => setLoading(false));
+          });
       });
     }, [token, nodeId])
   );
@@ -913,6 +909,15 @@ export default function PolesScreen() {
         })),
     [poles]
   );
+  // Keep ref in sync so MAP_READY handler always uses the latest poles
+  mapPolePinsRef.current = mapPolePins;
+
+  // Inject updated pole pins when map is ready and visible
+  useEffect(() => {
+    if (!mapReady || !mapPreviewVisible) return;
+    const j = JSON.stringify(mapPolePins);
+    mapWvRef.current?.injectJavaScript(`if(window.setPoles)window.setPoles(${j});true;`);
+  }, [mapReady, mapPolePins, mapPreviewVisible]);
 
   // ── Sync progress to backend ─────────────────────────────────────────────
   const lastSyncedPct = useRef<number | null>(null);

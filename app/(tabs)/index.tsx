@@ -412,19 +412,18 @@ export default function HomeScreen() {
           </View>
         )}
 
+        {/* ── Quick Actions ───────────────────────────── */}
         <View style={styles.quickActionsSection}>
           <View style={styles.sectionHeaderRow}>
             <View>
               <Text style={styles.sectionEyebrow}>START FASTER</Text>
               <Text style={styles.sectionTitle}>Quick Actions</Text>
             </View>
-
             <View style={styles.sectionBadge}>
               <Sparkles size={13} color="#2563EB" />
               <Text style={styles.sectionBadgeText}>Tools</Text>
             </View>
           </View>
-
           <View style={styles.actionGridBig}>
             <BigActionCard
               icon={<Map size={24} color="#059669" />}
@@ -436,6 +435,7 @@ export default function HomeScreen() {
             />
           </View>
         </View>
+
       </ScrollView>
     </SafeAreaView>
   );

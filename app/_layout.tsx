@@ -2,13 +2,13 @@ import { DarkTheme, DefaultTheme, ThemeProvider } from "@react-navigation/native
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useFonts } from "expo-font";
 import * as SplashScreen from "expo-splash-screen";
-import { Stack } from "expo-router";
+import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
 import "react-native-reanimated";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
-import { AuthProvider } from "@/context/auth-context";
+import { AuthProvider, useAuth } from "@/context/auth-context";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 
 SplashScreen.preventAutoHideAsync();
@@ -16,6 +16,31 @@ SplashScreen.preventAutoHideAsync();
 export const unstable_settings = {
   anchor: "(tabs)",
 };
+
+// Runs inside the navigator — imperatively redirects based on auth state.
+function AuthGate() {
+  const { isReady, isLoggedIn, mustChangePassword } = useAuth();
+  const router = useRouter();
+  const segments = useSegments();
+
+  useEffect(() => {
+    if (!isReady) return;
+
+    const root = segments[0] as string | undefined;
+    const onLogin = root === "login";
+    const onChangePw = root === "change-password";
+
+    if (!isLoggedIn && !onLogin) {
+      router.replace("/login");
+    } else if (isLoggedIn && mustChangePassword && !onChangePw) {
+      router.replace("/change-password");
+    } else if (isLoggedIn && !mustChangePassword && (onLogin || onChangePw)) {
+      router.replace("/(tabs)");
+    }
+  }, [isReady, isLoggedIn, mustChangePassword, segments]);
+
+  return null;
+}
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -32,18 +57,17 @@ export default function RootLayout() {
       <AuthProvider>
         <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
           <Stack>
-            <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
             <Stack.Screen name="login" options={{ headerShown: false }} />
             <Stack.Screen name="change-password" options={{ headerShown: false, gestureEnabled: false }} />
+            <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
             <Stack.Screen name="teardowns" options={{ headerShown: false }} />
             <Stack.Screen name="naps" options={{ headerShown: false }} />
             <Stack.Screen name="delivery" options={{ headerShown: false }} />
+            <Stack.Screen name="delivery/pickup-request" options={{ headerShown: false }} />
             <Stack.Screen name="warehouse" options={{ headerShown: false }} />
-            <Stack.Screen
-              name="modal"
-              options={{ presentation: "modal", title: "Modal" }}
-            />
+            <Stack.Screen name="modal" options={{ presentation: "modal", title: "Modal" }} />
           </Stack>
+          <AuthGate />
           <StatusBar style="auto" />
         </ThemeProvider>
       </AuthProvider>

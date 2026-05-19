@@ -22,6 +22,7 @@ async function prefetchCoreData(token: string, user: GlobeUser) {
 }
 
 type AuthContextType = {
+  isReady: boolean;
   isLoggedIn: boolean;
   token: string | null;
   user: GlobeUser | null;
@@ -32,6 +33,7 @@ type AuthContextType = {
 };
 
 const AuthContext = createContext<AuthContextType>({
+  isReady: false,
   isLoggedIn: false,
   token: null,
   user: null,
@@ -45,6 +47,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [user, setUser] = useState<GlobeUser | null>(null);
   const [mustChangePassword, setMustChangePassword] = useState(false);
+  const [isReady, setIsReady] = useState(false);
 
   // Rehydrate token from persistent store on app start.
   // On a fresh APK install the data directory may still exist from a previous
@@ -59,7 +62,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await clearAllCache();
         await clearAllQueues();
         await tokenStore.markInstalled();
-        return; // isLoggedIn stays false → redirected to login
+        setIsReady(true); // isLoggedIn stays false → redirected to login
+        return;
       }
 
       const saved = await tokenStore.get();
@@ -71,7 +75,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setNetSyncToken(saved);
         startNetSync();
         startLocationTracking();
-        // Prefetch teardown areas in background so they're cached before first navigation
         if (savedUser) prefetchCoreData(saved, savedUser).catch(() => {});
       }
 
@@ -79,6 +82,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setUser(savedUser);
         if (savedUser.password_reset_required) setMustChangePassword(true);
       }
+
+      setIsReady(true);
     })();
   }, []);
 
@@ -121,7 +126,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ isLoggedIn: !!token, token, user, mustChangePassword, login, logout, clearPasswordReset }}
+      value={{ isReady, isLoggedIn: !!token, token, user, mustChangePassword, login, logout, clearPasswordReset }}
     >
       {children}
     </AuthContext.Provider>

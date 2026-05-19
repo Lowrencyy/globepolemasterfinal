@@ -28,7 +28,8 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { BASE_URL } from "@/lib/api";
-import { cacheSet } from "@/lib/cache";
+import { cacheGet, cacheSet } from "@/lib/cache";
+import { cacheLocations, cachePhilippines } from "@/lib/tile-cache";
 import { useRouter } from "expo-router";
 import {
   processSyncQueue,
@@ -41,7 +42,6 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 const API_BASE_URL = BASE_URL;
 
 const HEALTH_ENDPOINT = "/ping";
-const SYNC_ENDPOINT = "/ping";
 
 type StepStatus = "idle" | "running" | "success" | "error";
 
@@ -286,11 +286,13 @@ export default function ProfileScreen() {
     const pendingCount = await queueCount();
 
     const steps: ModalStep[] = [
-      { id: "upload", label: "Upload pending field reports", status: "idle" },
-      { id: "areas", label: "Fetch areas", status: "idle" },
-      { id: "nodes", label: "Fetch nodes", status: "idle" },
-      { id: "poles", label: "Fetch poles for each node", status: "idle" },
-      { id: "finish", label: "Cache saved — ready for offline", status: "idle" },
+      { id: "upload",   label: "Upload pending field reports",     status: "idle" },
+      { id: "areas",   label: "Fetch areas",                       status: "idle" },
+      { id: "nodes",   label: "Fetch nodes",                       status: "idle" },
+      { id: "poles",   label: "Fetch poles for each node",         status: "idle" },
+      { id: "ph_tiles",label: "Cache Philippines map tiles",       status: "idle" },
+      { id: "loc_tiles",label: "Cache high-zoom pole area tiles",  status: "idle" },
+      { id: "finish",  label: "All data saved — ready for offline",status: "idle" },
     ];
 
     setBusyAction("sync");
@@ -326,7 +328,10 @@ export default function ProfileScreen() {
       for (const area of areas) {
         const res = await getNodes(area.id, token, teamId);
         const nodes = res.data;
+        // Save under both plain key (read by downloadSitemapData) and
+        // team-scoped key (read by nodes.tsx when teamId is present)
         await cacheSet(`sitemap_nodes_${area.id}`, nodes);
+        if (teamId) await cacheSet(`sitemap_nodes_${area.id}_team_${teamId}`, nodes);
         allNodes.push({ areaId: area.id, nodes });
         totalNodes += nodes.length;
         updateStep("nodes", { status: "running", detail: `${totalNodes} nodes fetched…` });
@@ -353,7 +358,51 @@ export default function ProfileScreen() {
       }
       updateStep("poles", { status: "success", detail: `${totalPoles} pole${totalPoles !== 1 ? "s" : ""} cached.` });
 
-      // 5. Save last sync timestamp
+      // 5. Cache Philippines overview map tiles (zoom 6–10, ~2 000 tiles)
+      updateStep("ph_tiles", { status: "running", detail: "Downloading Philippines tiles (zoom 6–10)…" });
+      try {
+        const phRes = await cachePhilippines((done, total) => {
+          updateStep("ph_tiles", { status: "running", detail: `${done}/${total} tiles…` });
+        });
+        updateStep("ph_tiles", {
+          status: "success",
+          detail: `${phRes.downloaded} new · ${phRes.skipped} already cached · ${phRes.failed} failed`,
+        });
+      } catch (e: any) {
+        updateStep("ph_tiles", { status: "error", detail: e?.message ?? "Tile download failed" });
+      }
+
+      // 6. Cache high-zoom tiles around every known pole location (zoom 11–15)
+      updateStep("loc_tiles", { status: "running", detail: "Collecting pole GPS coordinates…" });
+      try {
+        const locSet: { lat: number; lng: number }[] = [];
+        for (const { nodes } of allNodes) {
+          for (const node of nodes) {
+            const cached = await cacheGet<any[]>(`sitemap_poles_${node.id}`).catch(() => null);
+            if (!cached) continue;
+            for (const p of cached) {
+              if (p.pole?.lat && p.pole?.lng) {
+                locSet.push({ lat: parseFloat(p.pole.lat), lng: parseFloat(p.pole.lng) });
+              }
+            }
+          }
+        }
+        if (locSet.length) {
+          const locRes = await cacheLocations(locSet, [11, 12, 13, 14, 15], (done, total) => {
+            updateStep("loc_tiles", { status: "running", detail: `${done}/${total} tiles…` });
+          });
+          updateStep("loc_tiles", {
+            status: "success",
+            detail: `${locRes?.downloaded ?? 0} new · ${locRes?.skipped ?? 0} already cached · ${locSet.length} GPS points covered`,
+          });
+        } else {
+          updateStep("loc_tiles", { status: "success", detail: "No GPS coordinates found — skipped." });
+        }
+      } catch (e: any) {
+        updateStep("loc_tiles", { status: "error", detail: e?.message ?? "Location tile download failed" });
+      }
+
+      // 7. Save last sync timestamp
       const now = new Date();
       const formatted = `${now.getMonth() + 1}/${now.getDate()} ${now.getHours()}:${now.getMinutes().toString().padStart(2, "0")}`;
       setLastSyncDate(formatted);
@@ -606,9 +655,11 @@ export default function ProfileScreen() {
           <View style={styles.statDiv} />
 
           <View style={styles.statItem}>
-            <Text style={styles.statLabel}>Today&apos;s Teardown</Text>
-            <Text style={styles.statValue}>0</Text>
-            <Text style={styles.statSub}>completed</Text>
+            <Text style={styles.statLabel}>Queue Status</Text>
+            <Text style={[styles.statValue, { color: "#374151", fontSize: 14 }]}>
+              {pendingSyncCount > 0 ? "Pending" : "Synced"}
+            </Text>
+            <Text style={styles.statSub}>upload queue</Text>
           </View>
         </View>
 

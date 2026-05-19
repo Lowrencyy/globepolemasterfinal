@@ -6,6 +6,16 @@ import { Map, Search, X, ChevronLeft } from "lucide-react-native";
 import { getAreas, SkycableArea, SkycableNode, SkycablePole } from "@/services/skycable";
 import { useAuth } from "@/context/auth-context";
 import { cacheGet, cacheSet } from "@/lib/cache";
+import { getTileUri, networkUrl } from "@/lib/tile-cache";
+
+// Resolves to a file:// URI if the tile is cached on disk, else HTTPS.
+function TileImage({
+  z, y, x, style,
+}: { z: number; y: number; x: number; style: any }) {
+  const [uri, setUri] = useState(() => networkUrl(z, y, x));
+  useEffect(() => { getTileUri(z, y, x).then(setUri); }, [z, y, x]);
+  return <Image source={{ uri }} style={style} resizeMode="cover" />;
+}
 
 // ─── Vicinity Map (reused from nodes.tsx pattern) ─────────────────────────────
 const TILE_PX = 256;
@@ -63,14 +73,13 @@ function VicinityMap({ locs }: { locs: { lat: number; lng: number }[] }) {
 
   return (
     <View style={StyleSheet.absoluteFillObject} onLayout={onLayout}>
-      {/* 3×3 tile grid — covers full vertical + horizontal extent */}
+      {/* 3×3 tile grid — cached locally when available, falls back to HTTPS */}
       {([-1, 0, 1] as const).flatMap(dy =>
         ([-1, 0, 1] as const).map(dx => (
-          <Image
+          <TileImage
             key={`${dx}-${dy}`}
-            source={{ uri: `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${tileY + dy}/${tileX + dx}` }}
+            z={zoom} y={tileY + dy} x={tileX + dx}
             style={{ position: "absolute", left: offsetX + dx * imgW, top: offsetY + dy * imgH, width: imgW, height: imgH }}
-            resizeMode="cover"
           />
         ))
       )}

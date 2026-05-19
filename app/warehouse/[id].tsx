@@ -184,7 +184,7 @@ export default function DeliveryDetailScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
-      <SafeAreaView style={s.container} edges={["top"]}>
+      <SafeAreaView style={s.container as any} edges={["top"]}>
         <View style={s.header}>
           <TouchableOpacity onPress={() => router.back()} style={s.backBtn} activeOpacity={0.75}>
             <ChevronLeft size={23} color={INK} />
@@ -410,7 +410,7 @@ const shadow = Platform.select({
   },
 });
 
-const s = StyleSheet.create({
+const s: any = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: BG,
@@ -763,7 +763,7 @@ const s = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     color: MUTED,
-    fontWeight: "650",
+    fontWeight: "600",
   },
   approveBtn: {
     height: 62,
@@ -828,7 +828,7 @@ const s = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     color: MUTED,
-    fontWeight: "650",
+    fontWeight: "600",
     marginTop: 3,
   },
   modalBackdrop: {

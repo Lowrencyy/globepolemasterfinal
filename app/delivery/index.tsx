@@ -22,7 +22,7 @@ import {
 import { Stack, useFocusEffect, useRouter } from "expo-router";
 import {
   AlertCircle, Box, Cable, ChevronLeft,
-  ChevronRight, Clock, Hash, Package,
+  ChevronRight, Clock, ClipboardList, Hash, Package,
   RefreshCw, Send,
 } from "lucide-react-native";
 import { useCallback, useMemo, useState } from "react";
@@ -356,12 +356,32 @@ export default function DeliveryScreen() {
               <RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadData(true); }} colors={[G]} />
             }
             ListHeaderComponent={
-              <TodaySummary
-                logs={todayLogs}
-                totals={todayTotals}
-                onSubmit={handleSubmit}
-                submitting={submitting}
-              />
+              <>
+                {/* Delivery Report button */}
+                <TouchableOpacity
+                  style={s.reportBtn}
+                  onPress={() => router.push("/delivery/deliverylist" as any)}
+                  activeOpacity={0.85}
+                >
+                  <View style={s.reportBtnLeft}>
+                    <View style={s.reportBtnIcon}>
+                      <ClipboardList size={20} color={G} />
+                    </View>
+                    <View>
+                      <Text style={s.reportBtnTitle}>Delivery Reports</Text>
+                      <Text style={s.reportBtnSub}>View all received deliveries & confirmation photos</Text>
+                    </View>
+                  </View>
+                  <ChevronRight size={18} color={G} />
+                </TouchableOpacity>
+
+                <TodaySummary
+                  logs={todayLogs}
+                  totals={todayTotals}
+                  onSubmit={handleSubmit}
+                  submitting={submitting}
+                />
+              </>
             }
             renderItem={({ item }) => (
               <DeliveryCard
@@ -401,6 +421,11 @@ const s = StyleSheet.create({
   list:           { padding: 16, gap: 12, paddingBottom: 48 },
   empty:          { alignItems: "center", paddingTop: 40, gap: 10 },
   emptyTitle:     { fontSize: 15, fontWeight: "700", color: MUTED },
+  reportBtn:      { flexDirection: "row", alignItems: "center", justifyContent: "space-between", backgroundColor: WHITE, borderRadius: 18, padding: 14, borderWidth: 1.5, borderColor: G + "40", marginBottom: 12, shadowColor: G, shadowOpacity: 0.07, shadowRadius: 8, shadowOffset: { width: 0, height: 3 }, elevation: 2 },
+  reportBtnLeft:  { flexDirection: "row", alignItems: "center", gap: 12, flex: 1 },
+  reportBtnIcon:  { width: 44, height: 44, borderRadius: 12, backgroundColor: "#ECFDF5", alignItems: "center", justifyContent: "center" },
+  reportBtnTitle: { fontSize: 14, fontWeight: "900", color: SLATE },
+  reportBtnSub:   { fontSize: 11, fontWeight: "600", color: MUTED, marginTop: 2, flexShrink: 1 },
 });
 
 const dc = StyleSheet.create({

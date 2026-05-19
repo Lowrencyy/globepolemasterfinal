@@ -1,6 +1,13 @@
 import { useAuth } from "@/context/auth-context";
 import { cacheGet, cacheSet } from "@/lib/cache";
+import { getTileUri, networkUrl } from "@/lib/tile-cache";
 import { getNodes, SkycableNode, SkycablePole } from "@/services/skycable";
+
+function TileImage({ z, y, x, style }: { z: number; y: number; x: number; style: any }) {
+  const [uri, setUri] = useState(() => networkUrl(z, y, x));
+  useEffect(() => { getTileUri(z, y, x).then(setUri); }, [z, y, x]);
+  return <Image source={{ uri }} style={style} resizeMode="cover" />;
+}
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { CalendarCheck2, CalendarClock, ChevronLeft, Layers, Search, X } from "lucide-react-native";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -59,9 +66,9 @@ function PolesVicinityMap({ locs }: { locs: { lat: number; lng: number }[] }) {
 
   return (
     <View style={StyleSheet.absoluteFillObject} onLayout={onLayout}>
-      <Image source={{ uri: `${tileBase}/${tileX - 1}` }} style={{ position: "absolute", left: offsetX - imgW, top: offsetY, width: imgW, height: imgH }} resizeMode="cover" />
-      <Image source={{ uri: `${tileBase}/${tileX}` }} style={{ position: "absolute", left: offsetX, top: offsetY, width: imgW, height: imgH }} resizeMode="cover" />
-      <Image source={{ uri: `${tileBase}/${tileX + 1}` }} style={{ position: "absolute", left: offsetX + imgW, top: offsetY, width: imgW, height: imgH }} resizeMode="cover" />
+      <TileImage z={zoom} y={tileY} x={tileX - 1} style={{ position: "absolute", left: offsetX - imgW, top: offsetY, width: imgW, height: imgH }} />
+      <TileImage z={zoom} y={tileY} x={tileX}     style={{ position: "absolute", left: offsetX,        top: offsetY, width: imgW, height: imgH }} />
+      <TileImage z={zoom} y={tileY} x={tileX + 1} style={{ position: "absolute", left: offsetX + imgW, top: offsetY, width: imgW, height: imgH }} />
       {size && locs.length > 1 && (
         <View style={{ position: "absolute", left: boxLeft, top: boxTop, width: boxW, height: boxH, borderWidth: 2.5, borderColor: "#F59E0B", backgroundColor: "rgba(245,158,11,0.12)", borderRadius: 4 }} />
       )}
@@ -240,21 +247,22 @@ export default function NodesScreen() {
     async function loadNodes() {
       if (!token || !areaId) return;
 
-      // Use team-scoped cache key so unfiltered (admin) cache
-      // doesn't bleed into filtered (team) views
+      // Team-scoped key is written by the nodes screen itself; plain key is
+      // written by the profile "Download Data" sync and downloadSitemapData().
+      // Try team-scoped first, fall back to plain so synced data is always found.
       const CACHE_KEY = teamId
         ? `sitemap_nodes_${areaId}_team_${teamId}`
         : `sitemap_nodes_${areaId}`;
+      const CACHE_KEY_PLAIN = `sitemap_nodes_${areaId}`;
 
-      // Show cached data instantly while we fetch fresh
-      const cached = await cacheGet<SkycableNode[]>(CACHE_KEY);
-      if (cached?.length) {
-        setNodes(cached);
-        setLoading(false);
+      let cached = await cacheGet<SkycableNode[]>(CACHE_KEY);
+      if (!cached?.length && CACHE_KEY !== CACHE_KEY_PLAIN) {
+        cached = await cacheGet<SkycableNode[]>(CACHE_KEY_PLAIN);
       }
 
-      // Always fetch from API so team filter is applied — cache is only
-      // for instant display, not for skipping the network call
+      if (cached?.length) setNodes(cached);
+      setLoading(false); // Always unblock UI after cache check
+
       try {
         const response = await getNodes(Number(areaId), token, teamId);
         setNodes(response.data);
@@ -262,8 +270,6 @@ export default function NodesScreen() {
         setOffline(false);
       } catch {
         if (!cached?.length) setOffline(true);
-      } finally {
-        setLoading(false);
       }
     }
     loadNodes();

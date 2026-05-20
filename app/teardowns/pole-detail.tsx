@@ -22,6 +22,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
   Easing,
   Image,
   Modal,
@@ -37,6 +38,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import { WebView } from "react-native-webview";
 import { buildPoleMapHtml, StaticTileMap } from "./components";
+import { captureEvents } from "@/lib/capture-events";
+
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 
 type PhotoField = {
   uri: string;
@@ -158,6 +162,41 @@ function createPhotoField(
   };
 }
 
+function parseGpsAddress(raw: any): { road: string; city: string; province: string } {
+  const city = String(raw?.city ?? raw?.district ?? raw?.subregion ?? raw?.region ?? "").trim();
+  const province = String(raw?.region ?? raw?.country ?? "").trim();
+
+  const streetCore = String(raw?.street ?? raw?.road ?? raw?.pedestrian ?? "").trim();
+  const streetNumber = String(raw?.streetNumber ?? "").trim();
+  const combinedStreet = [streetNumber, streetCore].filter(Boolean).join(" ").trim();
+
+  const blocked = new Set(
+    [city, province, `${city}, ${province}`]
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+
+  const roadCandidates = [
+    combinedStreet,
+    streetCore,
+    String(raw?.name ?? "").trim(),
+    String(raw?.neighborhood ?? "").trim(),
+    String(raw?.subLocality ?? "").trim(),
+    String(raw?.streetNumber ?? "").trim(),
+  ].filter(Boolean);
+
+  const road =
+    roadCandidates.find((value) => !blocked.has(value.toLowerCase())) ?? "";
+
+  return { road, city, province };
+}
+
+function staticMapUrl(lat: number, lng: number) {
+  const w = Math.round(SCREEN_W * 0.35 * 2);
+  const h = Math.round(SCREEN_H * 0.22 * 2);
+  return `https://staticmap.openstreetmap.de/staticmap.php?center=${lat},${lng}&zoom=16&size=${w}x${h}&markers=${lat},${lng},red`;
+}
+
 function TrackerMini({ done, label }: { done: boolean; label: string }) {
   return (
     <View style={styles.trackerMini}>
@@ -267,48 +306,54 @@ function PhotoTile({
   accentColor,
   onCapture,
   onView,
+  disabled,
 }: {
   label: string;
   photo: PhotoField;
   accentColor: string;
   onCapture: () => void;
   onView: () => void;
+  disabled?: boolean;
 }) {
   return (
     <Pressable
-      style={[styles.photoTileCard, photo ? { borderColor: accentColor } : {}]}
-      onPress={photo ? onView : onCapture}
+      style={[styles.photoTileCard, photo ? { borderColor: accentColor } : {}, disabled && { opacity: 0.45 }]}
+      onPress={disabled ? undefined : photo ? onView : onCapture}
+      disabled={disabled}
     >
       <View style={styles.photoTileImgWrap}>
         {photo ? (
           <>
             <ExpoImage
+              key={photo.version}
               source={{ uri: photo.uri }}
               style={StyleSheet.absoluteFillObject}
               contentFit="cover"
-              transition={150}
+              cachePolicy="none"
+              transition={100}
             />
-            <View style={[styles.photoDoneBadge, { backgroundColor: accentColor }]}>
-              <Text style={styles.photoDoneBadgeText}>✓</Text>
-            </View>
             <View style={styles.photoViewHint}>
               <Text style={styles.photoViewHintText}>VIEW</Text>
             </View>
           </>
         ) : (
           <View style={styles.photoTilePlaceholder}>
-            <Image
-              source={require("../../assets/images/telco-mainlogo.png")}
-              style={styles.photoTilePlaceholderLogo}
-              resizeMode="contain"
-            />
-            <Text style={styles.photoTilePlaceholderText}>Not yet captured</Text>
+            <Text style={styles.photoTileCameraIcon}>📷</Text>
+            <Text style={styles.photoTileTapText}>Tap to capture</Text>
           </View>
         )}
       </View>
-      <Text style={[styles.photoTileLabel, photo ? { color: accentColor } : {}]}>
-        {label}
-      </Text>
+      {/* Label + checkmark row */}
+      <View style={styles.photoTileLabelRow}>
+        <Text style={[styles.photoTileLabel, photo ? { color: accentColor } : {}]}>
+          {label.toUpperCase()}
+        </Text>
+        {photo && (
+          <View style={[styles.photoTileCheck, { backgroundColor: accentColor }]}>
+            <Text style={styles.photoTileCheckText}>✓</Text>
+          </View>
+        )}
+      </View>
     </Pressable>
   );
 }
@@ -349,7 +394,7 @@ function rr(ctx,x,y,w,h,r){
   ctx.closePath();
 }
 
-function drawStamp(ctx,img,lines,mapB64){
+function drawStamp(ctx,img,lines,mapB64,mapDotX,mapDotY,mapTiles){
   var W=img.width,H=img.height;
   var gap=Math.round(W*0.012);          // ~6px on 500px wide, scales with resolution
   var fSize=Math.min(
@@ -362,15 +407,17 @@ function drawStamp(ctx,img,lines,mapB64){
   var panelH=lines.length*lh+vPad*2;
   var r=Math.round(panelH*0.14);        // corner radius
 
-  // Map panel: square, same height as text panel
-  var mapSize=mapB64?panelH:0;
+  // Map panel: square, same height as text panel — aligned flush
+  var mapSize=(mapB64||(mapTiles&&mapTiles.length))?panelH:0;
   // Text panel width fills remaining space
   var textW=W-gap*2-mapSize-(mapSize?gap:0);
 
-  // Panel Y position: gap from bottom
+  // Panel Y position: align text panel bottom with map panel bottom
+  // Both panels same height — share the same Y position
   var panelY=H-panelH-gap;
+  var mapY=panelY;
 
-  // Subtle gradient fade behind both panels
+  // Gradient fade behind both panels (same height)
   var fadeH=panelH+gap*4;
   var grad=ctx.createLinearGradient(0,H-fadeH,0,H);
   grad.addColorStop(0,'rgba(0,0,0,0)');
@@ -404,21 +451,31 @@ function drawStamp(ctx,img,lines,mapB64){
     ctx.shadowBlur=0;
   }
 
-  function drawMapPanel(mapImg){
+  function drawMapPanel(mapImgs){
     var mx=gap+textW+gap;
-    var my=panelY;
+    var my=mapY;
     ctx.save();
     rr(ctx,mx,my,mapSize,mapSize,r);
     ctx.clip();
-    // tile fills square
-    var scale=Math.max(mapSize/256,mapSize/256);
-    var tw=256*scale,th=256*scale;
-    ctx.drawImage(mapImg,mx+(mapSize-tw)/2,my+(mapSize-th)/2,tw,th);
-    // subtle vignette on map
-    ctx.fillStyle='rgba(0,0,0,0.18)';ctx.fillRect(mx,my,mapSize,mapSize);
-    // GPS dot centered
+    // Offset tile so captured GPS lands at CENTER of the panel
+    var dotFX=(mapDotX!=null&&!isNaN(mapDotX))?mapDotX:0.5;
+    var dotFY=(mapDotY!=null&&!isNaN(mapDotY))?mapDotY:0.5;
+    if(Array.isArray(mapImgs)){
+      mapImgs.forEach(function(t){
+        if(!t||!t.img)return;
+        var dx=Number(t.dx)||0,dy=Number(t.dy)||0;
+        ctx.drawImage(t.img,mx+(dx+0.5-dotFX)*mapSize,my+(dy+0.5-dotFY)*mapSize,mapSize,mapSize);
+      });
+    }else if(mapImgs){
+      ctx.drawImage(mapImgs, mx+(0.5-dotFX)*mapSize, my+(0.5-dotFY)*mapSize, mapSize, mapSize);
+    }
+    // subtle vignette
+    ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(mx,my,mapSize,mapSize);
+    // GPS dot always at center of the panel
     var dotR=Math.round(mapSize*0.07);
-    ctx.beginPath();ctx.arc(mx+mapSize/2,my+mapSize/2,dotR,0,2*Math.PI);
+    var dX=mx+mapSize/2;
+    var dY=my+mapSize/2;
+    ctx.beginPath();ctx.arc(dX,dY,dotR,0,2*Math.PI);
     ctx.fillStyle='#EF4444';ctx.fill();
     ctx.strokeStyle='#FFFFFF';ctx.lineWidth=Math.max(2,Math.round(dotR*0.35));ctx.stroke();
     ctx.restore();
@@ -429,11 +486,30 @@ function drawStamp(ctx,img,lines,mapB64){
     window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
   }
 
-  if(mapB64&&mapSize>0){
-    var mapImg=new Image();
-    mapImg.onload=function(){drawTextPanel();drawMapPanel(mapImg);finish();};
-    mapImg.onerror=function(){drawTextPanel();finish();};
-    mapImg.src='data:image/jpeg;base64,'+mapB64;
+  function loadMapImages(cb){
+    var tilePayload=Array.isArray(mapTiles)?mapTiles.filter(function(t){return t&&t.b64;}):[];
+    if(tilePayload.length){
+      var loaded=[],pending=tilePayload.length;
+      tilePayload.forEach(function(t){
+        var im=new Image();
+        im.onload=function(){loaded.push({img:im,dx:Number(t.dx)||0,dy:Number(t.dy)||0});if(--pending===0)cb(loaded.length?loaded:null);};
+        im.onerror=function(){if(--pending===0)cb(loaded.length?loaded:null);};
+        im.src='data:image/png;base64,'+t.b64;
+      });
+      return;
+    }
+    if(mapB64){
+      var mapImg=new Image();
+      mapImg.onload=function(){cb(mapImg);};
+      mapImg.onerror=function(){cb(null);};
+      mapImg.src='data:image/png;base64,'+mapB64;
+      return;
+    }
+    cb(null);
+  }
+
+  if(mapSize>0&&(mapB64||(mapTiles&&mapTiles.length))){
+    loadMapImages(function(mapImgs){drawTextPanel();if(mapImgs)drawMapPanel(mapImgs);finish();});
   }else{
     drawTextPanel();finish();
   }
@@ -447,7 +523,7 @@ function stamp(payload){
     c.width=img.width;c.height=img.height;
     var ctx=c.getContext('2d');
     ctx.drawImage(img,0,0);
-    drawStamp(ctx,img,data.lines,data.mapB64||null);
+    drawStamp(ctx,img,data.lines,data.mapB64||null,data.mapDotX!=null?data.mapDotX:0.5,data.mapDotY!=null?data.mapDotY:0.5,data.mapTiles||null);
   };
   img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({error:'load'}));};
   img.src='data:image/jpeg;base64,'+data.b64;
@@ -456,6 +532,61 @@ document.addEventListener('message',function(e){stamp(e.data);});
 window.addEventListener('message',function(e){stamp(e.data);});
 window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
 <\/script></body></html>`;
+
+type StreetTileInfo = {
+  url: string;
+  tileX: number;
+  tileY: number;
+  zoom: number;
+  dotX: number;
+  dotY: number;
+};
+
+type StampMapTile = { b64: string; dx: number; dy: number };
+type StampMapResult = { b64: string; tiles: StampMapTile[]; dotX: number; dotY: number };
+
+const STREET_TILE_OFFSETS = [-1, 0, 1] as const;
+const CARTO_SUBDOMAINS = ["a", "b", "c", "d"] as const;
+
+function streetTileUrlFor(tileX: number, tileY: number, zoom: number): string {
+  // Spread requests across CARTO subdomains to reduce missing tiles under load.
+  const idx = Math.abs(tileX + tileY) % CARTO_SUBDOMAINS.length;
+  const sub = CARTO_SUBDOMAINS[idx];
+  return `https://${sub}.basemaps.cartocdn.com/rastertiles/voyager/${zoom}/${tileX}/${tileY}.png`;
+}
+
+function MapThumbnail({ info }: { info: StreetTileInfo }) {
+  const [sz, setSz] = React.useState(0);
+  return (
+    <View
+      style={{ aspectRatio: 1, alignSelf: "stretch", borderRadius: 10, overflow: "hidden", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.35)" }}
+      onLayout={e => setSz(e.nativeEvent.layout.width)}
+    >
+      {sz > 0 && STREET_TILE_OFFSETS.map(dy =>
+        STREET_TILE_OFFSETS.map(dx => (
+          <Image
+            key={`${dx}:${dy}`}
+            source={{ uri: streetTileUrlFor(info.tileX + dx, info.tileY + dy, info.zoom) }}
+            style={{
+              position: "absolute",
+              width: sz,
+              height: sz,
+              left: (dx + 0.5 - info.dotX) * sz,
+              top: (dy + 0.5 - info.dotY) * sz,
+            }}
+            resizeMode="cover"
+          />
+        )),
+      )}
+      <View style={{ position: "absolute", top: "50%", left: "50%", width: 12, height: 12, borderRadius: 6, backgroundColor: "#EF4444", borderWidth: 2, borderColor: "#FFF", marginLeft: -6, marginTop: -6 }} />
+      <View style={{ position: "absolute", bottom: 4, left: 0, right: 0, alignItems: "center" }}>
+        <View style={{ backgroundColor: "rgba(0,0,0,0.65)", borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 }}>
+          <Text style={{ color: "#FFF", fontSize: 8, fontWeight: "900", letterSpacing: 0.7 }}>STREET</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
 
 export default function PoleDetailScreen() {
   const {
@@ -552,8 +683,13 @@ export default function PoleDetailScreen() {
 
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerLabel, setViewerLabel] = useState("");
-  const [viewerPhoto, setViewerPhoto] = useState<PhotoField>(null);
+  const [viewerTab, setViewerTab] = useState<"before" | "after" | "tag" | null>(null);
   const [viewerRetake, setViewerRetake] = useState<(() => void) | null>(null);
+  const viewerPhoto =
+    viewerTab === "before" ? photoBefore :
+    viewerTab === "after"  ? photoAfter  :
+    viewerTab === "tag"    ? photoTag    :
+    null;
 
   // ── Teardown gate ──────────────────────────────────────────────────────────
   const teardownStartedKey = `teardown_started_${pole_id}`;
@@ -571,6 +707,29 @@ export default function PoleDetailScreen() {
   const blurResolverRef = useRef<((variance: number) => void) | null>(null);
   const stampRef = useRef<WebView>(null);
   const stampResolverRef = useRef<((b64: string | null) => void) | null>(null);
+  // Pre-loaded map tile cache — populated as soon as GPS is available so
+  // stamping is instant (no network call during photo processing).
+  const mapTileCache = useRef<StampMapResult | null>(null);
+  const gpsWarmKeyRef = useRef("");
+  const gpsWarmPromiseRef = useRef<Promise<void> | null>(null);
+  const captureMapPrefetchedRef = useRef(false);
+  const captureReturnKey = `__pole_capture_${pole_id}`;
+  // Timestamp of the last fresh capture — draft loader skips overwriting for 3s after a capture
+  const lastFreshCaptureRef = useRef(0);
+
+  // Instant card update via event emitter — fires before navigation animation starts
+  useEffect(() => {
+    return captureEvents.on((result) => {
+      if (result.ownerType !== "pole-detail" || String(result.ownerPoleId) !== String(pole_id ?? "")) return;
+      const tab  = result.tab;
+      const setter = tab === "before" ? setPhotoBefore : tab === "after" ? setPhotoAfter : setPhotoTag;
+      const file   = tab === "before" ? `pole_${pole_id}_before.jpg`
+                   : tab === "after"  ? `pole_${pole_id}_after.jpg`
+                                      : `pole_${pole_id}_poletag.jpg`;
+      lastFreshCaptureRef.current = Date.now();
+      setter(createPhotoField(result.uri, file));
+    });
+  }, [pole_id]);
   const [elapsedSecs, setElapsedSecs] = useState(0);
   useEffect(() => {
     if (!teardownStarted || timerStartRef.current === null || poleFinishedAt) return;
@@ -743,9 +902,15 @@ export default function PoleDetailScreen() {
           const polesList = await cacheGet<any[]>(`sitemap_poles_${node_id}`).catch(() => null);
           const match = polesList?.find((p) => String(p.pole_id) === String(pole_id));
           if (match?.pole?.lat && match?.pole?.lng) {
-            setLat(parseFloat(match.pole.lat));
-            setLng(parseFloat(match.pole.lng));
-            setGpsFromSitemap(true); // sitemap APK pre-placed these coords
+            const pLat = parseFloat(match.pole.lat);
+            const pLng = parseFloat(match.pole.lng);
+            setLat(pLat);
+            setLng(pLng);
+            setGpsFromSitemap(true);
+            // Pre-load map tile in background as soon as GPS is known
+            fetchMapTileB64(pLat, pLng)
+              .then(r => { if (r) mapTileCache.current = r; })
+              .catch(() => {});
           }
         }
       })
@@ -910,6 +1075,9 @@ export default function PoleDetailScreen() {
           };
         };
 
+        // Skip overwrite if a fresh capture just happened (race guard)
+        if (Date.now() - lastFreshCaptureRef.current < 3000) return;
+
         const [pb, pa, pt] = await Promise.all([
           loadFile(F.before),
           loadFile(F.after),
@@ -926,28 +1094,6 @@ export default function PoleDetailScreen() {
       return () => { cancelled = true; };
     }, [draftDir, F.before, F.after, F.tag]),
   );
-
-  useEffect(() => {
-    if (!lat || !lng) return;
-
-    fetch(
-      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`,
-      {
-        headers: { "Accept-Language": "en", "User-Agent": "TelcoVantage/1.0" },
-      },
-    )
-      .then((r) => r.json())
-      .then((data) => {
-        const a = data?.address;
-        if (!a) return;
-        const s =
-          a.road ?? a.pedestrian ?? a.footway ?? a.street ?? a.path ?? null;
-        setStreet(s ?? "");
-        setCity(a.city ?? a.town ?? a.municipality ?? a.village ?? a.suburb ?? "");
-        setProvince(a.province ?? a.state ?? a.county ?? "");
-      })
-      .catch(() => {});
-  }, [lat, lng]);
 
   function handleBlurMessage(event: { nativeEvent: { data: string } }) {
     try {
@@ -971,16 +1117,17 @@ export default function PoleDetailScreen() {
   function buildStampLines(tab: "before" | "after" | "tag"): string[] {
     const name = editedPoleName || pole_name || pole_code || "";
     const tabLabel = tab === "before" ? "BEFORE" : tab === "after" ? "AFTER" : "POLE TAG";
-    const now = new Date();
-    // "Apr 13, 2026  14:33:57"
-    const datePart = now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "Asia/Manila" });
-    const timePart = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "Asia/Manila" });
-    const dateTimeLine = `${datePart}  ${timePart}`;
+    // Use server-synced PHT time — cannot be spoofed by changing device clock
+    const phtIso = getPHTNow(); // "2026-05-19T23:34:50+08:00"
+    const [datePart, timeRaw] = phtIso.substring(0, 19).split("T");
+    const [yr, mo, dy] = datePart.split("-").map(Number);
+    const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const dateTimeLine = `${MON[mo - 1]} ${dy}, ${yr}  ${timeRaw}`;
     const lines: string[] = [dateTimeLine];
     if (street) lines.push(street);
     const cityProv = [city, province].filter(Boolean).join(", ");
     if (cityProv) lines.push(cityProv);
-    if (lat && lng) {
+    if (lat != null && lng != null) {
       const latStr = `${Math.abs(lat).toFixed(6)}\u00b0 ${lat >= 0 ? "N" : "S"}`;
       const lngStr = `${Math.abs(lng).toFixed(6)}\u00b0 ${lng >= 0 ? "E" : "W"}`;
       lines.push(`${latStr}  ${lngStr}`);
@@ -988,24 +1135,79 @@ export default function PoleDetailScreen() {
     lines.push(`${name}  (${tabLabel})`);
     const nodeLabel = node_name || node_code || node_id || "";
     if (nodeLabel) lines.push(`Node: ${nodeLabel}`);
-    const isoTime = getPHTNow().replace("T", " ").substring(0, 19) + " PHT";
-    lines.push(`${isoTime}  \u2022  ${project_name || ""}`);
     return lines;
   }
 
-  async function fetchMapTileB64(lat: number, lng: number): Promise<string | null> {
+  /** Returns tile URL + exact fractional position (0-1) of the GPS point within the tile. */
+  function streetTileInfo(lat: number, lng: number, zoom = 18): StreetTileInfo {
+    const n = Math.pow(2, zoom);
+    const xFrac = ((lng + 180) / 360) * n;
+    const latRad = (lat * Math.PI) / 180;
+    const yFrac = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
+    const tileX = Math.floor(xFrac);
+    const tileY = Math.floor(yFrac);
+    return {
+      url: streetTileUrlFor(tileX, tileY, zoom),
+      tileX,
+      tileY,
+      zoom,
+      dotX: xFrac - tileX,   // 0 = left edge of tile, 1 = right edge
+      dotY: yFrac - tileY,   // 0 = top edge of tile, 1 = bottom edge
+    };
+  }
+
+  async function fetchMapTileB64(lat: number, lng: number): Promise<StampMapResult | null> {
     try {
-      const z = 17;
-      const n = Math.pow(2, z);
-      const tileX = Math.floor(((lng + 180) / 360) * n);
-      const latRad = (lat * Math.PI) / 180;
-      const tileY = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
-      const url = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${tileY}/${tileX}`;
-      const tmp = `${FileSystem.cacheDirectory}maptile_${Date.now()}.jpg`;
-      const dl = await FileSystem.downloadAsync(url, tmp);
-      const b64 = await FileSystem.readAsStringAsync(dl.uri, { encoding: "base64" as any });
-      FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {});
-      return b64;
+      const { tileX, tileY, zoom, dotX, dotY } = streetTileInfo(lat, lng, 18);
+      const requests: { dx: number; dy: number }[] = [];
+
+      STREET_TILE_OFFSETS.forEach(dy => {
+        STREET_TILE_OFFSETS.forEach(dx => {
+          requests.push({
+            dx,
+            dy,
+          });
+        });
+      });
+
+      const results = await Promise.all(
+        requests.map(async ({ dx, dy }) => {
+          const fullTileX = tileX + dx;
+          const fullTileY = tileY + dy;
+
+          // Try CARTO subdomains first, then fall back to standard OSM tiles.
+          const startIdx = Math.abs(fullTileX + fullTileY) % CARTO_SUBDOMAINS.length;
+          const cartoCandidates = [
+            ...CARTO_SUBDOMAINS.slice(startIdx),
+            ...CARTO_SUBDOMAINS.slice(0, startIdx),
+          ].map(sub => `https://${sub}.basemaps.cartocdn.com/rastertiles/voyager/${zoom}/${fullTileX}/${fullTileY}.png`);
+
+          const candidates = [
+            ...cartoCandidates,
+            `https://tile.openstreetmap.org/${zoom}/${fullTileX}/${fullTileY}.png`,
+          ];
+
+          for (let attempt = 0; attempt < candidates.length; attempt++) {
+            const url = candidates[attempt];
+            const tmp = `${FileSystem.cacheDirectory}maptile_${Date.now()}_${dx}_${dy}_${attempt}.png`;
+            try {
+              const dl = await FileSystem.downloadAsync(url, tmp);
+              const b64 = await FileSystem.readAsStringAsync(dl.uri, { encoding: "base64" as any });
+              return { b64, dx, dy };
+            } catch {
+              // try next candidate
+            } finally {
+              FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {});
+            }
+          }
+
+          return null;
+        }),
+      );
+      const tiles = results.filter((tile): tile is StampMapTile => !!tile);
+      const centerTile = tiles.find(tile => tile.dx === 0 && tile.dy === 0);
+      if (!centerTile) return null;
+      return { b64: centerTile.b64, tiles, dotX, dotY };
     } catch {
       return null;
     }
@@ -1014,8 +1216,16 @@ export default function PoleDetailScreen() {
   async function stampPhoto(uri: string, lines: string[], lat?: number | null, lng?: number | null): Promise<string> {
     try {
       const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" as any });
-      const mapB64 = lat && lng ? await fetchMapTileB64(lat, lng).catch(() => null) : null;
-      const payload = JSON.stringify({ b64, lines, mapB64 });
+      // Use pre-loaded tile cache (filled when GPS was captured) — no network wait
+      const mapResult = mapTileCache.current
+        ?? (lat != null && lng != null ? await fetchMapTileB64(lat, lng).catch(() => null) : null);
+      const payload = JSON.stringify({
+        b64, lines,
+        mapB64:  mapResult?.b64  ?? null,
+        mapTiles: mapResult?.tiles ?? null,
+        mapDotX: mapResult?.dotX ?? 0.5,
+        mapDotY: mapResult?.dotY ?? 0.5,
+      });
       return new Promise<string>((resolve) => {
         const timer = setTimeout(() => {
           stampResolverRef.current = null;
@@ -1107,7 +1317,7 @@ export default function PoleDetailScreen() {
       await FileSystem.copyAsync({ from: stamped, to: viewDest });
       displayUri = viewDest;
       // Save stamped copy to device gallery (lineman backup)
-      MediaLibrary.requestPermissionsAsync()
+      MediaLibrary.requestPermissionsAsync(true)
         .then(({ status }) => {
           if (status === "granted") MediaLibrary.saveToLibraryAsync(stamped).catch(() => {});
         })
@@ -1217,10 +1427,11 @@ export default function PoleDetailScreen() {
   }
 
 
-  function openViewer(label: string, photo: PhotoField, retakeFn: () => void) {
+  function openViewer(tab: "before" | "after" | "tag", retakeFn: () => void) {
+    const photo = tab === "before" ? photoBefore : tab === "after" ? photoAfter : photoTag;
     if (!photo) return;
-    setViewerLabel(label);
-    setViewerPhoto(photo);
+    setViewerLabel(tab === "before" ? "Before" : tab === "after" ? "After" : "Tag");
+    setViewerTab(tab);
     setViewerRetake(() => retakeFn);
     setViewerOpen(true);
   }
@@ -1236,6 +1447,174 @@ export default function PoleDetailScreen() {
     return Math.round(R * c);
   }
 
+  const warmPoleGpsBundle = useCallback(async (
+    nextLat: number,
+    nextLng: number,
+    opts?: { force?: boolean },
+  ) => {
+    const key = `${nextLat.toFixed(6)},${nextLng.toFixed(6)}`;
+    if (!opts?.force && gpsWarmKeyRef.current === key && gpsWarmPromiseRef.current) {
+      return gpsWarmPromiseRef.current;
+    }
+
+    gpsWarmKeyRef.current = key;
+    captureMapPrefetchedRef.current = false;
+
+    const warmPromise = (async () => {
+      await Promise.allSettled([
+        fetchMapTileB64(nextLat, nextLng).then((result) => {
+          if (result) mapTileCache.current = result;
+        }),
+        Location.reverseGeocodeAsync({ latitude: nextLat, longitude: nextLng }).then((res) => {
+          const a = res[0];
+          if (!a) return;
+          const parsed = parseGpsAddress(a);
+          setStreet(parsed.road);
+          setCity(parsed.city);
+          setProvince(parsed.province);
+        }),
+        Image.prefetch(staticMapUrl(nextLat, nextLng)).then((ok) => {
+          captureMapPrefetchedRef.current = !!ok;
+        }),
+      ]);
+    })();
+
+    gpsWarmPromiseRef.current = warmPromise;
+    await warmPromise;
+  }, []);
+
+  useEffect(() => {
+    if (lat == null || lng == null) return;
+    warmPoleGpsBundle(lat, lng).catch(() => {});
+  }, [lat, lng, warmPoleGpsBundle]);
+
+  const openSharedCapture = useCallback((tab: "before" | "after" | "tag") => {
+    if (lat == null || lng == null) return;
+    const tabLabel = tab === "before" ? "BEFORE" : tab === "after" ? "AFTER" : "POLE TAG";
+    router.push({
+      pathname: "/capture" as any,
+      params: {
+        tab,
+        returnKey: captureReturnKey,
+        ownerType: "pole-detail",
+        ownerPoleId: String(pole_id ?? ""),
+        label: tabLabel,
+        poleCode: editedPoleName || pole_name || pole_code || "Pole",
+        nodeName: node_name || node_code || node_id || "",
+        lat: String(lat),
+        lng: String(lng),
+        road: street,
+        city,
+        province,
+        prefetchedMap: captureMapPrefetchedRef.current ? "1" : "0",
+      },
+    });
+  }, [
+    captureReturnKey,
+    city,
+    editedPoleName,
+    lat,
+    lng,
+    node_code,
+    node_id,
+    node_name,
+    pole_code,
+    pole_id,
+    pole_name,
+    province,
+    street,
+  ]);
+
+  // Stable refs so applyCaptureResult's useCallback doesn't restart mid-stamp
+  // when setter(createPhotoField) triggers a re-render and recreates these functions.
+  const buildStampLinesRef = useRef(buildStampLines);
+  buildStampLinesRef.current = buildStampLines;
+  const savePhotoDraftRef = useRef(savePhotoDraft);
+  savePhotoDraftRef.current = savePhotoDraft;
+
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+
+      const applyCaptureResult = async () => {
+        const result = (global as any)[captureReturnKey] as
+          | {
+              uri?: string;
+              tab?: "before" | "after" | "tag";
+              ownerType?: string;
+              ownerPoleId?: string;
+              skipStamp?: boolean;
+            }
+          | undefined;
+        if (!result?.uri || !result?.tab) return;
+
+        const expectedPoleId = String(pole_id ?? "");
+        if (result.ownerType !== "pole-detail" || String(result.ownerPoleId ?? "") !== expectedPoleId) {
+          delete (global as any)[captureReturnKey];
+          return;
+        }
+
+        delete (global as any)[captureReturnKey];
+
+        const tab = result.tab;
+        const setter = tab === "before" ? setPhotoBefore : tab === "after" ? setPhotoAfter : setPhotoTag;
+        const qualitySetter = tab === "before" ? setQualityBefore : tab === "after" ? setQualityAfter : setQualityTag;
+        const file = tab === "before" ? F.before : tab === "after" ? F.after : F.tag;
+        const qualityKey = tab === "before"
+          ? `pole_quality_before_${pole_id}`
+          : tab === "after"
+          ? `pole_quality_after_${pole_id}`
+          : `pole_quality_tag_${pole_id}`;
+
+        setActiveCameraTab(tab);
+        setBlurWarning(false);
+
+        const thisGen = ++captureGenRef.current;
+        lastFreshCaptureRef.current = Date.now(); // block draft loader from overwriting for 3s
+        setter(createPhotoField(result.uri, file)); // show raw photo immediately
+
+        try {
+          // Skip re-stamp if capture.tsx already burned the metadata in
+          const stampLines = result.skipStamp ? undefined : buildStampLinesRef.current(tab);
+          const saved = await savePhotoDraftRef.current(file, result.uri, stampLines, lat, lng);
+          if (cancelled || captureGenRef.current !== thisGen) return;
+
+          setter(saved);
+          const capturedAt = getPHTNow();
+          cacheSet(`photo_captured_at_${pole_id}_${tab}`, capturedAt).catch(() => {});
+
+          if (tab === "after") {
+            setAfterCapturedAt(capturedAt);
+            api.put(`/skycable/nodes/${node_id}/poles/${pole_id}`, {
+              cleared_at: capturedAt,
+            }).catch(() => {});
+          }
+
+          const variance = await checkPhotoQuality(saved.fileUri);
+          if (cancelled || captureGenRef.current !== thisGen) return;
+          const pct = varianceToPercent(variance);
+          qualitySetter(pct);
+          cacheSet(qualityKey, pct).catch(() => {});
+          if (variance < 80) setBlurWarning(true);
+        } catch {}
+      };
+
+      applyCaptureResult().catch(() => {});
+      return () => {
+        cancelled = true;
+      };
+    }, [
+      F.after,
+      F.before,
+      F.tag,
+      captureReturnKey,
+      lat,
+      lng,
+      node_id,
+      pole_id,
+    ]),
+  );
+
   async function handleOpenCapture(tab: "before" | "after" | "tag") {
     if (!teardownStarted) {
       setGateAlertModal({ title: "Teardown Not Started", message: "Please tap 'Start Pole Teardown' below to start recording site progress." });
@@ -1246,7 +1625,6 @@ export default function PoleDetailScreen() {
       return;
     }
 
-    // Refresh live distance asynchronously for UI overlay display without blocking preview access
     if (lat !== null && lng !== null) {
       Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
         .then((pos) => {
@@ -1255,10 +1633,11 @@ export default function PoleDetailScreen() {
           if (live) setLiveCoords({ lat: live.latitude, lng: live.longitude });
         })
         .catch(() => {});
+      warmPoleGpsBundle(lat, lng).catch(() => {});
     }
 
     setActiveCameraTab(tab);
-    setShowCameraModal(true);
+    openSharedCapture(tab);
   }
 
   async function captureGps() {
@@ -1341,6 +1720,9 @@ export default function PoleDetailScreen() {
           }).catch(() => {});
         }
       }
+
+      // Pre-load street map tile in background so stamp is instant when photo is taken
+      warmPoleGpsBundle(draft.lat, draft.lng, { force: true }).catch(() => {});
 
       // Trigger high-fidelity custom success popup modal
       setGpsSuccessModal(true);
@@ -2278,43 +2660,34 @@ export default function PoleDetailScreen() {
           <View style={styles.sectionCard}>
             <SectionHeading
               title="Pole Photos"
-              subtitle={!teardownStarted ? "Start teardown first" : infoComplete ? "Tap a photo to view or capture" : isPoleReport ? "Capture GPS first" : "Fill GPS & Slot first"}
+              subtitle={!teardownStarted ? "Start teardown first" : !infoComplete ? (isPoleReport ? "Capture GPS first" : "Fill GPS & Slot first") : "Click a card to capture · tap again to view"}
             />
             <View style={styles.photoTileRow}>
               <PhotoTile
                 label="Before"
                 photo={photoBefore}
                 accentColor={accentColor}
+                disabled={!infoComplete}
                 onCapture={() => handleOpenCapture("before")}
-                onView={() => openViewer("Before", photoBefore, () => handleOpenCapture("before"))}
+                onView={() => openViewer("before", () => handleOpenCapture("before"))}
               />
               <PhotoTile
                 label="After"
                 photo={photoAfter}
                 accentColor={accentColor}
+                disabled={!infoComplete}
                 onCapture={() => handleOpenCapture("after")}
-                onView={() => openViewer("After", photoAfter, () => handleOpenCapture("after"))}
+                onView={() => openViewer("after", () => handleOpenCapture("after"))}
               />
               <PhotoTile
                 label="Tag"
                 photo={photoTag}
                 accentColor={accentColor}
+                disabled={!infoComplete}
                 onCapture={() => handleOpenCapture("tag")}
-                onView={() => openViewer("Tag", photoTag, () => handleOpenCapture("tag"))}
+                onView={() => openViewer("tag", () => handleOpenCapture("tag"))}
               />
             </View>
-            <Pressable
-              style={({ pressed }) => [
-                styles.capturePhotosBtn,
-                { backgroundColor: infoComplete ? accentColor : "#C9CED6" },
-                pressed && infoComplete && styles.pressedDown,
-              ]}
-              onPress={() => handleOpenCapture("before")}
-            >
-              <Text style={styles.capturePhotosBtnText}>
-                {!teardownStarted ? "Start teardown first" : infoComplete ? "📷  Capture Photos" : isPoleReport ? "Capture GPS first" : "Complete GPS & Slot first"}
-              </Text>
-            </Pressable>
           </View>
 
           {/* ── Pole Report sections ─────────────────────────────────────── */}
@@ -2710,9 +3083,13 @@ export default function PoleDetailScreen() {
 
               {viewerPhoto ? (
                 <ExpoImage
+                  key={viewerPhoto.version}
                   source={{ uri: viewerPhoto.uri }}
                   style={styles.modalImage}
-                  contentFit="cover"
+                  contentFit="contain"
+                  contentPosition="top"
+                  cachePolicy="none"
+                  recyclingKey={String(viewerPhoto.version)}
                   transition={150}
                 />
               ) : null}
@@ -2939,6 +3316,13 @@ export default function PoleDetailScreen() {
                   );
                 }
                 if (cameraPermission?.granted) {
+                  const stampPreviewLines = buildStampLines(activeCameraTab as any);
+                  const previewLat = lat ?? liveCoords?.lat ?? null;
+                  const previewLng = lng ?? liveCoords?.lng ?? null;
+                  const mapInfo = previewLat != null && previewLng != null
+                    ? streetTileInfo(previewLat, previewLng, 18)
+                    : null;
+
                   return (
                     <GestureDetector gesture={pinchGesture}>
                       <View style={StyleSheet.absoluteFillObject}>
@@ -2986,6 +3370,33 @@ export default function PoleDetailScreen() {
                             )}
                           </View>
                         )}
+
+                        {/* ── Live stamp preview overlay (bottom of camera) ── */}
+                        <View style={{
+                          position: "absolute", bottom: 8, left: 8, right: 8,
+                          flexDirection: "row", alignItems: "stretch", gap: 6,
+                        }}>
+                          {/* Text info panel */}
+                          <View style={{
+                            flex: 1, backgroundColor: "rgba(0,0,0,0.55)",
+                            borderRadius: 10, paddingVertical: 8, paddingHorizontal: 10,
+                            borderWidth: 1, borderColor: "rgba(255,255,255,0.12)",
+                          }}>
+                            {stampPreviewLines.map((line, i) => (
+                              <Text key={i} style={{
+                                color: i === stampPreviewLines.length - 1 ? "rgba(255,255,255,0.62)" : "#FFF",
+                                fontSize: i === 0 ? 11 : 10,
+                                fontWeight: i === 0 ? "700" : "600",
+                                lineHeight: 15,
+                              }} numberOfLines={1}>{line}</Text>
+                            ))}
+                          </View>
+
+                          {/* Street map thumbnail — GPS point always at center */}
+                          {mapInfo && (
+                            <MapThumbnail info={mapInfo} />
+                          )}
+                        </View>
                         {blurWarning && (
                           <View style={styles.blurWarningOverlay}>
                             <Text style={styles.blurWarningIcon}>⚠️</Text>
@@ -4057,6 +4468,36 @@ const styles = StyleSheet.create({
     color: "#94A3B8",
     letterSpacing: 0.2,
   },
+  photoTileCameraIcon: {
+    fontSize: 28,
+    marginBottom: 4,
+  },
+  photoTileTapText: {
+    fontSize: 9,
+    fontWeight: "700",
+    color: "#94A3B8",
+    textAlign: "center",
+    letterSpacing: 0.3,
+  },
+  photoTileLabelRow: {
+    flexDirection: "row" as const,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    marginTop: 4,
+  },
+  photoTileCheck: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  photoTileCheckText: {
+    color: "#FFFFFF",
+    fontSize: 9,
+    fontWeight: "900",
+  },
 
   photoTileLabel: {
     textAlign: "center",
@@ -4403,9 +4844,9 @@ const styles = StyleSheet.create({
 
   modalImage: {
     width: "100%",
-    aspectRatio: 3 / 4,
+    height: 440,
     borderRadius: 14,
-    backgroundColor: "#E5E7EB",
+    backgroundColor: "#000",
   },
 
   modalFooter: {

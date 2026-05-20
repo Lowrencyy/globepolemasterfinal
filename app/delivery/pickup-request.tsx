@@ -3,8 +3,8 @@
  * Accessible by: Project Manager, Warehouse In-Charge, Admin, Executive.
  */
 import { useAuth } from "@/context/auth-context";
+import { offlinePost, wasQueued } from "@/lib/offline-api";
 import {
-  createPickupRequest,
   getWarehouses,
   type Warehouse,
 } from "@/services/skycable";
@@ -48,14 +48,22 @@ export default function PickupRequestScreen() {
     if (!token) return;
     setSubmitting(true);
     try {
-      await createPickupRequest(token, {
+      const result = await offlinePost("/skycable/pickup-requests", {
         from_warehouse_id: fromWh.id,
         to_warehouse_id:   toWh.id,
-        notes: notes.trim() || undefined,
+        notes: notes.trim() || null,
       });
-      Alert.alert("✅ Request Sent", "Pickup request submitted. Awaiting approval.", [
-        { text: "OK", onPress: () => router.back() },
-      ]);
+      if (wasQueued(result)) {
+        Alert.alert(
+          "📶 Saved Offline",
+          "No internet connection. Pickup request queued — will sync automatically when back online.",
+          [{ text: "OK", onPress: () => router.back() }]
+        );
+      } else {
+        Alert.alert("✅ Request Sent", "Pickup request submitted. Awaiting approval.", [
+          { text: "OK", onPress: () => router.back() },
+        ]);
+      }
     } catch (e: any) {
       Alert.alert("Error", e?.message ?? "Failed to submit pickup request.");
     } finally {

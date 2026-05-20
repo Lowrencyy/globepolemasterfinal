@@ -550,7 +550,7 @@ export default function SelectPairScreen() {
     const actualToCode = destPole?.pole?.pole_code ?? "";
     const actualToName = destPole?.pole?.pole_code ?? "";
 
-    router.replace({
+    router.push({
       pathname: "/teardowns/destination-pole" as any,
       params: {
         pole_code: actualFromCode,
@@ -821,22 +821,23 @@ export default function SelectPairScreen() {
             </Text>
           </View>
 
-          <View
+          <Pressable
             style={[
               styles.headerAccentBadge,
-              {
-                backgroundColor: `${accentColor}14`,
-                borderColor: `${accentColor}28`,
-              },
+              { backgroundColor: `${accentColor}14`, borderColor: `${accentColor}28` },
             ]}
+            onPress={() =>
+              router.push({
+                pathname: "/teardowns/poles",
+                params: { nodeId: node_id, nodeName: pole_name, accent },
+              } as any)
+            }
           >
-            <View
-              style={[styles.headerAccentDot, { backgroundColor: accentColor }]}
-            />
+            <View style={[styles.headerAccentDot, { backgroundColor: accentColor }]} />
             <Text style={[styles.headerAccentText, { color: accentColor }]}>
-              Ready
+              Poles
             </Text>
-          </View>
+          </Pressable>
         </View>
 
         {status === "loading" && (

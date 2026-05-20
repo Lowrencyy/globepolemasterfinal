@@ -42,6 +42,7 @@ import { WebView } from "react-native-webview";
 // ─── Static tile map ─────────────────────────────────────────────────────────
 const ZOOM = 17;
 const TILE_PX = 256;
+const TILE_OFFSETS = [-1, 0, 1] as const;
 
 function latLngToTileFrac(lat: number, lng: number, z: number) {
   const n = Math.pow(2, z);
@@ -55,10 +56,6 @@ function latLngToTileFrac(lat: number, lng: number, z: number) {
 function StaticTileMap({ lat, lng }: { lat: number; lng: number }) {
   const [size, setSize] = useState<{ w: number; h: number } | null>(null);
   const { xFrac, yFrac, tileX, tileY } = latLngToTileFrac(lat, lng, ZOOM);
-
-  const tileUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY}/${tileX}`;
-  const tileUrlLeft = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY}/${tileX - 1}`;
-  const tileUrlRight = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY}/${tileX + 1}`;
 
   const fracX = xFrac - tileX;
   const fracY = yFrac - tileY;
@@ -80,39 +77,24 @@ function StaticTileMap({ lat, lng }: { lat: number; lng: number }) {
 
   return (
     <View style={StyleSheet.absoluteFillObject} onLayout={onLayout}>
-      <Image
-        source={{ uri: tileUrlLeft }}
-        style={{
-          position: "absolute",
-          left: offsetX - imgW,
-          top: offsetY,
-          width: imgW,
-          height: imgH,
-        }}
-        resizeMode="cover"
-      />
-      <Image
-        source={{ uri: tileUrl }}
-        style={{
-          position: "absolute",
-          left: offsetX,
-          top: offsetY,
-          width: imgW,
-          height: imgH,
-        }}
-        resizeMode="cover"
-      />
-      <Image
-        source={{ uri: tileUrlRight }}
-        style={{
-          position: "absolute",
-          left: offsetX + imgW,
-          top: offsetY,
-          width: imgW,
-          height: imgH,
-        }}
-        resizeMode="cover"
-      />
+      {TILE_OFFSETS.map(dy =>
+        TILE_OFFSETS.map(dx => (
+          <Image
+            key={`${dx}:${dy}`}
+            source={{
+              uri: `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${ZOOM}/${tileY + dy}/${tileX + dx}`,
+            }}
+            style={{
+              position: "absolute",
+              left: offsetX + dx * imgW,
+              top: offsetY + dy * imgH,
+              width: imgW,
+              height: imgH,
+            }}
+            resizeMode="cover"
+          />
+        )),
+      )}
       {size && (
         <View
           style={{

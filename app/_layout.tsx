@@ -63,7 +63,6 @@ export default function RootLayout() {
             <Stack.Screen name="teardowns" options={{ headerShown: false }} />
             <Stack.Screen name="naps" options={{ headerShown: false }} />
             <Stack.Screen name="delivery" options={{ headerShown: false }} />
-            <Stack.Screen name="delivery/pickup-request" options={{ headerShown: false }} />
             <Stack.Screen name="warehouse" options={{ headerShown: false }} />
             <Stack.Screen name="modal" options={{ presentation: "modal", title: "Modal" }} />
           </Stack>

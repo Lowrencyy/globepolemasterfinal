@@ -29,6 +29,8 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 
 import { BASE_URL } from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
+import { isOnline } from "@/lib/net-sync";
+import { simpleQueueCount } from "@/lib/simple-queue";
 import { cacheLocations, cachePhilippines } from "@/lib/tile-cache";
 import { useRouter } from "expo-router";
 import {
@@ -283,62 +285,103 @@ export default function ProfileScreen() {
     if (busyAction || !token) return;
 
     const teamId = (user as any)?.team_id ?? null;
-    const pendingCount = await queueCount();
+    const [tdCount, simpleCount] = await Promise.all([queueCount(), simpleQueueCount()]);
+    const totalPending = tdCount + simpleCount;
+    const online = await isOnline();
 
     const steps: ModalStep[] = [
-      { id: "upload",   label: "Upload pending field reports",     status: "idle" },
-      { id: "areas",   label: "Fetch areas",                       status: "idle" },
-      { id: "nodes",   label: "Fetch nodes",                       status: "idle" },
-      { id: "poles",   label: "Fetch poles for each node",         status: "idle" },
-      { id: "ph_tiles",label: "Cache Philippines map tiles",       status: "idle" },
-      { id: "loc_tiles",label: "Cache high-zoom pole area tiles",  status: "idle" },
-      { id: "finish",  label: "All data saved — ready for offline",status: "idle" },
+      { id: "net",      label: "Check network connection",           status: "idle" },
+      { id: "upload",   label: "Upload teardown reports & photos",   status: "idle" },
+      { id: "actions",  label: "Upload queued actions (delivery, GPS, pickup)", status: "idle" },
+      { id: "areas",    label: "Download areas",                     status: "idle" },
+      { id: "nodes",    label: "Download nodes",                     status: "idle" },
+      { id: "poles",    label: "Download poles for each node",       status: "idle" },
+      { id: "ph_tiles", label: "Cache Philippines map tiles",        status: "idle" },
+      { id: "loc_tiles",label: "Cache high-zoom pole area tiles",    status: "idle" },
+      { id: "finish",   label: "All done — ready for offline",       status: "idle" },
     ];
 
     setBusyAction("sync");
-    openProcessModal("Sync Data", "Downloading all data from backend…", steps);
+    openProcessModal(
+      "Sync All",
+      online
+        ? `${totalPending} pending upload${totalPending !== 1 ? "s" : ""} + downloading all data`
+        : "⚠️ Offline — will upload when connection returns",
+      steps
+    );
 
     try {
-      // 1. Upload queue
-      updateStep("upload", { status: "running", detail: pendingCount > 0 ? `Flushing ${pendingCount} pending items…` : "Checking queue…" });
-      if (pendingCount > 0) {
-        const res = await processSyncQueue();
-        await processImageQueue();
-        const remaining = await queueCount();
-        setPendingSyncCount(remaining);
-        updateStep("upload", {
-          status: res.failed > 0 ? "error" : "success",
-          detail: `${res.submitted} submitted${res.failed > 0 ? `, ${res.failed} failed` : ""}`,
-        });
-      } else {
-        updateStep("upload", { status: "success", detail: "Nothing pending — skipped." });
+      // 0. Network check
+      updateStep("net", {
+        status: online ? "success" : "error",
+        detail: online ? "Connected — proceeding with full sync." : "No connection. Uploads queued — download skipped.",
+      });
+
+      if (!online) {
+        updateStep("upload",   { status: "idle", detail: "Skipped — offline." });
+        updateStep("actions",  { status: "idle", detail: "Skipped — offline." });
+        updateStep("areas",    { status: "idle", detail: "Skipped — offline." });
+        updateStep("nodes",    { status: "idle", detail: "Skipped — offline." });
+        updateStep("poles",    { status: "idle", detail: "Skipped — offline." });
+        updateStep("ph_tiles", { status: "idle", detail: "Skipped — offline." });
+        updateStep("loc_tiles",{ status: "idle", detail: "Skipped — offline." });
+        updateStep("finish",   { status: "error", detail: "No internet. All changes are queued locally.\nThey will upload automatically when you reconnect." });
+        return;
       }
 
-      // 2. Fetch areas
+      // 1. Upload teardown reports queue
+      updateStep("upload", { status: "running", detail: tdCount > 0 ? `Uploading ${tdCount} teardown report${tdCount !== 1 ? "s" : ""}…` : "Checking…" });
+      const tdRes = await processSyncQueue();
+      await processImageQueue();
+      const tdRemaining = await queueCount();
+      setPendingSyncCount(tdRemaining);
+      updateStep("upload", {
+        status: tdRes.failed > 0 ? "error" : "success",
+        detail: tdRes.submitted > 0
+          ? `${tdRes.submitted} uploaded${tdRes.failed > 0 ? ` · ${tdRes.failed} failed` : ""}`
+          : "Nothing to upload.",
+      });
+
+      // 2. Upload simple-queue actions (delivery moves, pickup requests, GPS)
+      updateStep("actions", { status: "running", detail: simpleCount > 0 ? `Uploading ${simpleCount} queued action${simpleCount !== 1 ? "s" : ""}…` : "Checking…" });
+      try {
+        const { processSimpleQueue } = await import("@/lib/simple-queue");
+        const { gpsQueueFlush } = await import("@/lib/gps-queue");
+        await Promise.all([processSimpleQueue(), gpsQueueFlush()]);
+        const simpleRemaining = await simpleQueueCount();
+        updateStep("actions", {
+          status: simpleRemaining > 0 ? "error" : "success",
+          detail: simpleRemaining > 0
+            ? `${simpleRemaining} item${simpleRemaining !== 1 ? "s" : ""} still pending.`
+            : "All actions uploaded.",
+        });
+      } catch (e: any) {
+        updateStep("actions", { status: "error", detail: e?.message ?? "Action upload failed." });
+      }
+
+      // 3. Download areas
       updateStep("areas", { status: "running", detail: "Fetching from server…" });
       const areas = await getAreas(token, teamId);
       const areasCacheKey = teamId ? `sitemap_areas_team_${teamId}` : "sitemap_areas";
       await cacheSet(areasCacheKey, areas);
       updateStep("areas", { status: "success", detail: `${areas.length} area${areas.length !== 1 ? "s" : ""} cached.` });
 
-      // 3. Fetch nodes for every area
+      // 4. Download nodes
       updateStep("nodes", { status: "running", detail: "Fetching nodes…" });
       let totalNodes = 0;
       const allNodes: { areaId: number; nodes: any[] }[] = [];
       for (const area of areas) {
         const res = await getNodes(area.id, token, teamId);
         const nodes = res.data;
-        // Save under both plain key (read by downloadSitemapData) and
-        // team-scoped key (read by nodes.tsx when teamId is present)
         await cacheSet(`sitemap_nodes_${area.id}`, nodes);
         if (teamId) await cacheSet(`sitemap_nodes_${area.id}_team_${teamId}`, nodes);
         allNodes.push({ areaId: area.id, nodes });
         totalNodes += nodes.length;
-        updateStep("nodes", { status: "running", detail: `${totalNodes} nodes fetched…` });
+        updateStep("nodes", { status: "running", detail: `${totalNodes} nodes…` });
       }
       updateStep("nodes", { status: "success", detail: `${totalNodes} node${totalNodes !== 1 ? "s" : ""} cached.` });
 
-      // 4. Fetch poles for every node (chunked 5 at a time)
+      // 5. Download poles
       updateStep("poles", { status: "running", detail: "Fetching poles…" });
       let totalPoles = 0;
       const allNodesList = allNodes.flatMap(a => a.nodes);
@@ -350,30 +393,28 @@ export default function ProfileScreen() {
             const poles = await getNodePoles(node.id, token);
             await cacheSet(`sitemap_poles_${node.id}`, poles);
             totalPoles += poles.length;
-          } catch {
-            // Non-fatal — continue with other nodes
-          }
+          } catch {}
         }));
-        updateStep("poles", { status: "running", detail: `${Math.min(i + chunkSize, allNodesList.length)}/${allNodesList.length} nodes done…` });
+        updateStep("poles", { status: "running", detail: `${Math.min(i + chunkSize, allNodesList.length)}/${allNodesList.length} nodes…` });
       }
       updateStep("poles", { status: "success", detail: `${totalPoles} pole${totalPoles !== 1 ? "s" : ""} cached.` });
 
-      // 5. Cache Philippines overview map tiles (zoom 6–10, ~2 000 tiles)
-      updateStep("ph_tiles", { status: "running", detail: "Downloading Philippines tiles (zoom 6–10)…" });
+      // 6. Cache Philippines tiles
+      updateStep("ph_tiles", { status: "running", detail: "Caching Philippines overview (zoom 6–10)…" });
       try {
-        const phRes = await cachePhilippines((done, total) => {
-          updateStep("ph_tiles", { status: "running", detail: `${done}/${total} tiles…` });
-        });
+        const phRes = await cachePhilippines((done, total) =>
+          updateStep("ph_tiles", { status: "running", detail: `${done}/${total} tiles…` })
+        );
         updateStep("ph_tiles", {
           status: "success",
-          detail: `${phRes.downloaded} new · ${phRes.skipped} already cached · ${phRes.failed} failed`,
+          detail: `${phRes.downloaded} new · ${phRes.skipped} already cached`,
         });
       } catch (e: any) {
-        updateStep("ph_tiles", { status: "error", detail: e?.message ?? "Tile download failed" });
+        updateStep("ph_tiles", { status: "error", detail: e?.message ?? "Tile download failed." });
       }
 
-      // 6. Cache high-zoom tiles around every known pole location (zoom 11–15)
-      updateStep("loc_tiles", { status: "running", detail: "Collecting pole GPS coordinates…" });
+      // 7. Cache high-zoom tiles for pole locations
+      updateStep("loc_tiles", { status: "running", detail: "Collecting pole GPS…" });
       try {
         const locSet: { lat: number; lng: number }[] = [];
         for (const { nodes } of allNodes) {
@@ -381,28 +422,27 @@ export default function ProfileScreen() {
             const cached = await cacheGet<any[]>(`sitemap_poles_${node.id}`).catch(() => null);
             if (!cached) continue;
             for (const p of cached) {
-              if (p.pole?.lat && p.pole?.lng) {
+              if (p.pole?.lat && p.pole?.lng)
                 locSet.push({ lat: parseFloat(p.pole.lat), lng: parseFloat(p.pole.lng) });
-              }
             }
           }
         }
         if (locSet.length) {
-          const locRes = await cacheLocations(locSet, [11, 12, 13, 14, 15], (done, total) => {
-            updateStep("loc_tiles", { status: "running", detail: `${done}/${total} tiles…` });
-          });
+          const locRes = await cacheLocations(locSet, [11, 12, 13, 14, 15], (done, total) =>
+            updateStep("loc_tiles", { status: "running", detail: `${done}/${total} tiles…` })
+          );
           updateStep("loc_tiles", {
             status: "success",
-            detail: `${locRes?.downloaded ?? 0} new · ${locRes?.skipped ?? 0} already cached · ${locSet.length} GPS points covered`,
+            detail: `${locRes?.downloaded ?? 0} new · ${locSet.length} GPS points`,
           });
         } else {
-          updateStep("loc_tiles", { status: "success", detail: "No GPS coordinates found — skipped." });
+          updateStep("loc_tiles", { status: "success", detail: "No GPS data — skipped." });
         }
       } catch (e: any) {
-        updateStep("loc_tiles", { status: "error", detail: e?.message ?? "Location tile download failed" });
+        updateStep("loc_tiles", { status: "error", detail: e?.message ?? "Tile cache failed." });
       }
 
-      // 7. Save last sync timestamp
+      // 8. Save timestamp
       const now = new Date();
       const formatted = `${now.getMonth() + 1}/${now.getDate()} ${now.getHours()}:${now.getMinutes().toString().padStart(2, "0")}`;
       setLastSyncDate(formatted);
@@ -410,12 +450,12 @@ export default function ProfileScreen() {
 
       updateStep("finish", {
         status: "success",
-        detail: `${areas.length} areas · ${totalNodes} nodes · ${totalPoles} poles ready offline.`,
+        detail: `${areas.length} areas · ${totalNodes} nodes · ${totalPoles} poles — fully synced ✓`,
       });
     } catch (error: any) {
       updateStep("finish", {
         status: "error",
-        detail: error?.message || "Sync failed. Check connection.",
+        detail: error?.message || "Sync failed. Check your connection.",
       });
     } finally {
       setBusyAction(null);
@@ -539,7 +579,7 @@ export default function ProfileScreen() {
         ) : (
           <RefreshCw size={22} color="#374151" />
         ),
-      label: busyAction === "sync" ? "Syncing..." : "Download\nData",
+      label: busyAction === "sync" ? "Syncing..." : "Sync\nAll",
       onPress: runSyncData,
     },
   ];

@@ -1,5 +1,7 @@
 import { useAuth } from "@/context/auth-context";
 import { MOCK_DELIVERIES, type MockDelivery } from "@/lib/mock-deliveries";
+import { isOnline } from "@/lib/net-sync";
+import { simpleQueuePush } from "@/lib/simple-queue";
 import {
   acceptDelivery,
   getBackendDeliveries,
@@ -126,10 +128,25 @@ function ApprovalSection({
           onPress: async () => {
             setSaving(true);
             try {
-              await acceptDelivery(token, deliveryId, photo);
-              Alert.alert("✅ Approved!", "Delivery accepted. Warehouse stock updated.", [
-                { text: "OK", onPress: onApproved },
-              ]);
+              const online = await isOnline();
+              if (!online) {
+                // Queue the acceptance — photo path saved for later upload
+                await simpleQueuePush({
+                  method: "put",
+                  url: `/skycable/deliveries/${deliveryId}/accept`,
+                  body: { notes: "", _photo_uri: photo },
+                });
+                Alert.alert(
+                  "📶 Saved Offline",
+                  "No internet. Approval queued — will sync automatically when back online.",
+                  [{ text: "OK", onPress: onApproved }]
+                );
+              } else {
+                await acceptDelivery(token, deliveryId, photo);
+                Alert.alert("✅ Approved!", "Delivery accepted. Warehouse stock updated.", [
+                  { text: "OK", onPress: onApproved },
+                ]);
+              }
             } catch (e: any) {
               Alert.alert("Error", e?.message ?? "Approval failed. Please try again.");
             } finally {

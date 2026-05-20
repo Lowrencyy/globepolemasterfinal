@@ -1,4 +1,5 @@
 import api from "@/lib/api";
+import { captureEvents } from "@/lib/capture-events";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
 import { startPoleTeardown } from "@/services/skycable";
@@ -11,13 +12,14 @@ import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
 import * as MediaLibrary from "expo-media-library";
-import { Stack, router, useLocalSearchParams } from "expo-router";
+import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { ChevronLeft, Play, Timer } from "lucide-react-native";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
   Easing,
   Image,
   Modal,
@@ -36,6 +38,7 @@ import { buildSpanMapHtml, buildPoleMapHtml, StaticTileMap } from "./components"
 
 const SLOTS = ["DA", "C1", "C2", "C3", "C4", "C5"] as const;
 const REQUIRED_GPS_ACCURACY_METERS = 10;
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 
 type PhotoField = {
   uri: string;
@@ -59,6 +62,49 @@ function sanitize(s?: string) {
     .replace(/[^a-z0-9_-]/g, "_");
 }
 
+function parseGpsAddress(raw: any): { road: string; city: string; province: string } {
+  const city = String(raw?.city ?? raw?.district ?? raw?.subregion ?? raw?.region ?? "").trim();
+  const province = String(raw?.region ?? raw?.country ?? "").trim();
+
+  const streetCore = String(raw?.street ?? raw?.road ?? raw?.pedestrian ?? "").trim();
+  const streetNumber = String(raw?.streetNumber ?? "").trim();
+  const combinedStreet = [streetNumber, streetCore].filter(Boolean).join(" ").trim();
+
+  const blocked = new Set(
+    [city, province, `${city}, ${province}`]
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+
+  const roadCandidates = [
+    combinedStreet,
+    streetCore,
+    String(raw?.name ?? "").trim(),
+    String(raw?.neighborhood ?? "").trim(),
+    String(raw?.subLocality ?? "").trim(),
+    String(raw?.streetNumber ?? "").trim(),
+  ].filter(Boolean);
+
+  const road =
+    roadCandidates.find((value) => !blocked.has(value.toLowerCase())) ?? "";
+
+  return { road, city, province };
+}
+
+function applyParsedGpsAddress(
+  raw: any,
+  setters: {
+    setGpsStreet: (value: string) => void;
+    setGpsCity: (value: string) => void;
+    setGpsProvince: (value: string) => void;
+  },
+) {
+  const { road, city, province } = parseGpsAddress(raw);
+  if (road) setters.setGpsStreet(road);
+  if (city) setters.setGpsCity(city);
+  if (province) setters.setGpsProvince(province);
+}
+
 function createPhotoField(
   fileUri: string,
   name: string,
@@ -71,6 +117,12 @@ function createPhotoField(
     type: "image/jpeg",
     version,
   };
+}
+
+function staticMapUrl(lat: number, lng: number) {
+  const w = Math.round(SCREEN_W * 0.35 * 2);
+  const h = Math.round(SCREEN_H * 0.22 * 2);
+  return `https://staticmap.openstreetmap.de/staticmap.php?center=${lat},${lng}&zoom=16&size=${w}x${h}&markers=${lat},${lng},red`;
 }
 
 function getCompletionState({
@@ -257,77 +309,148 @@ window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
 <\/script></body></html>`;
 
 function PhotoTile({
-  label,
-  photo,
-  accentColor,
-  onCapture,
-  onView,
+  label, photo, accentColor, onCapture, onView, disabled,
 }: {
-  label: string;
-  photo: PhotoField;
-  accentColor: string;
-  onCapture: () => void;
-  onView: () => void;
+  label: string; photo: PhotoField; accentColor: string;
+  onCapture: () => void; onView: () => void; disabled?: boolean;
 }) {
   return (
     <Pressable
-      style={[styles.photoTileCard, photo ? { borderColor: accentColor } : {}]}
-      onPress={photo ? onView : onCapture}
+      style={[styles.photoTileCard, photo ? { borderColor: accentColor } : {}, disabled && { opacity: 0.45 }]}
+      onPress={disabled ? undefined : photo ? onView : onCapture}
+      disabled={disabled}
     >
       <View style={styles.photoTileImgWrap}>
         {photo ? (
           <>
-            <ExpoImage source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="cover" transition={150} />
-            <View style={[styles.photoDoneBadge, { backgroundColor: accentColor }]}>
-              <Text style={styles.photoDoneBadgeText}>✓</Text>
-            </View>
+            <ExpoImage key={photo.version} source={{ uri: photo.uri }} style={StyleSheet.absoluteFillObject} contentFit="cover" cachePolicy="none" transition={100} />
             <View style={styles.photoViewHint}>
               <Text style={styles.photoViewHintText}>VIEW</Text>
             </View>
           </>
         ) : (
           <View style={styles.photoTilePlaceholder}>
-            <Text style={styles.photoTilePlaceholderIcon}>📷</Text>
-            <Text style={styles.photoTilePlaceholderText}>Tap</Text>
+            <Text style={{ fontSize: 28, marginBottom: 4 }}>📷</Text>
+            <Text style={{ fontSize: 9, fontWeight: "700", color: "#94A3B8", textAlign: "center" }}>Tap to capture</Text>
           </View>
         )}
       </View>
-      <Text style={[styles.photoTileLabel, photo ? { color: accentColor } : {}]}>
-        {label}
-      </Text>
+      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5, marginTop: 4 }}>
+        <Text style={[styles.photoTileLabel, photo ? { color: accentColor } : {}]}>
+          {label.toUpperCase()}
+        </Text>
+        {photo && (
+          <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: accentColor, alignItems: "center", justifyContent: "center" }}>
+            <Text style={{ color: "#FFF", fontSize: 9, fontWeight: "900" }}>✓</Text>
+          </View>
+        )}
+      </View>
     </Pressable>
   );
 }
 
 const STAMP_HTML = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#000"><canvas id="c"></canvas><script>
+function rr(ctx,x,y,w,h,r){
+  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
+}
+function drawStamp(ctx,img,lines,mapB64,mapDotX,mapDotY,mapTiles){
+  var W=img.width,H=img.height;
+  var gap=Math.round(W*0.012);
+  var fSize=Math.min(Math.max(14,Math.round(W*0.020)),Math.floor((H*0.22)/(lines.length*1.55+1.5)));
+  var lh=Math.round(fSize*1.55);
+  var vPad=Math.round(fSize*0.9);
+  var hPad=Math.round(fSize*0.75);
+  var panelH=lines.length*lh+vPad*2;
+  var r=Math.round(panelH*0.14);
+  var mapSize=(mapB64||(mapTiles&&mapTiles.length))?panelH:0;
+  var textW=W-gap*2-mapSize-(mapSize?gap:0);
+  var panelY=H-panelH-gap;
+  var mapY=panelY;
+  var fadeH=panelH+gap*4;
+  var grad=ctx.createLinearGradient(0,H-fadeH,0,H);
+  grad.addColorStop(0,'rgba(0,0,0,0)');grad.addColorStop(1,'rgba(0,0,0,0.38)');
+  ctx.fillStyle=grad;ctx.fillRect(0,H-fadeH,W,fadeH);
+  function drawTextPanel(){
+    ctx.save();rr(ctx,gap,panelY,textW,panelH,r);
+    ctx.fillStyle='rgba(0,0,0,0.52)';ctx.fill();ctx.restore();
+    ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=3;
+    var startY=panelY+(panelH-lines.length*lh)/2;
+    lines.forEach(function(line,i){
+      var y=startY+(i+0.78)*lh;
+      var maxW=textW-hPad*2;
+      if(i===0){ctx.font='bold '+Math.round(fSize*1.05)+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
+      else if(i===lines.length-1){ctx.font=Math.round(fSize*0.84)+'px Arial,sans-serif';ctx.fillStyle='rgba(255,255,255,0.72)';}
+      else{ctx.font='bold '+fSize+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
+      var txt=line;while(ctx.measureText(txt).width>maxW&&txt.length>4)txt=txt.slice(0,-2);
+      if(txt!==line)txt=txt.slice(0,-1)+'…';
+      ctx.fillText(txt,gap+hPad,y);
+    });
+    ctx.shadowBlur=0;
+  }
+  function drawMapPanel(mapImgs){
+    var mx=gap+textW+gap,my=mapY;
+    ctx.save();rr(ctx,mx,my,mapSize,mapSize,r);ctx.clip();
+    // Offset tile so captured GPS lands at CENTER of the panel
+    var dotFX=(mapDotX!=null&&!isNaN(mapDotX))?mapDotX:0.5;
+    var dotFY=(mapDotY!=null&&!isNaN(mapDotY))?mapDotY:0.5;
+    if(Array.isArray(mapImgs)){
+      mapImgs.forEach(function(t){
+        if(!t||!t.img)return;
+        var dx=Number(t.dx)||0,dy=Number(t.dy)||0;
+        ctx.drawImage(t.img,mx+(dx+0.5-dotFX)*mapSize,my+(dy+0.5-dotFY)*mapSize,mapSize,mapSize);
+      });
+    }else if(mapImgs){
+      ctx.drawImage(mapImgs,mx+(0.5-dotFX)*mapSize,my+(0.5-dotFY)*mapSize,mapSize,mapSize);
+    }
+    ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(mx,my,mapSize,mapSize);
+    // GPS dot always at center
+    var dotR=Math.round(mapSize*0.07);
+    var dX=mx+mapSize/2;
+    var dY=my+mapSize/2;
+    ctx.beginPath();ctx.arc(dX,dY,dotR,0,2*Math.PI);
+    ctx.fillStyle='#EF4444';ctx.fill();
+    ctx.strokeStyle='#FFFFFF';ctx.lineWidth=Math.max(2,Math.round(dotR*0.35));ctx.stroke();
+    ctx.restore();
+  }
+  function finish(){
+    var b64=document.getElementById('c').toDataURL('image/jpeg',0.93).split(',')[1];
+    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
+  }
+  function loadMapImages(cb){
+    var tilePayload=Array.isArray(mapTiles)?mapTiles.filter(function(t){return t&&t.b64;}):[];
+    if(tilePayload.length){
+      var loaded=[],pending=tilePayload.length;
+      tilePayload.forEach(function(t){
+        var im=new Image();
+        im.onload=function(){loaded.push({img:im,dx:Number(t.dx)||0,dy:Number(t.dy)||0});if(--pending===0)cb(loaded.length?loaded:null);};
+        im.onerror=function(){if(--pending===0)cb(loaded.length?loaded:null);};
+        im.src='data:image/png;base64,'+t.b64;
+      });
+      return;
+    }
+    if(mapB64){
+      var mapImg=new Image();
+      mapImg.onload=function(){cb(mapImg);};
+      mapImg.onerror=function(){cb(null);};
+      mapImg.src='data:image/png;base64,'+mapB64;
+      return;
+    }
+    cb(null);
+  }
+  if(mapSize>0&&(mapB64||(mapTiles&&mapTiles.length))){
+    loadMapImages(function(mapImgs){drawTextPanel();if(mapImgs)drawMapPanel(mapImgs);finish();});
+  }else{drawTextPanel();finish();}
+}
 function stamp(payload){
   var data;try{data=JSON.parse(payload);}catch(ex){window.ReactNativeWebView.postMessage(JSON.stringify({error:'parse'}));return;}
   var img=new Image();
   img.onload=function(){
-    var c=document.getElementById('c');
-    c.width=img.width;c.height=img.height;
-    var ctx=c.getContext('2d');
-    ctx.drawImage(img,0,0);
-    var lines=data.lines;
-    var fSize=Math.max(22,Math.round(img.width*0.024));
-    var lh=Math.round(fSize*1.6);
-    var pad=Math.round(fSize*0.9);
-    var totalH=lines.length*lh+pad*2;
-    var grad=ctx.createLinearGradient(0,img.height-totalH-30,0,img.height);
-    grad.addColorStop(0,'rgba(0,0,0,0)');
-    grad.addColorStop(0.35,'rgba(0,0,0,0.55)');
-    grad.addColorStop(1,'rgba(0,0,0,0.80)');
-    ctx.fillStyle=grad;
-    ctx.fillRect(0,img.height-totalH-30,img.width,totalH+30);
-    ctx.font='bold '+fSize+'px Arial,sans-serif';
-    ctx.fillStyle='#FFFFFF';
-    ctx.shadowColor='rgba(0,0,0,0.9)';
-    ctx.shadowBlur=5;
-    lines.forEach(function(line,i){
-      ctx.fillText(line,pad,img.height-totalH+pad+(i+1)*lh-6);
-    });
-    var b64=c.toDataURL('image/jpeg',0.92).split(',')[1];
-    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
+    var c=document.getElementById('c');c.width=img.width;c.height=img.height;
+    var ctx=c.getContext('2d');ctx.drawImage(img,0,0);
+    drawStamp(ctx,img,data.lines,data.mapB64||null,data.mapDotX!=null?data.mapDotX:0.5,data.mapDotY!=null?data.mapDotY:0.5,data.mapTiles||null);
   };
   img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({error:'load'}));};
   img.src='data:image/jpeg;base64,'+data.b64;
@@ -336,6 +459,61 @@ document.addEventListener('message',function(e){stamp(e.data);});
 window.addEventListener('message',function(e){stamp(e.data);});
 window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
 <\/script></body></html>`;
+
+type StreetTileInfo = {
+  url: string;
+  tileX: number;
+  tileY: number;
+  zoom: number;
+  dotX: number;
+  dotY: number;
+};
+
+type StampMapTile = { b64: string; dx: number; dy: number };
+type StampMapResult = { b64: string; tiles: StampMapTile[]; dotX: number; dotY: number };
+
+const STREET_TILE_OFFSETS = [-1, 0, 1] as const;
+const CARTO_SUBDOMAINS = ["a", "b", "c", "d"] as const;
+
+function streetTileUrlFor(tileX: number, tileY: number, zoom: number): string {
+  // Spread requests across CARTO subdomains to reduce missing tiles under load.
+  const idx = Math.abs(tileX + tileY) % CARTO_SUBDOMAINS.length;
+  const sub = CARTO_SUBDOMAINS[idx];
+  return `https://${sub}.basemaps.cartocdn.com/rastertiles/voyager/${zoom}/${tileX}/${tileY}.png`;
+}
+
+function MapThumbnail({ info }: { info: StreetTileInfo }) {
+  const [sz, setSz] = React.useState(0);
+  return (
+    <View
+      style={{ aspectRatio: 1, alignSelf: "stretch", borderRadius: 10, overflow: "hidden", borderWidth: 1.5, borderColor: "rgba(255,255,255,0.35)" }}
+      onLayout={e => setSz(e.nativeEvent.layout.width)}
+    >
+      {sz > 0 && STREET_TILE_OFFSETS.map(dy =>
+        STREET_TILE_OFFSETS.map(dx => (
+          <Image
+            key={`${dx}:${dy}`}
+            source={{ uri: streetTileUrlFor(info.tileX + dx, info.tileY + dy, info.zoom) }}
+            style={{
+              position: "absolute",
+              width: sz,
+              height: sz,
+              left: (dx + 0.5 - info.dotX) * sz,
+              top: (dy + 0.5 - info.dotY) * sz,
+            }}
+            resizeMode="cover"
+          />
+        )),
+      )}
+      <View style={{ position: "absolute", top: "50%", left: "50%", width: 12, height: 12, borderRadius: 6, backgroundColor: "#EF4444", borderWidth: 2, borderColor: "#FFF", marginLeft: -6, marginTop: -6 }} />
+      <View style={{ position: "absolute", bottom: 4, left: 0, right: 0, alignItems: "center" }}>
+        <View style={{ backgroundColor: "rgba(0,0,0,0.65)", borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 }}>
+          <Text style={{ color: "#FFF", fontSize: 8, fontWeight: "900", letterSpacing: 0.7 }}>STREET</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
 
 export default function DestinationPoleScreen() {
   const params = useLocalSearchParams<{
@@ -392,14 +570,23 @@ export default function DestinationPoleScreen() {
   const [qualityTag, setQualityTag] = useState<number | null>(null);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerLabel, setViewerLabel] = useState("");
-  const [viewerPhoto, setViewerPhoto] = useState<PhotoField>(null);
+  const [viewerTab, setViewerTab] = useState<"before" | "after" | "tag" | null>(null);
   const [viewerRetake, setViewerRetake] = useState<(() => void) | null>(null);
+  const viewerPhoto =
+    viewerTab === "before" ? photoBefore :
+    viewerTab === "after"  ? photoAfter  :
+    viewerTab === "tag"    ? photoTag    :
+    null;
   const [slot, setSlot] = useState("");
   const [landmark, setLandmark] = useState("");
 
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
   const [gpsCapturing, setGpsCapturing] = useState(false);
   const [capturedGps, setCapturedGps] = useState<GpsData | null>(null);
+  const [gpsStreet,   setGpsStreet]   = useState("");
+  const [gpsCity,     setGpsCity]     = useState("");
+  const [gpsProvince, setGpsProvince] = useState("");
+  const [gpsSuccessModal, setGpsSuccessModal] = useState(false);
   // true = GPS came from sitemap APK (pre-placed, no re-capture needed)
   // false = GPS was captured on this device (or absent)
   const [gpsFromSitemap, setGpsFromSitemap] = useState(false);
@@ -408,6 +595,16 @@ export default function DestinationPoleScreen() {
 
   const [showCameraModal, setShowCameraModal] = useState(false);
   const [activeCameraTab, setActiveCameraTab] = useState<"before" | "after" | "tag">("before");
+
+  // Preload map tile whenever camera modal opens (backup if GPS preload hadn't finished)
+  useEffect(() => {
+    if (!showCameraModal || mapTileCache.current) return;
+    const gps = capturedGps;
+    if (!gps) return;
+    fetchMapTileB64(gps.latitude, gps.longitude)
+      .then(r => { if (r) mapTileCache.current = r; })
+      .catch(() => {});
+  }, [showCameraModal]);
   const cameraRef = useRef<React.ComponentRef<typeof CameraView>>(null);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [cameraReady, setCameraReady] = useState(false);
@@ -426,6 +623,20 @@ export default function DestinationPoleScreen() {
 
 
   const [elapsedSecs, setElapsedSecs] = useState(0);
+  const captureReturnKey = `__dest_capture_${params.to_pole_id}`;
+  const lastFreshCaptureRef = useRef(0);
+
+  // Instant card update via event emitter
+  useEffect(() => {
+    return captureEvents.on((result) => {
+      if (result.ownerType !== "destination" || String(result.ownerPoleId) !== String(params.to_pole_id ?? "")) return;
+      const tab = result.tab;
+      const setter = tab === "before" ? setPhotoBefore : tab === "after" ? setPhotoAfter : setPhotoTag;
+      const file   = tab === "before" ? F.before       : tab === "after" ? F.after       : F.tag;
+      lastFreshCaptureRef.current = Date.now();
+      setter(createPhotoField(result.uri, file));
+    });
+  }, [params.to_pole_id, F.before, F.after, F.tag]);
 
   // ── Pole teardown session (date_start persisted to backend) ──────────────
   const { token } = useAuth();
@@ -502,6 +713,10 @@ export default function DestinationPoleScreen() {
   const blurResolverRef = useRef<((variance: number) => void) | null>(null);
   const stampRef = useRef<WebView>(null);
   const stampResolverRef = useRef<((b64: string | null) => void) | null>(null);
+  const mapTileCache = useRef<StampMapResult | null>(null);
+  const gpsWarmKeyRef = useRef<string>("");
+  const gpsWarmPromiseRef = useRef<Promise<void> | null>(null);
+  const captureMapPrefetchedRef = useRef(false);
 
   const hasGps = !!capturedGps;
   const infoComplete = hasGps && !!slot && !!landmark.trim();
@@ -570,6 +785,18 @@ export default function DestinationPoleScreen() {
               if (Number.isFinite(lat) && Number.isFinite(lng)) {
                 setCapturedGps({ latitude: lat, longitude: lng, accuracy: null, captured_at: "" });
                 setGpsFromSitemap(true);
+                // Pre-load map tile immediately
+                fetchMapTileB64(lat, lng)
+                  .then(r => { if (r) mapTileCache.current = r; })
+                  .catch(() => {});
+                // Reverse geocode sitemap GPS silently
+                Location.reverseGeocodeAsync({ latitude: lat, longitude: lng })
+                  .then(res => {
+                    const a = res[0];
+                    if (!a) return;
+                    applyParsedGpsAddress(a, { setGpsStreet, setGpsCity, setGpsProvince });
+                  })
+                  .catch(() => {});
               }
             }
           }
@@ -585,6 +812,18 @@ export default function DestinationPoleScreen() {
           const lat = Number(d.map_latitude);
           const lng = Number(d.map_longitude);
           if (lat && lng) {
+            fetchMapTileB64(lat, lng)
+              .then(r => { if (r) mapTileCache.current = r; })
+              .catch(() => {});
+
+            Location.reverseGeocodeAsync({ latitude: lat, longitude: lng })
+              .then(res => {
+                const a = res[0];
+                if (!a) return;
+                applyParsedGpsAddress(a, { setGpsStreet, setGpsCity, setGpsProvince });
+              })
+              .catch(() => {});
+
             setCapturedGps(prev => {
               if (prev) return prev; // keep existing (device capture or sitemap)
               setGpsFromSitemap(true); // came from backend sitemap data
@@ -699,15 +938,41 @@ export default function DestinationPoleScreen() {
         return null;
       };
 
+      // Skip overwrite if a fresh capture just happened (race guard)
+      if (Date.now() - lastFreshCaptureRef.current < 3000) return;
+
       const [b, a, t] = await Promise.all([
-        load(F.before, `pole_${params.to_pole_id}_before.jpg`),  // reuse if available
-        load(F.after,  null),                                     // always fresh
-        load(F.tag,    `pole_${params.to_pole_id}_poletag.jpg`),  // reuse if available
+        load(F.before, `pole_${params.to_pole_id}_before.jpg`),
+        load(F.after,  `pole_${params.to_pole_id}_after.jpg`),
+        load(F.tag,    `pole_${params.to_pole_id}_poletag.jpg`),
       ]);
 
       if (b) setPhotoBefore(b);
       if (a) setPhotoAfter(a);
       if (t) setPhotoTag(t);
+
+      // If ALL 3 photos were already captured (pole was previously a FROM pole on another span),
+      // auto-proceed to components — no need to recapture the same pole's photos.
+      if (b && a && t) {
+        // Small delay so the UI renders the restored photos before navigating
+        setTimeout(() => {
+          const gps = toPoleGpsRef.current;
+          router.push({
+            pathname: "/teardowns/components" as any,
+            params: {
+              ...params,
+              to_pole_name: params.to_pole_name,
+              to_pole_latitude: gps ? String(gps.latitude) : "",
+              to_pole_longitude: gps ? String(gps.longitude) : "",
+              to_pole_gps_captured_at: gps?.captured_at ?? "",
+              to_pole_gps_accuracy: gps?.accuracy != null ? String(gps.accuracy) : "",
+              destination_slot: "",
+              destination_landmark: "",
+              teardown_started_at: new Date().toISOString(),
+            },
+          });
+        }, 400);
+      }
 
       const [qb, qa, qt] = await Promise.all([
         cacheGet<number>(`td_quality_before_${params.to_pole_id}`),
@@ -792,23 +1057,119 @@ export default function DestinationPoleScreen() {
     } catch {}
   }
 
+  function streetTileInfo(lat: number, lng: number, zoom = 18): StreetTileInfo {
+    const n = Math.pow(2, zoom);
+    const xFrac = ((lng + 180) / 360) * n;
+    const latRad = (lat * Math.PI) / 180;
+    const yFrac = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
+    const tileX = Math.floor(xFrac);
+    const tileY = Math.floor(yFrac);
+    return {
+      url: streetTileUrlFor(tileX, tileY, zoom),
+      tileX,
+      tileY,
+      zoom,
+      dotX: xFrac - tileX,
+      dotY: yFrac - tileY,
+    };
+  }
+
+  async function fetchMapTileB64(lat: number, lng: number): Promise<StampMapResult | null> {
+    try {
+      const { tileX, tileY, zoom, dotX, dotY } = streetTileInfo(lat, lng, 18);
+      const requests: { dx: number; dy: number }[] = [];
+
+      STREET_TILE_OFFSETS.forEach(dy => {
+        STREET_TILE_OFFSETS.forEach(dx => {
+          requests.push({
+            dx,
+            dy,
+          });
+        });
+      });
+
+      const results = await Promise.all(
+        requests.map(async ({ dx, dy }) => {
+          const fullTileX = tileX + dx;
+          const fullTileY = tileY + dy;
+
+          const startIdx = Math.abs(fullTileX + fullTileY) % CARTO_SUBDOMAINS.length;
+          const cartoCandidates = [
+            ...CARTO_SUBDOMAINS.slice(startIdx),
+            ...CARTO_SUBDOMAINS.slice(0, startIdx),
+          ].map(sub => `https://${sub}.basemaps.cartocdn.com/rastertiles/voyager/${zoom}/${fullTileX}/${fullTileY}.png`);
+
+          const candidates = [
+            ...cartoCandidates,
+            `https://tile.openstreetmap.org/${zoom}/${fullTileX}/${fullTileY}.png`,
+          ];
+
+          for (let attempt = 0; attempt < candidates.length; attempt++) {
+            const url = candidates[attempt];
+            const tmp = `${FileSystem.cacheDirectory}maptile_dest_${Date.now()}_${dx}_${dy}_${attempt}.png`;
+            try {
+              const dl = await FileSystem.downloadAsync(url, tmp);
+              const b64 = await FileSystem.readAsStringAsync(dl.uri, { encoding: "base64" as any });
+              return { b64, dx, dy };
+            } catch {
+              // try next candidate
+            } finally {
+              FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {});
+            }
+          }
+
+          return null;
+        }),
+      );
+      const tiles = results.filter((tile): tile is StampMapTile => !!tile);
+      const centerTile = tiles.find(tile => tile.dx === 0 && tile.dy === 0);
+      if (!centerTile) return null;
+      return { b64: centerTile.b64, tiles, dotX, dotY };
+    } catch {
+      return null;
+    }
+  }
+
   function buildStampLines(tab: "before" | "after" | "tag"): string[] {
     const name = editedToPoleName || params.to_pole_name || params.to_pole_code || "";
     const tabLabel = tab === "before" ? "BEFORE" : tab === "after" ? "AFTER" : "POLE TAG";
     const gps = capturedGps;
-    const gpsText = gps ? `${gps.latitude.toFixed(6)}, ${gps.longitude.toFixed(6)}` : "GPS not captured";
-    const time = getPHTNow().replace("T", " ").substring(0, 19) + " PHT";
-    return [
-      `${name}  [${tabLabel}]`,
-      `GPS: ${gpsText}`,
-      `${time}  \u2022  ${params.project_name || ""}`,
-    ];
+    // Use server-synced PHT time — cannot be spoofed by changing device clock
+    const phtIso = getPHTNow(); // "2026-05-19T23:34:50+08:00"
+    const [datePart, timeRaw] = phtIso.substring(0, 19).split("T");
+    const [yr, mo, dy] = datePart.split("-").map(Number);
+    const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const lines: string[] = [`${MON[mo - 1]} ${dy}, ${yr}  ${timeRaw}`];
+
+    // Street + city/province from reverse geocoding (populated on GPS capture)
+    if (gpsStreet) lines.push(gpsStreet);
+    const cityProv = [gpsCity, gpsProvince].filter(Boolean).join(", ");
+    if (cityProv) lines.push(cityProv);
+
+    if (gps) {
+      const latStr = `${Math.abs(gps.latitude).toFixed(6)}\u00b0 ${gps.latitude >= 0 ? "N" : "S"}`;
+      const lngStr = `${Math.abs(gps.longitude).toFixed(6)}\u00b0 ${gps.longitude >= 0 ? "E" : "W"}`;
+      lines.push(`${latStr}  ${lngStr}`);
+    }
+    lines.push(`${name}  (${tabLabel})`);
+    const nodeLabel = params.node_name || params.node_id || "";
+    if (nodeLabel) lines.push(`Node: ${nodeLabel}`);
+    return lines;
   }
 
-  async function stampPhoto(uri: string, lines: string[]): Promise<string> {
+  async function stampPhoto(uri: string, lines: string[], lat?: number | null, lng?: number | null): Promise<string> {
     try {
       const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" as any });
-      const payload = JSON.stringify({ b64, lines });
+      // Use pre-loaded tile cache — no network wait during photo stamping
+      const mapResult = mapTileCache.current
+        ?? (lat != null && lng != null ? await fetchMapTileB64(lat, lng).catch(() => null) : null);
+      const payload = JSON.stringify({
+        b64, lines,
+        mapB64:  mapResult?.b64  ?? null,
+        mapTiles: mapResult?.tiles ?? null,
+        mapDotX: mapResult?.dotX ?? 0.5,
+        mapDotY: mapResult?.dotY ?? 0.5,
+      });
       return new Promise<string>((resolve) => {
         const timer = setTimeout(() => {
           stampResolverRef.current = null;
@@ -868,12 +1229,27 @@ export default function DestinationPoleScreen() {
     setGpsCapturing(true);
     try {
       setCapturedGps({ ...coords });
-      setGpsFromSitemap(false); // overridden by actual device capture
+      setGpsFromSitemap(false);
       cacheSet(`pole_gps_${params.to_pole_id}`, {
         lat: coords.latitude,
         lng: coords.longitude,
       }).catch(() => {});
-      Alert.alert("GPS Captured", `Location saved.\n${coords.latitude.toFixed(6)}, ${coords.longitude.toFixed(6)}`);
+
+      // Pre-load street map tile now so stamp is instant when photo is taken
+      fetchMapTileB64(coords.latitude, coords.longitude)
+        .then(r => { if (r) mapTileCache.current = r; })
+        .catch(() => {});
+
+      // Reverse geocode in background — fills stamp lines with street/city/province
+      Location.reverseGeocodeAsync({ latitude: coords.latitude, longitude: coords.longitude })
+        .then(res => {
+          const a = res[0];
+          if (!a) return;
+          applyParsedGpsAddress(a, { setGpsStreet, setGpsCity, setGpsProvince });
+        })
+        .catch(() => {});
+
+      setGpsSuccessModal(true);
     } finally {
       setGpsCapturing(false);
     }
@@ -898,6 +1274,8 @@ export default function DestinationPoleScreen() {
     fileName: string,
     uri: string,
     stampLines?: string[],
+    gpsLat?: number | null,
+    gpsLng?: number | null,
   ): Promise<NonNullable<PhotoField>> {
     await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true });
 
@@ -912,13 +1290,13 @@ export default function DestinationPoleScreen() {
     // ── Stamped version → _view file on disk + gallery (display + lineman backup) ──
     let displayUri = dest;
     if (stampLines?.length) {
-      const stamped = await stampPhoto(compressed, stampLines);
+      const stamped = await stampPhoto(compressed, stampLines, gpsLat, gpsLng);
       const viewDest = dest.replace(/\.jpg$/i, "_view.jpg");
       const viewExisting = await FileSystem.getInfoAsync(viewDest);
       if ((viewExisting as any).exists) await FileSystem.deleteAsync(viewDest, { idempotent: true });
       await FileSystem.copyAsync({ from: stamped, to: viewDest });
       displayUri = viewDest;
-      MediaLibrary.requestPermissionsAsync()
+      MediaLibrary.requestPermissionsAsync(true)
         .then(({ status }) => {
           if (status === "granted") MediaLibrary.saveToLibraryAsync(stamped).catch(() => {});
         })
@@ -956,10 +1334,11 @@ export default function DestinationPoleScreen() {
     };
   }
 
-  function openViewer(label: string, photo: PhotoField, retakeFn: () => void) {
+  function openViewer(tab: "before" | "after" | "tag", retakeFn: () => void) {
+    const photo = tab === "before" ? photoBefore : tab === "after" ? photoAfter : photoTag;
     if (!photo) return;
-    setViewerLabel(label);
-    setViewerPhoto(photo);
+    setViewerLabel(tab === "before" ? "Before" : tab === "after" ? "After" : "Tag");
+    setViewerTab(tab);
     setViewerRetake(() => retakeFn);
     setViewerOpen(true);
   }
@@ -974,6 +1353,164 @@ export default function DestinationPoleScreen() {
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return Math.round(R * c);
   }
+
+  const warmDestinationGpsBundle = useCallback(async (
+    lat: number,
+    lng: number,
+    opts?: { force?: boolean },
+  ) => {
+    const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+    if (!opts?.force && gpsWarmKeyRef.current === key && gpsWarmPromiseRef.current) {
+      return gpsWarmPromiseRef.current;
+    }
+
+    gpsWarmKeyRef.current = key;
+    captureMapPrefetchedRef.current = false;
+
+    const warmPromise = (async () => {
+      await Promise.allSettled([
+        fetchMapTileB64(lat, lng).then((r) => {
+          if (r) mapTileCache.current = r;
+        }),
+        Location.reverseGeocodeAsync({ latitude: lat, longitude: lng }).then((res) => {
+          const a = res[0];
+          if (!a) return;
+          applyParsedGpsAddress(a, { setGpsStreet, setGpsCity, setGpsProvince });
+        }),
+        Image.prefetch(staticMapUrl(lat, lng)).then((ok) => {
+          captureMapPrefetchedRef.current = !!ok;
+        }),
+      ]);
+    })();
+
+    gpsWarmPromiseRef.current = warmPromise;
+    await warmPromise;
+  }, []);
+
+  useEffect(() => {
+    if (!capturedGps?.latitude || !capturedGps?.longitude) return;
+    warmDestinationGpsBundle(capturedGps.latitude, capturedGps.longitude).catch(() => {});
+  }, [capturedGps?.latitude, capturedGps?.longitude, warmDestinationGpsBundle]);
+
+  const openSharedCapture = useCallback((tab: "before" | "after" | "tag") => {
+    const gps = capturedGps ?? toPoleGpsRef.current;
+    if (!gps) return;
+    const tabLabel = tab === "before" ? "BEFORE" : tab === "after" ? "AFTER" : "POLE TAG";
+    router.push({
+      pathname: "/capture" as any,
+      params: {
+        tab,
+        returnKey: captureReturnKey,
+        ownerType: "destination",
+        ownerPoleId: String(params.to_pole_id ?? ""),
+        label: tabLabel,
+        poleCode: editedToPoleName || params.to_pole_name || params.to_pole_code || "Destination Pole",
+        nodeName: params.node_name || params.node_id || "",
+        lat: String(gps.latitude),
+        lng: String(gps.longitude),
+        road: gpsStreet,
+        city: gpsCity,
+        province: gpsProvince,
+        prefetchedMap: captureMapPrefetchedRef.current ? "1" : "0",
+      },
+    });
+  }, [
+    capturedGps,
+    captureReturnKey,
+    editedToPoleName,
+    gpsCity,
+    gpsProvince,
+    gpsStreet,
+    params.node_id,
+    params.node_name,
+    params.to_pole_id,
+    params.to_pole_code,
+    params.to_pole_name,
+  ]);
+
+  // Stable refs so applyCaptureResult's useCallback doesn't restart mid-stamp
+  // when setter(createPhotoField) triggers a re-render and recreates these functions.
+  const buildStampLinesRef = useRef(buildStampLines);
+  buildStampLinesRef.current = buildStampLines;
+  const savePhotoDraftRef = useRef(savePhotoDraft);
+  savePhotoDraftRef.current = savePhotoDraft;
+
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+
+      const applyCaptureResult = async () => {
+        const result = (global as any)[captureReturnKey] as
+          | {
+              uri?: string;
+              tab?: "before" | "after" | "tag";
+              ownerType?: string;
+              ownerPoleId?: string;
+              skipStamp?: boolean;
+            }
+          | undefined;
+        if (!result?.uri || !result?.tab) return;
+
+        const expectedPoleId = String(params.to_pole_id ?? "");
+        if (result.ownerType !== "destination" || String(result.ownerPoleId ?? "") !== expectedPoleId) {
+          delete (global as any)[captureReturnKey];
+          return;
+        }
+
+        delete (global as any)[captureReturnKey];
+
+        const tab = result.tab;
+        const setter = tab === "before" ? setPhotoBefore : tab === "after" ? setPhotoAfter : setPhotoTag;
+        const qualitySetter = tab === "before" ? setQualityBefore : tab === "after" ? setQualityAfter : setQualityTag;
+        const file = tab === "before" ? F.before : tab === "after" ? F.after : F.tag;
+        const qualityKey = tab === "before"
+          ? `td_quality_before_${params.to_pole_id}`
+          : tab === "after"
+          ? `td_quality_after_${params.to_pole_id}`
+          : `td_quality_tag_${params.to_pole_id}`;
+
+        setActiveCameraTab(tab);
+        setBlurWarning(false);
+
+        const thisGen = ++captureGenRef.current;
+        lastFreshCaptureRef.current = Date.now(); // block draft loader for 3s
+        setter(createPhotoField(result.uri, file)); // show immediately
+
+        try {
+          const gpsLat = capturedGps?.latitude ?? toPoleGpsRef.current?.latitude ?? null;
+          const gpsLng = capturedGps?.longitude ?? toPoleGpsRef.current?.longitude ?? null;
+          // Skip re-stamp if capture.tsx already burned the metadata in
+          const stampLines = result.skipStamp ? undefined : buildStampLinesRef.current(tab);
+          const saved = await savePhotoDraftRef.current(file, result.uri, stampLines, gpsLat, gpsLng);
+          if (cancelled || captureGenRef.current !== thisGen) return;
+
+          setter(saved);
+          cacheSet(`photo_captured_at_${params.to_pole_id}_${tab}`, getPHTNow()).catch(() => {});
+
+          const variance = await checkPhotoQuality(saved.fileUri ?? result.uri);
+          if (cancelled || captureGenRef.current !== thisGen) return;
+
+          const pct = varianceToPercent(variance);
+          qualitySetter(pct);
+          cacheSet(qualityKey, pct).catch(() => {});
+          if (variance < 80) setBlurWarning(true);
+        } catch {}
+      };
+
+      applyCaptureResult().catch(() => {});
+      return () => {
+        cancelled = true;
+      };
+    }, [
+      F.after,
+      F.before,
+      F.tag,
+      captureReturnKey,
+      capturedGps,
+      params.to_pole_id,
+      toPoleGpsRef,
+    ]),
+  );
 
   async function captureFromCamera() {
     if (!cameraRef.current || !cameraReady || photoCapturing) return;
@@ -1017,7 +1554,9 @@ export default function DestinationPoleScreen() {
       // Stamp + quality check in background
       (async () => {
         try {
-          const saved = await savePhotoDraft(file, photo.uri, buildStampLines(tab));
+          const gpsLat = capturedGps?.latitude ?? null;
+          const gpsLng = capturedGps?.longitude ?? null;
+          const saved = await savePhotoDraft(file, photo.uri, buildStampLines(tab), gpsLat, gpsLng);
           if (captureGenRef.current !== thisGen) return;
           setter(saved);
           cacheSet(`photo_captured_at_${params.to_pole_id}_${tab}`, capturedAt).catch(() => {});
@@ -1459,44 +1998,34 @@ export default function DestinationPoleScreen() {
           <View style={styles.sectionCard}>
             <SectionHeading
               title="Pole Photos"
-              subtitle={infoComplete ? "Tap a photo to view or capture" : "Fill GPS, Slot & Landmark first"}
+              subtitle={infoComplete ? "Click a card to capture · tap again to view" : "Fill GPS, Slot & Landmark first"}
             />
             <View style={styles.photoTileRow}>
               <PhotoTile
                 label="Before"
                 photo={photoBefore}
                 accentColor={accentColor}
-                onCapture={() => { if (infoComplete) { setActiveCameraTab("before"); setShowCameraModal(true); } }}
-                onView={() => openViewer("Before", photoBefore, () => { setActiveCameraTab("before"); setShowCameraModal(true); })}
+                disabled={!infoComplete}
+                onCapture={() => openSharedCapture("before")}
+                onView={() => openViewer("before", () => openSharedCapture("before"))}
               />
               <PhotoTile
                 label="After"
                 photo={photoAfter}
                 accentColor={accentColor}
-                onCapture={() => { if (infoComplete) { setActiveCameraTab("after"); setShowCameraModal(true); } }}
-                onView={() => openViewer("After", photoAfter, () => { setActiveCameraTab("after"); setShowCameraModal(true); })}
+                disabled={!infoComplete}
+                onCapture={() => openSharedCapture("after")}
+                onView={() => openViewer("after", () => openSharedCapture("after"))}
               />
               <PhotoTile
                 label="Tag"
                 photo={photoTag}
                 accentColor={accentColor}
-                onCapture={() => { if (infoComplete) { setActiveCameraTab("tag"); setShowCameraModal(true); } }}
-                onView={() => openViewer("Tag", photoTag, () => { setActiveCameraTab("tag"); setShowCameraModal(true); })}
+                disabled={!infoComplete}
+                onCapture={() => openSharedCapture("tag")}
+                onView={() => openViewer("tag", () => openSharedCapture("tag"))}
               />
             </View>
-            <Pressable
-              style={({ pressed }) => [
-                styles.capturePhotosBtn,
-                { backgroundColor: infoComplete ? accentColor : "#C9CED6" },
-                pressed && infoComplete && styles.pressedDown,
-              ]}
-              onPress={infoComplete ? () => { setActiveCameraTab("before"); setShowCameraModal(true); } : undefined}
-              disabled={!infoComplete}
-            >
-              <Text style={styles.capturePhotosBtnText}>
-                {infoComplete ? "📷  Capture Photos" : "Complete GPS, Slot & Landmark first"}
-              </Text>
-            </Pressable>
           </View>
         </ScrollView>
 
@@ -1662,10 +2191,87 @@ export default function DestinationPoleScreen() {
                   );
                 }
                 if (cameraPermission?.granted) {
+                  const stampPreviewLines = buildStampLines(activeCameraTab as any);
+                  const previewLat = capturedGps?.latitude ?? null;
+                  const previewLng = capturedGps?.longitude ?? null;
+                  const mapInfo = previewLat != null && previewLng != null
+                    ? streetTileInfo(previewLat, previewLng, 18)
+                    : null;
+
                   return (
                     <GestureDetector gesture={pinchGesture}>
                       <View style={StyleSheet.absoluteFillObject}>
                         <CameraView ref={cameraRef} style={StyleSheet.absoluteFillObject} facing="back" zoom={cameraZoom} onCameraReady={() => setCameraReady(true)} />
+
+                        {capturedGps && (
+                          <View
+                            style={{
+                              position: "absolute",
+                              top: 16,
+                              left: 16,
+                              right: 16,
+                              backgroundColor: "rgba(13, 17, 23, 0.85)",
+                              borderRadius: 12,
+                              paddingVertical: 10,
+                              paddingHorizontal: 14,
+                              flexDirection: "row",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              borderWidth: 1,
+                              borderColor: "rgba(255,255,255,0.15)",
+                            }}
+                          >
+                            <View style={{ flexDirection: "row", alignItems: "center" }}>
+                              <Text style={{ fontSize: 16, marginRight: 8 }}>📍</Text>
+                              <View>
+                                <Text style={{ color: "#FFF", fontSize: 12, fontWeight: "600" }}>Target Coordinates</Text>
+                                <Text style={{ color: "#9CA3AF", fontSize: 11 }}>
+                                  {capturedGps.latitude.toFixed(6)}, {capturedGps.longitude.toFixed(6)}
+                                </Text>
+                              </View>
+                            </View>
+                            {prewarmedGps.current ? (
+                              <View style={{ alignItems: "flex-end" }}>
+                                <Text style={{ color: accentColor, fontSize: 13, fontWeight: "800" }}>
+                                  {computeDistanceMeters(
+                                    capturedGps.latitude,
+                                    capturedGps.longitude,
+                                    prewarmedGps.current.latitude,
+                                    prewarmedGps.current.longitude,
+                                  )}m Range
+                                </Text>
+                                <Text style={{ color: "#A7F3D0", fontSize: 9 }}>Verified</Text>
+                              </View>
+                            ) : (
+                              <Text style={{ color: accentColor, fontSize: 12, fontWeight: "600" }}>Active</Text>
+                            )}
+                          </View>
+                        )}
+
+                        {/* Live stamp preview overlay */}
+                        <View style={{
+                          position: "absolute", bottom: 8, left: 8, right: 8,
+                          flexDirection: "row", alignItems: "stretch", gap: 6,
+                        }}>
+                          <View style={{
+                            flex: 1, backgroundColor: "rgba(0,0,0,0.55)",
+                            borderRadius: 10, paddingVertical: 8, paddingHorizontal: 10,
+                            borderWidth: 1, borderColor: "rgba(255,255,255,0.12)",
+                          }}>
+                            {stampPreviewLines.map((line, i) => (
+                              <Text key={i} style={{
+                                color: i === stampPreviewLines.length - 1 ? "rgba(255,255,255,0.62)" : "#FFF",
+                                fontSize: i === 0 ? 11 : 10,
+                                fontWeight: i === 0 ? "700" : "600",
+                                lineHeight: 15,
+                              }} numberOfLines={1}>{line}</Text>
+                            ))}
+                          </View>
+                          {mapInfo && (
+                            <MapThumbnail info={mapInfo} />
+                          )}
+                        </View>
+
                         {blurWarning && (
                           <View style={styles.blurWarningOverlay}>
                             <Text style={styles.blurWarningIcon}>⚠️</Text>
@@ -1768,7 +2374,16 @@ export default function DestinationPoleScreen() {
                 </Pressable>
               </View>
               {viewerPhoto ? (
-                <ExpoImage source={{ uri: viewerPhoto.uri }} style={styles.modalImage} contentFit="cover" transition={150} />
+                <ExpoImage
+                  key={viewerPhoto.version}
+                  source={{ uri: viewerPhoto.uri }}
+                  style={styles.modalImage}
+                  contentFit="contain"
+                  contentPosition="top"
+                  cachePolicy="none"
+                  recyclingKey={String(viewerPhoto.version)}
+                  transition={150}
+                />
               ) : null}
               <View style={styles.modalFooter}>
                 <Pressable style={({ pressed }) => [styles.modalGhostBtn, pressed && styles.pressedDown]} onPress={() => setViewerOpen(false)}>
@@ -1837,6 +2452,33 @@ export default function DestinationPoleScreen() {
           domStorageEnabled
           originWhitelist={["*"]}
         />
+
+        <Modal
+          transparent
+          visible={gpsSuccessModal}
+          animationType="fade"
+          onRequestClose={() => setGpsSuccessModal(false)}
+        >
+          <View style={styles.prModalOverlay}>
+            <View style={styles.alertModalCard}>
+              <View style={styles.alertModalSuccessIcon}>
+                <Text style={{ fontSize: 24, color: "#10b981", fontWeight: "900" }}>✓</Text>
+              </View>
+              <Text style={styles.alertModalTitle}>GPS Captured</Text>
+              <Text style={styles.alertModalText}>
+                Location successfully saved:{"\n"}
+                {capturedGps?.latitude?.toFixed(6)}, {capturedGps?.longitude?.toFixed(6)}
+              </Text>
+
+              <TouchableOpacity
+                style={styles.alertModalBtnFull}
+                onPress={() => setGpsSuccessModal(false)}
+              >
+                <Text style={styles.alertModalBtnFullText}>OK</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
       </SafeAreaView>
     </>
   );
@@ -3341,9 +3983,9 @@ const styles = StyleSheet.create({
 
   modalImage: {
     width: "100%",
-    aspectRatio: 3 / 4,
+    height: 440,
     borderRadius: 14,
-    backgroundColor: "#E5E7EB",
+    backgroundColor: "#000",
   },
 
   modalFooter: {
@@ -3376,6 +4018,71 @@ const styles = StyleSheet.create({
   modalPrimaryBtnText: {
     fontSize: 14,
     fontWeight: "900",
+    color: "#FFFFFF",
+  },
+
+  prModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 24,
+  },
+
+  alertModalCard: {
+    width: "100%",
+    maxWidth: 320,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    padding: 24,
+    alignItems: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.18,
+    shadowRadius: 24,
+    elevation: 12,
+  },
+
+  alertModalSuccessIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: "#ECFDF5",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 16,
+    borderWidth: 2,
+    borderColor: "#A7F3D0",
+  },
+
+  alertModalTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: "#0F172A",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+
+  alertModalText: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: "#64748B",
+    textAlign: "center",
+    lineHeight: 20,
+  },
+
+  alertModalBtnFull: {
+    marginTop: 24,
+    width: "100%",
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: "#0B7A5A",
+    alignItems: "center",
+  },
+
+  alertModalBtnFullText: {
+    fontSize: 13,
+    fontWeight: "800",
     color: "#FFFFFF",
   },
 

@@ -6,18 +6,47 @@ import { startNetSync, stopNetSync, setNetSyncToken } from "@/lib/net-sync";
 import { startLocationTracking, stopLocationTracking } from "@/lib/location-tracker";
 import { clearAllCache, cacheSet } from "@/lib/cache";
 import { clearAllQueues } from "@/lib/sync-queue";
-import { getAreas } from "@/services/skycable";
+import { getAreas, getNodes, getNodePoles } from "@/services/skycable";
 
-// Prefetch teardown areas right after login/rehydration so the
-// teardown screen always has data even on the very first navigation.
+// Prefetch all teardown data right after login/rehydration so the app works
+// offline immediately: areas → nodes → poles for active/pending nodes.
 async function prefetchCoreData(token: string, user: GlobeUser) {
   try {
     const teamId = (user as any)?.team_id ?? null;
-    const cacheKey = teamId ? `sitemap_areas_team_${teamId}` : "sitemap_areas";
+
+    // 1. Areas
+    const areasKey = teamId ? `sitemap_areas_team_${teamId}` : "sitemap_areas";
     const areas = await getAreas(token, teamId);
-    await cacheSet(cacheKey, areas);
+    await cacheSet(areasKey, areas);
+
+    // 2. Nodes for all areas in parallel
+    const nodeResults = await Promise.allSettled(
+      areas.map(area => getNodes(area.id, token, teamId))
+    );
+
+    const allNodes: { id: number; status: string }[] = [];
+    for (let i = 0; i < nodeResults.length; i++) {
+      const r = nodeResults[i];
+      if (r.status !== "fulfilled") continue;
+      const raw = r.value;
+      const nodes: any[] = Array.isArray(raw) ? raw : ((raw as any)?.data ?? []);
+      cacheSet(`nodes_area_${areas[i].id}`, nodes).catch(() => {});
+      allNodes.push(...nodes);
+    }
+
+    // 3. Poles for active / pending nodes (cap at 30 to avoid flooding the API)
+    const active = allNodes
+      .filter(n => n.status === "in_progress" || n.status === "pending")
+      .slice(0, 30);
+
+    await Promise.allSettled(
+      active.map(async node => {
+        const poles = await getNodePoles(node.id, token);
+        cacheSet(`sitemap_poles_${node.id}`, poles).catch(() => {});
+      })
+    );
   } catch {
-    // Silent — prefetch is best-effort, screen will retry on mount
+    // Silent — prefetch is best-effort, each screen retries on mount
   }
 }
 
@@ -70,6 +99,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const savedUser = await tokenStore.getUser();
 
       if (saved) {
+        // Validate the saved token before starting any services.
+        // 401 → token is expired/invalid → auto-logout so the user sees the login screen.
+        // Network error → device is offline → trust the cached token and continue.
+        let tokenValid = true;
+        try {
+          await getAreas(saved, (savedUser as any)?.team_id ?? null);
+        } catch (e: any) {
+          if (e?.response?.status === 401 || e?.status === 401) {
+            tokenValid = false;
+          }
+          // Network/timeout errors → keep tokenValid=true (offline mode)
+        }
+
+        if (!tokenValid) {
+          // Token rejected by server — clear everything and show login
+          await tokenStore.clear();
+          await clearAllCache();
+          await clearAllQueues();
+          setIsReady(true);
+          return;
+        }
+
         setToken(saved);
         setBridgeToken(saved);
         setNetSyncToken(saved);

@@ -32,7 +32,7 @@ export interface SkycableNode {
   expected_cable?: number | null;
   actual_cable?: number | null;
   progress_percentage?: number | null;
-  report_type?: string | null;
+  report_type?: "full_report" | "pole_report" | null;
 }
 
 export interface SkycablePole {
@@ -75,7 +75,11 @@ export const getNodeDetail = async (nodeId: number, token: string): Promise<Skyc
 };
 
 export const startNodeTeardown = async (nodeId: number, token: string, dateStart: string): Promise<void> => {
-  await api.request(`/skycable/nodes/${nodeId}`, { method: "PUT", body: JSON.stringify({ date_start: dateStart }) }, token);
+  await api.request(
+    `/skycable/nodes/${nodeId}`,
+    { method: "PUT", body: JSON.stringify({ date_start: dateStart, status: "in_progress" }) },
+    token,
+  );
 };
 
 export const startPoleTeardown = async (nodeId: number, poleId: number, token: string, dateStart: string): Promise<void> => {
@@ -513,4 +517,3 @@ export const downloadSitemapData = async (token: string): Promise<boolean> => {
     throw err;
   }
 };
-

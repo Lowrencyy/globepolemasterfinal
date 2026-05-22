@@ -8,6 +8,20 @@ import { useEffect } from "react";
 import "react-native-reanimated";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
+// Suppress non-fatal "Unable to activate keep awake" errors thrown by
+// expo-camera's internal expo-keep-awake call on some Android devices.
+// The error appears as an unhandled rejection but does NOT affect functionality.
+if (typeof global !== "undefined") {
+  const _gu = (global as any).ErrorUtils;
+  if (_gu) {
+    const _prev = _gu.getGlobalHandler?.();
+    _gu.setGlobalHandler?.((err: any, isFatal: boolean) => {
+      if (err?.message?.toLowerCase().includes("keep awake")) return;
+      _prev?.(err, isFatal);
+    });
+  }
+}
+
 import { AuthProvider, useAuth } from "@/context/auth-context";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 

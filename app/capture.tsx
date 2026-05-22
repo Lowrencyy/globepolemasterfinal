@@ -8,6 +8,7 @@ import {
   View,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as Location from "expo-location";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -49,6 +50,37 @@ export default function CaptureScreen() {
   });
   const [now, setNow]           = useState(() => getPHTNow());
   const [capturing, setCapturing] = useState(false);
+
+  // Zoom
+  const [cameraZoom, setCameraZoom] = useState(0);
+  const pinchBaseZoom = useRef(0);
+  const zoomBadgeOpacity = useRef(new Animated.Value(0)).current;
+  const zoomHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const pinchGesture = Gesture.Pinch()
+    .runOnJS(true)
+    .onStart(() => { pinchBaseZoom.current = cameraZoom; })
+    .onUpdate((e) => {
+      const next = Math.min(1, Math.max(0, pinchBaseZoom.current + (e.scale - 1) * 0.4));
+      setCameraZoom(next);
+      // Show zoom badge
+      Animated.timing(zoomBadgeOpacity, { toValue: 1, duration: 100, useNativeDriver: true }).start();
+      if (zoomHideTimer.current) clearTimeout(zoomHideTimer.current);
+      zoomHideTimer.current = setTimeout(() => {
+        Animated.timing(zoomBadgeOpacity, { toValue: 0, duration: 400, useNativeDriver: true }).start();
+      }, 1200);
+    });
+
+  // Double-tap resets zoom to 1×
+  const doubleTapGesture = Gesture.Tap()
+    .runOnJS(true)
+    .numberOfTaps(2)
+    .onEnd(() => { setCameraZoom(0); });
+
+  const cameraGesture = Gesture.Simultaneous(pinchGesture, doubleTapGesture);
+
+  // Human-readable zoom label: 0→1.0×, 1→~10×
+  const zoomLabel = `${(1 + cameraZoom * 9).toFixed(1)}×`;
 
   // Flash animation on capture
   const flashOpacity  = useRef(new Animated.Value(0)).current;
@@ -162,14 +194,22 @@ export default function CaptureScreen() {
       <Stack.Screen options={{ headerShown: false }} />
       <StatusBar hidden />
 
-      {/* Camera — sized to fill full screen height (no letterbox) */}
-      <View style={StyleSheet.absoluteFill} collapsable={false}>
-        <CameraView
-          ref={cameraRef}
-          style={StyleSheet.absoluteFillObject}
-          facing="back"
-        />
-      </View>
+      {/* Camera with pinch-to-zoom + double-tap reset */}
+      <GestureDetector gesture={cameraGesture}>
+        <View style={StyleSheet.absoluteFill} collapsable={false}>
+          <CameraView
+            ref={cameraRef}
+            style={StyleSheet.absoluteFillObject}
+            facing="back"
+            zoom={cameraZoom}
+          />
+        </View>
+      </GestureDetector>
+
+      {/* Zoom level badge — fades in on pinch, fades out after 1.2s */}
+      <Animated.View style={[s.zoomBadge, { opacity: zoomBadgeOpacity }]} pointerEvents="none">
+        <Text style={s.zoomBadgeTxt}>{zoomLabel}</Text>
+      </Animated.View>
 
       {/* Target coordinates — safe area top */}
       {targetLat != null && targetLng != null && (
@@ -257,4 +297,6 @@ const s = StyleSheet.create({
   shutterInner:  { width: 54, height: 54, borderRadius: 27, backgroundColor: "#fff" },
   sideBtn:       { width: 42, height: 42, borderRadius: 21, backgroundColor: "rgba(0,0,0,0.4)", alignItems: "center", justifyContent: "center" },
   sideBtnTxt:    { color: "#fff", fontSize: 22 },
+  zoomBadge:     { position: "absolute", top: "50%", alignSelf: "center", backgroundColor: "rgba(0,0,0,0.55)", borderRadius: 20, paddingHorizontal: 14, paddingVertical: 6, borderWidth: 1, borderColor: "rgba(255,255,255,0.25)" },
+  zoomBadgeTxt:  { color: "#fff", fontSize: 15, fontWeight: "800", letterSpacing: 0.5 },
 });

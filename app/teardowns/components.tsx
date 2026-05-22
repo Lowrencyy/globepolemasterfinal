@@ -24,6 +24,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
   Easing,
   Modal,
   Pressable,
@@ -34,6 +35,8 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+
+const SCREEN_H = Dimensions.get("window").height;
 
 type PhotoFile = { uri: string } | null;
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -512,6 +515,69 @@ function PhotoCircleItem({
   );
 }
 
+// Pure React Native span map — no WebView, works inside ScrollView on Android.
+// Shows satellite tiles centered at the midpoint between two poles, with colored dots.
+function StaticSpanMapView({
+  fromLat, fromLng, toLat, toLng, accentColor,
+}: {
+  fromLat: number; fromLng: number; toLat: number; toLng: number; accentColor: string;
+}) {
+  const [size, setSize] = React.useState<{ w: number; h: number } | null>(null);
+
+  const midLat = (fromLat + toLat) / 2;
+  const midLng = (fromLng + toLng) / 2;
+
+  const maxDiff = Math.max(Math.abs(toLat - fromLat), Math.abs(toLng - fromLng));
+  const zoom = maxDiff < 0.001 ? 17 : maxDiff < 0.005 ? 16 : maxDiff < 0.02 ? 15 : 14;
+
+  const { xFrac: midXFrac, yFrac: midYFrac, tileX, tileY } = latLngToTileFrac(midLat, midLng, zoom);
+  const { xFrac: fromXFrac, yFrac: fromYFrac } = latLngToTileFrac(fromLat, fromLng, zoom);
+  const { xFrac: toXFrac,   yFrac: toYFrac   } = latLngToTileFrac(toLat,   toLng,   zoom);
+
+  const scale = size ? Math.max(size.w / TILE_PX, size.h / TILE_PX) * 1.6 : 1.6;
+  const imgW  = TILE_PX * scale;
+  const imgH  = TILE_PX * scale;
+  const PIN   = 13;
+
+  const px = (xFrac: number, yFrac: number) => ({
+    left: (size?.w ?? 0) / 2 + (xFrac - midXFrac) * imgW - PIN / 2,
+    top:  (size?.h ?? 0) / 2 + (yFrac - midYFrac) * imgH - PIN / 2,
+  });
+
+  return (
+    <View
+      style={{ flex: 1, overflow: "hidden" }}
+      onLayout={e => setSize({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })}
+    >
+      {size && TILE_OFFSETS.map(dy =>
+        TILE_OFFSETS.map(dx => (
+          <ExpoImage
+            key={`${dx}:${dy}`}
+            source={{ uri: `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${tileY + dy}/${tileX + dx}` }}
+            style={{
+              position: "absolute",
+              left: size.w / 2 - (midXFrac - tileX) * imgW + dx * imgW,
+              top:  size.h / 2 - (midYFrac - tileY) * imgH + dy * imgH,
+              width: imgW, height: imgH,
+            }}
+            contentFit="cover"
+          />
+        ))
+      )}
+      {size && (() => {
+        const f = px(fromXFrac, fromYFrac);
+        const t = px(toXFrac, toYFrac);
+        return (
+          <>
+            <View style={{ position: "absolute", left: f.left, top: f.top, width: PIN, height: PIN, borderRadius: PIN / 2, backgroundColor: accentColor, borderWidth: 2, borderColor: "#FFF", elevation: 3 }} />
+            <View style={{ position: "absolute", left: t.left, top: t.top, width: PIN, height: PIN, borderRadius: PIN / 2, backgroundColor: "#6366F1", borderWidth: 2, borderColor: "#FFF", elevation: 3 }} />
+          </>
+        );
+      })()}
+    </View>
+  );
+}
+
 export default function TeardownComponentsScreen() {
   const params = useLocalSearchParams<{
     pole_code: string;
@@ -605,7 +671,38 @@ export default function TeardownComponentsScreen() {
   const fromLng = Number(params.from_pole_longitude) || null;
   const toLat = Number(params.to_pole_latitude) || null;
   const toLng = Number(params.to_pole_longitude) || null;
-  const hasSpanCoords = !!(fromLat && fromLng && toLat && toLng);
+
+  // Display coords — start from params, fill from GPS cache when params are empty
+  const [mapFromLat, setMapFromLat] = useState<number | null>(fromLat);
+  const [mapFromLng, setMapFromLng] = useState<number | null>(fromLng);
+  const [mapToLat,   setMapToLat]   = useState<number | null>(toLat);
+  const [mapToLng,   setMapToLng]   = useState<number | null>(toLng);
+
+  useEffect(() => {
+    (async () => {
+      const loadCoords = async (
+        poleId: string,
+        setLat: (v: number) => void,
+        setLng: (v: number) => void,
+      ) => {
+        const g = await cacheGet<{ lat: number | string; lng: number | string }>(`pole_gps_${poleId}`).catch(() => null);
+        if (g?.lat && g?.lng) { setLat(Number(g.lat)); setLng(Number(g.lng)); return; }
+        if (params.node_id) {
+          const poles = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`).catch(() => null);
+          const match = poles?.find(p => String(p.pole_id) === String(poleId));
+          if (match?.pole?.lat && match?.pole?.lng) {
+            setLat(parseFloat(match.pole.lat));
+            setLng(parseFloat(match.pole.lng));
+          }
+        }
+      };
+      if (!fromLat || !fromLng) await loadCoords(params.from_pole_id, setMapFromLat, setMapFromLng);
+      if (!toLat   || !toLng  ) await loadCoords(params.to_pole_id,   setMapToLat,   setMapToLng);
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const hasSpanCoords = !!(mapFromLat && mapFromLng && mapToLat && mapToLng);
 
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerLabel, setViewerLabel] = useState("");
@@ -685,17 +782,32 @@ export default function TeardownComponentsScreen() {
     const allFiles = { ...fromPoleFiles, ...toFiles };
     const result: Record<string, PhotoFile> = {};
 
+    // Helper: load a file, preferring the stamped _view.jpg over the clean version.
+    // Uses canonical URIs from getInfoAsync (not constructed strings) to avoid path issues.
+    const loadFile = async (path: string, tsKey: string, fileName: string): Promise<PhotoFile> => {
+      const info = await FileSystem.getInfoAsync(path).catch(() => null);
+      if (!(info as any)?.exists) return null;
+      const viewPath = path.replace(/\.jpg$/i, "_view.jpg");
+      const viewInfo = await FileSystem.getInfoAsync(viewPath).catch(() => null);
+      // Only use _view.jpg if it exists AND has content (size > 0)
+      const viewValid = (viewInfo as any)?.exists && ((viewInfo as any).size ?? 0) > 0;
+      const uri = viewValid ? (viewInfo as any).uri : (info as any).uri;
+      if ("modificationTime" in (info as any) && (info as any).modificationTime) {
+        photoTimestamps.current[tsKey] = new Date((info as any).modificationTime * 1000).toISOString();
+      }
+      return { uri, name: fileName, type: "image/jpeg" } as any;
+    };
+
     await Promise.all(
       Object.entries(allFiles).map(async ([key, { dir, file }]) => {
-        const path = dir + file;
-        const info = await FileSystem.getInfoAsync(path);
-        if (info.exists) {
-          result[key] = { uri: info.uri, name: file, type: "image/jpeg" } as any;
-          if ("modificationTime" in info && info.modificationTime) {
-            photoTimestamps.current[key] = new Date(
-              info.modificationTime * 1000,
-            ).toISOString();
-          }
+        const loaded = await loadFile(dir + file, key, file);
+        if (loaded) {
+          result[key] = loaded;
+        } else if (key === "to_tag") {
+          // Fallback: destination-pole cross-copies the to-pole tag to pole_drafts.
+          // Try that path if the teardown_drafts version is missing.
+          const poleDir = `${FileSystem.documentDirectory}pole_drafts/${sanitize(params.project_name)}/${params.node_id}/${params.to_pole_id}/`;
+          result[key] = await loadFile(poleDir + `pole_${params.to_pole_id}_poletag.jpg`, key, file);
         } else {
           result[key] = null;
         }
@@ -1216,17 +1328,24 @@ export default function TeardownComponentsScreen() {
           FileSystem.deleteAsync(poleDraftDir + `pole_${params.from_pole_id}_after.jpg`, { idempotent: true }).catch(() => {});
         }
 
-        // Record cleared_at on the skycable_poles pivot row — backend decides the
-        // actual skycable_status based on remaining spans (may be in_progress, not cleared).
+        // Record cleared_at for both poles. Backend determines actual skycable_status
+        // based on remaining spans — a pole with multiple spans stays "in_progress"
+        // until all spans are submitted.
+        const clearedAt = getPHTNow();
         if (params.node_id && params.to_pole_id) {
-          const clearedAt = getPHTNow();
           api.put(
             `/skycable/nodes/${params.node_id}/poles/${params.to_pole_id}`,
             { cleared_at: clearedAt }
           ).catch(() => {});
-          // Invalidate local poles cache so poles.tsx re-fetches fresh status
-          cacheSet(`sitemap_poles_${params.node_id}`, null).catch(() => {});
         }
+        if (params.node_id && params.from_pole_id) {
+          api.put(
+            `/skycable/nodes/${params.node_id}/poles/${params.from_pole_id}`,
+            { cleared_at: clearedAt }
+          ).catch(() => {});
+        }
+        // Invalidate local poles cache — poles.tsx will re-fetch correct status from backend
+        if (params.node_id) cacheSet(`sitemap_poles_${params.node_id}`, null).catch(() => {});
       })
       .catch(async (e: any) => {
         const status = e?.response?.status;
@@ -1402,27 +1521,12 @@ export default function TeardownComponentsScreen() {
 
             {hasSpanCoords ? (
               <View style={styles.spanMiniMapWrap}>
-                <WebView
-                  style={StyleSheet.absoluteFillObject}
-                  scrollEnabled={false}
-                  originWhitelist={["*"]}
-                  javaScriptEnabled
-                  domStorageEnabled
-                  mixedContentMode="always"
-                  cacheEnabled={false}
-                  source={{
-                    html: buildSpanMapHtml(
-                      fromLat!,
-                      fromLng!,
-                      params.pole_code || "FROM",
-                      toLat!,
-                      toLng!,
-                      params.to_pole_code || "TO",
-                      accentColor,
-                      true,
-                    ),
-                    baseUrl: "https://local.telcovantage/",
-                  }}
+                <StaticSpanMapView
+                  fromLat={mapFromLat!}
+                  fromLng={mapFromLng!}
+                  toLat={mapToLat!}
+                  toLng={mapToLng!}
+                  accentColor={accentColor}
                 />
               </View>
             ) : (
@@ -1484,11 +1588,11 @@ export default function TeardownComponentsScreen() {
                     cacheEnabled={false}
                     source={{
                       html: buildSpanMapHtml(
-                        fromLat!,
-                        fromLng!,
+                        mapFromLat!,
+                        mapFromLng!,
                         params.pole_code || "FROM",
-                        toLat!,
-                        toLng!,
+                        mapToLat!,
+                        mapToLng!,
                         params.to_pole_code || "TO",
                         accentColor,
                         false,
@@ -1504,12 +1608,6 @@ export default function TeardownComponentsScreen() {
           <View style={styles.progressCard}>
             <View style={styles.progressTopRow}>
               <Text style={styles.progressTitle}>Completion Tracker</Text>
-              <View style={styles.timerBadge}>
-                <Text style={styles.timerText}>
-                  ⏱ {String(Math.floor(elapsedSecs / 60)).padStart(2, "0")}:
-                  {String(elapsedSecs % 60).padStart(2, "0")}
-                </Text>
-              </View>
               <Text style={[styles.progressPercent, { color: accentColor }]}>
                 {progress.percent}%
               </Text>
@@ -1996,12 +2094,14 @@ export default function TeardownComponentsScreen() {
               </View>
 
               {viewerPhoto ? (
-                <ExpoImage
-                  source={{ uri: viewerPhoto.uri }}
-                  style={styles.modalImage}
-                  contentFit="cover"
-                  transition={150}
-                />
+                <View style={styles.modalImageWrap}>
+                  <ExpoImage
+                    source={{ uri: viewerPhoto.uri }}
+                    style={styles.modalImage}
+                    contentFit="contain"
+                    transition={150}
+                  />
+                </View>
               ) : null}
 
               <View style={styles.modalFooter}>
@@ -2121,11 +2221,11 @@ export default function TeardownComponentsScreen() {
                       cacheEnabled={false}
                       source={{
                         html: buildSpanMapHtml(
-                          fromLat!,
-                          fromLng!,
+                          mapFromLat!,
+                          mapFromLng!,
                           params.pole_code || "FROM",
-                          toLat!,
-                          toLng!,
+                          mapToLat!,
+                          mapToLng!,
                           params.to_pole_code || "TO",
                           accentColor,
                           false,
@@ -3130,6 +3230,7 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     padding: 14,
     overflow: "hidden",
+    maxHeight: SCREEN_H * 0.88,
   },
 
   modalHeader: {
@@ -3167,11 +3268,16 @@ const styles = StyleSheet.create({
     color: "#111827",
   },
 
+  modalImageWrap: {
+    height: SCREEN_H * 0.65,
+    borderRadius: 18,
+    overflow: "hidden",
+    backgroundColor: "#E5E7EB",
+  },
+
   modalImage: {
     width: "100%",
-    height: 380,
-    borderRadius: 18,
-    backgroundColor: "#E5E7EB",
+    height: "100%",
   },
 
   modalFooter: {

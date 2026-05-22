@@ -2,8 +2,9 @@ import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
+import * as Location from "expo-location";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -50,6 +51,224 @@ function sanitize(s?: string) {
     .replace(/[^a-z0-9_-]/g, "_");
 }
 
+// Static HTML — identical to poles.tsx buildPolesMapHtml.
+// Span data injected via injectJavaScript after MAP_READY (same as setPoles pattern).
+function buildAllSpansMapHtml(): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body,#map{
+  width:100%;
+  height:100%;
+  overflow:hidden;
+  background:#0d1117;
+}
+.leaflet-container{
+  width:100%;
+  height:100%;
+  background:#0d1117;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+#fallback{
+  position:absolute;
+  inset:0;
+  z-index:999;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:24px;
+  background:#0d1117;
+  color:#94a3b8;
+  font-size:13px;
+  font-weight:800;
+  pointer-events:none;
+}
+#fallback.ready{
+  display:none;
+}
+.pp-wrap{
+  width:48px;
+  height:48px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+.pp{
+  width:14px;
+  height:14px;
+  border-radius:50%;
+  border:2px solid rgba(255,255,255,0.98);
+  box-shadow:0 0 0 1.5px rgba(15,23,42,0.18),0 3px 8px rgba(0,0,0,0.35);
+  pointer-events:none;
+}
+.pw{min-width:190px;font-family:system-ui,sans-serif;}
+.pt{font-size:13px;font-weight:900;color:#111827;margin-bottom:5px;}
+.pb{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:800;}
+.pstart{margin-top:8px;width:100%;padding:7px 0;border-radius:8px;color:#fff;font-size:12px;font-weight:900;border:none;cursor:pointer;}
+.leaflet-popup-content-wrapper{
+  border-radius:16px;
+  background:#ffffff;
+  color:#111827;
+  border:1px solid rgba(15,23,42,0.08);
+  box-shadow:0 12px 28px rgba(0,0,0,0.16);
+}
+.leaflet-popup-content{margin:12px 14px;}
+.leaflet-popup-tip{background:#ffffff;}
+@keyframes gps-pulse{0%{opacity:0.7;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4)}}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="fallback">Loading Map...</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function(){
+  var map = null;
+  var markerGroup = null;
+  var spanLine = null;
+  var PH_CENTER = [14.5995, 120.9842];
+
+  function post(data){
+    try{
+      if(window.ReactNativeWebView){
+        window.ReactNativeWebView.postMessage(JSON.stringify(data));
+      }
+    }catch(e){}
+  }
+
+  function hideFallback(){
+    var el = document.getElementById("fallback");
+    if(el) el.className = "ready";
+  }
+
+  // Called from React Native after MAP_READY
+  window.setSpans = function(fromLat, fromLng, fromLabel, dests, accent){
+    if(!map || !markerGroup) return;
+    markerGroup.clearLayers();
+    if(spanLine){ map.removeLayer(spanLine); spanLine=null; }
+
+    // FROM pole (accent color, not tappable)
+    L.marker([fromLat,fromLng],{
+      icon:L.divIcon({
+        className:"",
+        html:'<div class="pp-wrap" style="pointer-events:none"><div class="pp" style="background:'+accent+';width:16px;height:16px;border:2.5px solid #fff"></div></div>',
+        iconSize:[48,48], iconAnchor:[24,24]
+      }),
+      interactive:false, zIndexOffset:500
+    }).addTo(markerGroup);
+
+    var bounds = [[fromLat,fromLng]];
+
+    dests.forEach(function(d, i){
+      var icon = L.divIcon({
+        className:"",
+        html:'<div class="pp-wrap"><div class="pp" style="background:#6366F1"></div></div>',
+        iconSize:[48,48], iconAnchor:[24,24]
+      });
+      var pop = '<div class="pw">'
+        +'<div class="pb" style="background:#6366F122;color:#6366F1;margin-bottom:8px">'
+        +'<span style="width:6px;height:6px;border-radius:50%;background:'+accent+';display:inline-block"></span>'
+        +fromLabel
+        +'<span style="margin:0 4px;color:#9CA3AF">- - -</span>'
+        +'<span style="width:6px;height:6px;border-radius:50%;background:#6366F1;display:inline-block"></span>'
+        +d.label
+        +'</div>'
+        +'<button class="pstart" style="background:'+accent+'" onclick="window._selSpan('+i+')">Select this pair →</button>'
+        +'</div>';
+      var mk = L.marker([d.lat,d.lng],{icon:icon, zIndexOffset:1000}).addTo(markerGroup).bindPopup(pop);
+      mk.on('popupopen', function(){
+        if(spanLine){map.removeLayer(spanLine);spanLine=null;}
+        spanLine = L.polyline([[fromLat,fromLng],[d.lat,d.lng]],{color:accent,weight:4,opacity:0.9,dashArray:'10 6'}).addTo(map);
+      });
+      mk.on('popupclose', function(){
+        if(spanLine){map.removeLayer(spanLine);spanLine=null;}
+      });
+      bounds.push([d.lat,d.lng]);
+    });
+
+    setTimeout(function(){
+      map.invalidateSize(true);
+      if(bounds.length > 1) map.fitBounds(bounds,{padding:[50,50],maxZoom:17});
+      else map.setView([fromLat,fromLng],16);
+    },300);
+  };
+
+  window._selSpan = function(i){
+    post({type:'tap', i:i});
+  };
+
+  var _tileLayer = null;
+  var _labelLayer = null;
+  var TILE_URLS = {
+    street:    {url:"https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",                                                                     sub:"abc",  maxZoom:22, maxNativeZoom:19},
+    satellite: {url:"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",                         sub:null,   maxZoom:22, maxNativeZoom:18},
+    dark:      {url:"https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",                                                         sub:"abcd", maxZoom:22, maxNativeZoom:20}
+  };
+  window.setTileLayer = function(type){
+    if(!map) return;
+    if(_tileLayer){ map.removeLayer(_tileLayer); _tileLayer=null; }
+    if(_labelLayer){ map.removeLayer(_labelLayer); _labelLayer=null; }
+    var t = TILE_URLS[type] || TILE_URLS.street;
+    var opts = {maxZoom:t.maxZoom, maxNativeZoom:t.maxNativeZoom, attribution:""};
+    if(t.sub) opts.subdomains = t.sub;
+    _tileLayer = L.tileLayer(t.url, opts).addTo(map);
+    if(type==="satellite"){
+      _labelLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png",
+        {maxZoom:22, maxNativeZoom:20, opacity:0.85, subdomains:"abcd", attribution:""}).addTo(map);
+    }
+  };
+
+  function init(){
+    if(map) return;
+    map = L.map("map", {zoomControl:true, attributionControl:false, preferCanvas:true, maxZoom:22}).setView(PH_CENTER, 13);
+    window.setTileLayer('street');
+    markerGroup = L.layerGroup().addTo(map);
+    hideFallback();
+    post({type:"MAP_READY"});
+    var _userMarker = null;
+    var _locIcon = L.divIcon({
+      className:'',
+      html:'<div style="position:relative;width:32px;height:32px;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0.82;">'
+        +'<div style="position:absolute;width:52px;height:52px;border-radius:50%;background:rgba(37,99,235,0.15);top:50%;left:50%;transform:translate(-50%,-50%);animation:gps-pulse 1.8s ease-out infinite;"></div>'
+        +'<div id="u-arrow" style="display:flex;align-items:center;justify-content:center;transition:transform 0.25s linear;">'
+        +'<svg width="24" height="24" viewBox="0 0 24 24"><polygon points="12,2 20,22 12,17 4,22" fill="#2563EB" stroke="rgba(255,255,255,0.9)" stroke-width="2" stroke-linejoin="round"/></svg>'
+        +'</div></div>',
+      iconSize:[32,32], iconAnchor:[16,16]
+    });
+    window.setLoc = function(lat, lng){
+      if(!map) return;
+      if(!_userMarker){
+        _userMarker = L.marker([lat,lng],{icon:_locIcon,zIndexOffset:2000,interactive:false}).addTo(map);
+      } else {
+        _userMarker.setLatLng([lat,lng]);
+      }
+    };
+    var _hdgAccum = 0;
+    window.setHdg = function(deg){
+      var el = document.getElementById('u-arrow');
+      if(!el) return;
+      var diff = ((deg - (_hdgAccum % 360)) + 540) % 360 - 180;
+      _hdgAccum += diff;
+      el.style.transform = 'rotate('+_hdgAccum+'deg)';
+    };
+  }
+
+  window.onload = init;
+  setTimeout(init, 1000);
+})();
+</script>
+</body>
+</html>`;
+}
+
 function buildSpanMapHtml(
   fromLat: number,
   fromLng: number,
@@ -59,86 +278,84 @@ function buildSpanMapHtml(
   toLabel: string,
   accent: string,
 ) {
-  const midLat = (fromLat + toLat) / 2;
-  const midLng = (fromLng + toLng) / 2;
-
   return `<!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;}
-html,body,#map{
-  width:100%;
-  height:100%;
-  background:#eef2f7;
-  font-family:-apple-system,BlinkMacSystemFont,sans-serif;
-}
+html,body,#map{width:100%;height:100%;background:#eef2f7;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}
 .leaflet-div-icon{background:none!important;border:none!important;}
 .pin{display:flex;flex-direction:column;align-items:center;}
-.pin-dot{
-  width:14px;
-  height:14px;
-  border-radius:50%;
-  border:2px solid #fff;
-  box-shadow:0 2px 8px rgba(0,0,0,0.35);
-}
-.pin-label{
-  margin-top:4px;
-  background:rgba(15,23,42,0.88);
-  color:#fff;
-  font-size:10px;
-  font-weight:800;
-  padding:4px 8px;
-  border-radius:999px;
-  white-space:nowrap;
-}
+.pin-dot{width:16px;height:16px;border-radius:50%;border:2.5px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,0.35);}
+.pin-label{margin-top:4px;background:rgba(15,23,42,0.88);color:#fff;font-size:11px;font-weight:800;padding:4px 10px;border-radius:999px;white-space:nowrap;}
+@keyframes gps-pulse{0%{opacity:0.7;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4)}}
 </style>
 </head>
 <body>
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-var map=L.map('map',{
-  zoomControl:true,
-  scrollWheelZoom:true,
-  dragging:true,
-  doubleClickZoom:true,
-  touchZoom:true
-}).setView([${midLat},${midLng}],16);
+(function(){
+  var map = L.map('map',{zoomControl:true,attributionControl:false,preferCanvas:true,maxZoom:22})
+    .setView([(${fromLat}+${toLat})/2,(${fromLng}+${toLng})/2],16);
 
-L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{
-  subdomains:'abcd',
-  maxZoom:20
-}).addTo(map);
+  // Street tiles (same as poles map)
+  var _tile = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {maxZoom:22,maxNativeZoom:19,subdomains:'abc'}).addTo(map);
 
-var fromIcon=L.divIcon({
-  className:'',
-  html:'<div class="pin"><div class="pin-dot" style="background:${accent}"></div><div class="pin-label">${fromLabel}</div></div>',
-  iconAnchor:[7,7]
-});
+  // FROM pole
+  var fromIcon = L.divIcon({
+    className:'',
+    html:'<div class="pin"><div class="pin-dot" style="background:${accent}"></div><div class="pin-label">${fromLabel}</div></div>',
+    iconAnchor:[8,8]
+  });
+  // TO pole
+  var toIcon = L.divIcon({
+    className:'',
+    html:'<div class="pin"><div class="pin-dot" style="background:#6366F1"></div><div class="pin-label">${toLabel}</div></div>',
+    iconAnchor:[8,8]
+  });
 
-var toIcon=L.divIcon({
-  className:'',
-  html:'<div class="pin"><div class="pin-dot" style="background:#6366F1"></div><div class="pin-label">${toLabel}</div></div>',
-  iconAnchor:[7,7]
-});
+  L.marker([${fromLat},${fromLng}],{icon:fromIcon,interactive:false}).addTo(map);
+  L.marker([${toLat},${toLng}],{icon:toIcon,interactive:false}).addTo(map);
+  L.polyline([[${fromLat},${fromLng}],[${toLat},${toLng}]],{color:'${accent}',weight:5,opacity:0.85,dashArray:'8 5'}).addTo(map);
 
-L.marker([${fromLat},${fromLng}],{icon:fromIcon}).addTo(map);
-L.marker([${toLat},${toLng}],{icon:toIcon}).addTo(map);
+  setTimeout(function(){
+    map.invalidateSize(true);
+    map.fitBounds([[${fromLat},${fromLng}],[${toLat},${toLng}]],{padding:[60,60],maxZoom:18});
+  },200);
 
-L.polyline([[${fromLat},${fromLng}],[${toLat},${toLng}]],{
-  color:'${accent}',
-  weight:5,
-  opacity:0.9,
-  dashArray:'8,5'
-}).addTo(map);
-
-
-var bounds=L.latLngBounds([[${fromLat},${fromLng}],[${toLat},${toLng}]]);
-map.fitBounds(bounds,{padding:[48,48],maxZoom:18});
-setTimeout(function(){ map.invalidateSize(); }, 120);
+  // ── GPS location + compass arrow (copied from poles map) ──────────────
+  var _userMarker = null;
+  var _locIcon = L.divIcon({
+    className:'',
+    html:'<div style="position:relative;width:32px;height:32px;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0.85;">'
+      +'<div style="position:absolute;width:52px;height:52px;border-radius:50%;background:rgba(37,99,235,0.15);top:50%;left:50%;transform:translate(-50%,-50%);animation:gps-pulse 1.8s ease-out infinite;"></div>'
+      +'<div id="u-arrow" style="display:flex;align-items:center;justify-content:center;transition:transform 0.25s linear;">'
+      +'<svg width="24" height="24" viewBox="0 0 24 24"><polygon points="12,2 20,22 12,17 4,22" fill="#2563EB" stroke="rgba(255,255,255,0.9)" stroke-width="2" stroke-linejoin="round"/></svg>'
+      +'</div></div>',
+    iconSize:[32,32], iconAnchor:[16,16]
+  });
+  window.setLoc = function(lat,lng){
+    if(!map) return;
+    if(!_userMarker){
+      _userMarker = L.marker([lat,lng],{icon:_locIcon,zIndexOffset:2000,interactive:false}).addTo(map);
+    } else {
+      _userMarker.setLatLng([lat,lng]);
+    }
+  };
+  var _hdgAccum = 0;
+  window.setHdg = function(deg){
+    var el = document.getElementById('u-arrow');
+    if(!el) return;
+    var diff = ((deg - (_hdgAccum % 360)) + 540) % 360 - 180;
+    _hdgAccum += diff;
+    el.style.transform = 'rotate('+_hdgAccum+'deg)';
+  };
+})();
 </script>
 </body>
 </html>`;
@@ -467,6 +684,7 @@ export default function SelectPairScreen() {
   }, [allDone, accent, node_id, pole_name]);
   const [selectedSpan, setSelectedSpan] = useState<Span | null>(null);
   const [showVicinityModal, setShowVicinityModal] = useState(false);
+  const mainMapRef = useRef<any>(null);
 
   // Report new intermediate pole
   const [showNewPoleModal, setShowNewPoleModal] = useState(false);
@@ -581,6 +799,10 @@ export default function SelectPairScreen() {
     });
   }, [accent, from_pole_gps_captured_at, from_pole_latitude, from_pole_longitude, node_id, pole_code, pole_id, pole_name, project_id, project_name]);
 
+  // Stable ref so the span-loading effect never re-runs just because navigateToKabila recreated
+  const navigateToKabilaRef = React.useRef(navigateToKabila);
+  navigateToKabilaRef.current = navigateToKabila;
+
   useEffect(() => {
     if (!pole_id || !node_id) return;
 
@@ -588,67 +810,72 @@ export default function SelectPairScreen() {
     const CACHE_KEY = `spans_pole_${pole_id}`;
 
     cacheGet<Span[]>(CACHE_KEY).then((cached) => {
+      // 1. Show cache instantly to unblock UI
       if (cached?.length) {
         const active = cached.filter((s) => s.status !== "completed" && s.status !== "superseded");
         if (active.length === 1) {
-          navigateToKabila(active[0]);
-          return;
-        }
-        if (active.length > 0) {
+          navigateToKabilaRef.current(active[0]);
+          // Still fetch fresh in background to keep cache warm
+        } else if (active.length > 0) {
           setSpans(active);
           setStatus("ok");
-          return; // Skip background fetch if we already have valid data
         }
       }
 
+      // 2. Always fetch fresh from backend regardless of cache
       api
         .get(`/skycable/spans?node_id=${node_id}`)
         .then(({ data }) => {
           const all: Span[] = Array.isArray(data) ? data : (data?.data ?? []);
+
+          // Cross-cache all poles in this node
+          const poleIdsInNode = new Set<string>();
+          all.forEach(s => {
+            if (s.from_pole?.pole?.id) poleIdsInNode.add(String(s.from_pole.pole.id));
+            if (s.to_pole?.pole?.id)   poleIdsInNode.add(String(s.to_pole.pole.id));
+          });
+          poleIdsInNode.forEach(pid => {
+            const pSpans = all.filter(s =>
+              String(s.from_pole?.pole?.id) === pid ||
+              String(s.to_pole?.pole?.id)   === pid,
+            );
+            if (pSpans.length > 0) cacheSet(`spans_pole_${pid}`, pSpans).catch(() => {});
+          });
+
           const list = all.filter(
             (s) =>
               String(s.from_pole?.pole?.id) === String(pole_id) ||
               String(s.to_pole?.pole?.id) === String(pole_id),
           );
-          cacheSet(CACHE_KEY, list);
 
           const active = list.filter((s) => s.status !== "completed" && s.status !== "superseded");
 
           if (active.length === 0) {
-            if (list.length > 0) setAllDone(true); // had spans but all completed
+            if (list.length > 0) setAllDone(true);
             setStatus("empty");
             return;
           }
 
           if (active.length === 1) {
-            navigateToKabila(active[0]);
+            navigateToKabilaRef.current(active[0]);
             return;
           }
 
+          // Update with fresh data (replaces any cached version shown above)
           setSpans(active);
           setStatus("ok");
         })
         .catch(() => {
-          if (!cached?.length) {
-            setStatus("error");
-          } else {
-            const active = cached.filter((s) => s.status !== "completed" && s.status !== "superseded");
-            if (active.length === 0) {
-              if (cached.length > 0) setAllDone(true);
-              setStatus("empty");
-            }
-          }
+          // Network failed — keep whatever is showing (cache or loading)
+          if (!cached?.length) setStatus("error");
         });
     });
-  }, [pole_id, node_id, navigateToKabila]);
+  }, [pole_id, node_id]);
 
 
   function retryFetch() {
     if (!pole_id || !node_id) return;
-
     setStatus("loading");
-    const CACHE_KEY = `spans_pole_${pole_id}`;
-
     api
       .get(`/skycable/spans?node_id=${node_id}`)
       .then(({ data }) => {
@@ -658,20 +885,10 @@ export default function SelectPairScreen() {
             String(s.from_pole?.pole?.id) === String(pole_id) ||
             String(s.to_pole?.pole?.id) === String(pole_id),
         );
-        cacheSet(CACHE_KEY, list);
-
+        cacheSet(`spans_pole_${pole_id}`, list).catch(() => {});
         const active = list.filter((s) => s.status !== "completed" && s.status !== "superseded");
-
-        if (active.length === 0) {
-          setStatus("empty");
-          return;
-        }
-
-        if (active.length === 1) {
-          navigateToKabila(active[0]);
-          return;
-        }
-
+        if (active.length === 0) { setStatus("empty"); return; }
+        if (active.length === 1) { navigateToKabila(active[0]); return; }
         setSpans(active);
         setStatus("ok");
       })
@@ -780,6 +997,70 @@ export default function SelectPairScreen() {
     return getSpanCoords(selectedSpan, pole_id ?? "", from_pole_latitude, from_pole_longitude);
   }, [selectedSpan, from_pole_latitude, from_pole_longitude, pole_id]);
 
+  const [mapTileView, setMapTileView] = useState<"street" | "satellite" | "dark">("street");
+
+  // Active span shown on the main map — default to first span
+  const [activeSpanIndex, setActiveSpanIndex] = useState(0);
+  const activeSpan = spans[activeSpanIndex] ?? null;
+  const lastSpanPosRef = useRef<{lat:number;lng:number}|null>(null);
+  const lastSpanHdgRef = useRef(0);
+
+  // GPS + compass heading → injected into span map WebView (same as poles.tsx)
+  useEffect(() => {
+    let posSub: Location.LocationSubscription | null = null;
+    let hdgSub: Location.LocationSubscription | null = null;
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== "granted") return;
+        posSub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1500, distanceInterval: 1 },
+          loc => {
+            const { latitude: lat, longitude: lng } = loc.coords;
+            lastSpanPosRef.current = { lat, lng };
+            mainMapRef.current?.injectJavaScript(`if(window.setLoc)window.setLoc(${lat},${lng});true;`);
+          }
+        );
+        if (typeof (Location as any).watchHeadingAsync === "function") {
+          hdgSub = await (Location as any).watchHeadingAsync((h: any) => {
+            const deg = h.trueHeading ?? h.magHeading ?? 0;
+            lastSpanHdgRef.current = deg;
+            mainMapRef.current?.injectJavaScript(`if(window.setHdg)window.setHdg(${deg});true;`);
+          });
+        }
+      } catch {}
+    })();
+    return () => { posSub?.remove(); hdgSub?.remove(); };
+  }, []);
+
+  const [selectedMapSpan, setSelectedMapSpan] = useState<Span | null>(null);
+
+  // Static map HTML — same for every span screen. Data injected via injectJavaScript after MAP_READY.
+  const allSpansMapHtml = useMemo(() => buildAllSpansMapHtml(), []);
+
+  // Span inject payload — recomputed when spans/coords change, injected after MAP_READY
+  const spanInjectPayload = useMemo(() => {
+    if (!spans.length) return null;
+    let fLat = Number(from_pole_latitude);
+    let fLng = Number(from_pole_longitude);
+    if (!fLat || !fLng) {
+      const s0 = spans[0];
+      const isFrom0 = String(s0.from_pole?.pole?.id) === String(pole_id);
+      fLat = Number(isFrom0 ? s0.from_pole?.pole?.lat : s0.to_pole?.pole?.lat) || 0;
+      fLng = Number(isFrom0 ? s0.from_pole?.pole?.lng : s0.to_pole?.pole?.lng) || 0;
+    }
+    if (!fLat || !fLng) return null;
+    const dests = spans.flatMap((span, i) => {
+      const isFrom = String(span.from_pole?.pole?.id) === String(pole_id);
+      const dp = isFrom ? span.to_pole?.pole : span.from_pole?.pole;
+      const dLat = Number(dp?.lat ?? 0);
+      const dLng = Number(dp?.lng ?? 0);
+      if (!dLat || !dLng) return [];
+      return [{ lat: dLat, lng: dLng, label: dp?.pole_code ?? `Span ${i + 1}`, spanIndex: i }];
+    });
+    return { fLat, fLng, dests };
+  }, [spans, from_pole_latitude, from_pole_longitude, pole_id]);
+
   const mapHtml = useMemo(() => {
     if (
       !selectedSpan ||
@@ -827,7 +1108,7 @@ export default function SelectPairScreen() {
               { backgroundColor: `${accentColor}14`, borderColor: `${accentColor}28` },
             ]}
             onPress={() =>
-              router.push({
+              router.navigate({
                 pathname: "/teardowns/poles",
                 params: { nodeId: node_id, nodeName: pole_name, accent },
               } as any)
@@ -915,120 +1196,151 @@ export default function SelectPairScreen() {
         )}
 
         {status === "ok" && (
-          <ScrollView
-            showsVerticalScrollIndicator={false}
-            contentContainerStyle={styles.scroll}
-          >
-            <Animated.View
-              entering={FadeInUp.duration(350)}
-              style={styles.heroWrap}
-            >
-              <View style={styles.heroCard}>
-                <View style={styles.heroGlowOne} />
-                <View style={styles.heroGlowTwo} />
-
-                <Text style={styles.heroEyebrow}>Span Selection</Text>
-
-                <Text style={styles.heroTitle}>
-                  Choose the next pole to continue
-                </Text>
-
-                <Text style={styles.heroSub}>
-                  Premium rework style na ito: tap the whole card to proceed, or
-                  preview the route first using the vicinity action.
-                </Text>
-
-                <View style={styles.heroInfoRow}>
-                  <View style={styles.heroInfoPill}>
-                    <Ionicons
-                      name="git-network-outline"
-                      size={14}
-                      color="#667085"
-                    />
-                    <Text style={styles.heroInfoPillText}>
-                      {spans.length} spans found
-                    </Text>
-                  </View>
-
-                  <View style={styles.heroInfoPill}>
-                    <Ionicons name="radio-outline" size={14} color="#667085" />
-                    <Text style={styles.heroInfoPillText}>
-                      From {shortPole(pole_code)}
-                    </Text>
-                  </View>
-                </View>
-              </View>
-            </Animated.View>
-
-            <View style={styles.sectionWrap}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Available Connections</Text>
-                <Text style={styles.sectionSub}>
-                  Pick your destination pole
-                </Text>
-              </View>
-
-              <View style={styles.listWrap}>
-                {spans.map((item, index) => {
-                  const displayPole = getDisplayPole(item);
-
-                  return (
-                    <View key={item.id}>
-                      <SpanCard
-                        fromCode={pole_code || ""}
-                        poleCode={displayPole?.pole_code ?? "?"}
-                        poleName={displayPole?.pole_code ?? "?"}
-                        spanCode={item.span_code ?? ""}
-                        expectedCable={getExpected(item, "cable")}
-                        lengthMeters={item.strand_length}
-                        runs={item.number_of_runs}
-                        accentColor={accentColor}
-                        index={index}
-                        onCardPress={() => navigateToKabila(item)}
-                        onVicinityPress={() => openVicinity(item)}
-                      />
+          <View style={{ flex: 1 }}>
+            {/* Map fills the screen */}
+            {spanInjectPayload ? (
+              <>
+                <WebView
+                  ref={mainMapRef}
+                  key={`span-map-${pole_id}`}
+                  source={{ html: allSpansMapHtml, baseUrl: "https://gis-pole-map.local/" }}
+                  style={{ flex: 1 }}
+                  originWhitelist={["*"]}
+                  javaScriptEnabled
+                  domStorageEnabled
+                  geolocationEnabled
+                  mixedContentMode="always"
+                  allowFileAccess
+                  allowUniversalAccessFromFileURLs
+                  cacheEnabled={true}
+                  scrollEnabled={false}
+                  androidLayerType="hardware"
+                  textZoom={100}
+                  setSupportMultipleWindows={false}
+                  onMessage={e => {
+                    try {
+                      const msg = JSON.parse(e.nativeEvent.data);
+                      if (msg.type === "MAP_READY") {
+                        // Inject span data
+                        if (spanInjectPayload) {
+                          const { fLat, fLng, dests } = spanInjectPayload;
+                          const js = `if(window.setSpans)window.setSpans(${fLat},${fLng},${JSON.stringify(pole_code || "FROM")},${JSON.stringify(dests)},${JSON.stringify(accentColor)});true;`;
+                          mainMapRef.current?.injectJavaScript(js);
+                        }
+                        // Inject current GPS position
+                        if (lastSpanPosRef.current) {
+                          const { lat, lng } = lastSpanPosRef.current;
+                          mainMapRef.current?.injectJavaScript(
+                            `if(window.setLoc)window.setLoc(${lat},${lng});if(window.setHdg)window.setHdg(${lastSpanHdgRef.current});true;`
+                          );
+                        }
+                        return;
+                      }
+                      if (msg.type === "tap" && typeof msg.i === "number") {
+                        setSelectedMapSpan(spans[msg.i] ?? null);
+                      }
+                    } catch {}
+                  }}
+                />
+                {/* Tile toggle — bottom bar, hidden when bottom sheet open */}
+                {!selectedMapSpan && (
+                  <View style={styles.mapTileBar}>
+                    {(["street", "satellite", "dark"] as const).map(v => (
                       <Pressable
-                        style={({ pressed }) => [
-                          styles.newPoleBtn,
-                          pressed && { opacity: 0.7 },
-                        ]}
-                        onPress={() => openNewPoleModal(item)}
+                        key={v}
+                        style={[styles.mapTileBtn, mapTileView === v && styles.mapTileBtnActive]}
+                        onPress={() => {
+                          setMapTileView(v);
+                          mainMapRef.current?.injectJavaScript(`if(window.setTileLayer)window.setTileLayer('${v}');true;`);
+                        }}
                       >
-                        <Text style={styles.newPoleBtnText}>
-                          + Insert New Pole Here
+                        <Text style={[styles.mapTileBtnText, mapTileView === v && styles.mapTileBtnTextActive]}>
+                          {v === "street" ? "🗺 Street" : v === "satellite" ? "🛰 Satellite" : "🌑 Dark"}
                         </Text>
                       </Pressable>
-                    </View>
-                  );
-                })}
+                    ))}
+                  </View>
+                )}
+              </>
+            ) : (
+              <View style={{ flex: 1, backgroundColor: "#F4F6F8", alignItems: "center", justifyContent: "center", gap: 12 }}>
+                <Ionicons name="map-outline" size={42} color="#98A2B3" />
+                <Text style={{ fontSize: 16, fontWeight: "800", color: "#374151" }}>No GPS coordinates</Text>
+                <Text style={{ fontSize: 13, color: "#6B7280", textAlign: "center", paddingHorizontal: 32 }}>
+                  GPS data missing for this span's poles.
+                </Text>
               </View>
-            </View>
-          </ScrollView>
+            )}
+
+            {/* Tap a pole → small bottom card with Continue */}
+            {selectedMapSpan && (
+              <Animated.View entering={FadeInUp.duration(200)} style={styles.mapSelectionSheet}>
+                <View style={styles.mapSheetHandle} />
+                <View style={styles.mapSheetHeader}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.mapSheetLabel}>DESTINATION POLE</Text>
+                    <Text style={styles.mapSheetPoleCode}>{getDisplayPole(selectedMapSpan)?.pole_code ?? "?"}</Text>
+                    <Text style={styles.mapSheetSpanCode}>{selectedMapSpan.span_code}</Text>
+                  </View>
+                  <Pressable onPress={() => setSelectedMapSpan(null)} style={styles.mapSheetClose}>
+                    <Ionicons name="close" size={18} color="#667085" />
+                  </Pressable>
+                </View>
+                <View style={styles.mapSheetStats}>
+                  <View style={styles.mapSheetStat}>
+                    <Text style={styles.mapSheetStatLabel}>LENGTH</Text>
+                    <Text style={styles.mapSheetStatVal}>{Number(selectedMapSpan.strand_length ?? 0).toFixed(0)}m</Text>
+                  </View>
+                  <View style={styles.mapSheetStatDivider} />
+                  <View style={styles.mapSheetStat}>
+                    <Text style={styles.mapSheetStatLabel}>RUNS</Text>
+                    <Text style={styles.mapSheetStatVal}>{selectedMapSpan.number_of_runs ?? "—"}</Text>
+                  </View>
+                  <View style={styles.mapSheetStatDivider} />
+                  <View style={styles.mapSheetStat}>
+                    <Text style={styles.mapSheetStatLabel}>CABLE</Text>
+                    <Text style={styles.mapSheetStatVal}>{getExpected(selectedMapSpan, "cable")}m</Text>
+                  </View>
+                </View>
+                <Pressable
+                  style={({ pressed }) => [styles.mapSheetContinueBtn, { backgroundColor: accentColor, opacity: pressed ? 0.85 : 1 }]}
+                  onPress={() => { setSelectedMapSpan(null); navigateToKabila(selectedMapSpan); }}
+                >
+                  <Text style={styles.mapSheetContinueText}>Continue with this span →</Text>
+                </Pressable>
+              </Animated.View>
+            )}
+          </View>
         )}
 
         <Modal
           visible={showVicinityModal}
-          animationType="slide"
-          transparent={false}
+          animationType="fade"
+          transparent={true}
           onRequestClose={() => setShowVicinityModal(false)}
         >
-          <StatusBar barStyle="dark-content" backgroundColor="#F4F6F8" />
+          <Pressable
+            style={styles.modalBackdrop}
+            onPress={() => setShowVicinityModal(false)}
+          />
 
           <View style={styles.modalRoot}>
-            <View style={styles.modalHeader}>
-              <Pressable
-                onPress={() => setShowVicinityModal(false)}
-                style={styles.modalCloseBtn}
-              >
-                <Ionicons name="close" size={20} color="#111827" />
-              </Pressable>
+            {/* Handle bar */}
+            <View style={styles.modalHandle} />
 
+            <View style={styles.modalHeader}>
               <View style={styles.modalHeaderText}>
                 <Text style={styles.modalTitle}>Vicinity Map</Text>
                 <Text style={styles.modalSub} numberOfLines={1}>
                   {selectedSpan?.span_code || "Selected Span"}
                 </Text>
               </View>
+              <Pressable
+                onPress={() => setShowVicinityModal(false)}
+                style={styles.modalCloseBtn}
+              >
+                <Ionicons name="close" size={18} color="#111827" />
+              </Pressable>
             </View>
 
             <ScrollView
@@ -1684,40 +1996,64 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 
+  modalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.52)",
+  },
+
   modalRoot: {
-    flex: 1,
-    backgroundColor: "#F4F6F8",
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    maxHeight: "88%",
+    backgroundColor: "#FFFFFF",
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    overflow: "hidden",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -8 },
+    shadowOpacity: 0.18,
+    shadowRadius: 24,
+    elevation: 24,
+  },
+
+  modalHandle: {
+    alignSelf: "center",
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "#D1D5DB",
+    marginTop: 10,
+    marginBottom: 4,
   },
 
   modalHeader: {
     flexDirection: "row",
     alignItems: "center",
-    paddingTop: 54,
-    paddingHorizontal: 16,
-    paddingBottom: 14,
-    backgroundColor: "#F4F6F8",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingVertical: 14,
     borderBottomWidth: 1,
-    borderBottomColor: "#E9EDF2",
+    borderBottomColor: "#F3F4F6",
   },
 
   modalCloseBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#E9EDF2",
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#F3F4F6",
     alignItems: "center",
     justifyContent: "center",
-    marginRight: 12,
   },
 
   modalHeaderText: {
     flex: 1,
+    marginRight: 12,
   },
 
   modalTitle: {
-    fontSize: 18,
+    fontSize: 17,
     fontWeight: "900",
     color: "#111827",
   },
@@ -1731,13 +2067,13 @@ const styles = StyleSheet.create({
 
   modalScroll: {
     padding: 16,
-    paddingBottom: 36,
+    paddingBottom: 40,
     gap: 16,
   },
 
   mapWrap: {
-    height: 320,
-    borderRadius: 28,
+    height: 300,
+    borderRadius: 20,
     overflow: "hidden",
     backgroundColor: "#E5E7EB",
     borderWidth: 1,
@@ -2133,6 +2469,191 @@ const styles = StyleSheet.create({
   newPoleSaveText: {
     fontSize: 15,
     fontWeight: "700",
+    color: "#FFFFFF",
+  },
+
+  // ── Map-based span selection ──────────────────────────────────────────────
+  mapFloatingBottom: {
+    position: "absolute",
+    bottom: 24,
+    left: 16,
+    right: 16,
+  },
+
+  mapSelectionSheet: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "#FFFFFF",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingBottom: 30,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -6 },
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
+    elevation: 20,
+  },
+
+  mapSheetHandle: {
+    alignSelf: "center",
+    width: 38,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "#D1D5DB",
+    marginTop: 10,
+    marginBottom: 6,
+  },
+
+  mapSpanTabs: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    flexDirection: "column",
+    gap: 6,
+    zIndex: 10,
+  },
+
+  mapSpanTab: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 10,
+    alignItems: "center",
+    backgroundColor: "#F3F4F6",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+
+  mapSpanTabText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#6B7280",
+  },
+
+  mapSheetHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F3F4F6",
+  },
+
+  mapSheetClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#F3F4F6",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  mapSheetLabel: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#9CA3AF",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+    marginBottom: 4,
+  },
+
+  mapSheetPoleCode: {
+    fontSize: 22,
+    fontWeight: "900",
+    color: "#111827",
+  },
+
+  mapSheetSpanCode: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#6B7280",
+    marginTop: 2,
+  },
+
+  mapSheetStats: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    gap: 0,
+  },
+
+  mapSheetStat: {
+    flex: 1,
+    alignItems: "center",
+  },
+
+  mapSheetStatDivider: {
+    width: 1,
+    height: 32,
+    backgroundColor: "#E5E7EB",
+  },
+
+  mapSheetStatLabel: {
+    fontSize: 9,
+    fontWeight: "800",
+    color: "#9CA3AF",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+    marginBottom: 4,
+  },
+
+  mapSheetStatVal: {
+    fontSize: 15,
+    fontWeight: "900",
+    color: "#111827",
+  },
+
+  mapSheetContinueBtn: {
+    marginHorizontal: 16,
+    paddingVertical: 14,
+    borderRadius: 16,
+    alignItems: "center",
+  },
+
+  mapSheetContinueText: {
+    fontSize: 15,
+    fontWeight: "900",
+    color: "#FFFFFF",
+  },
+
+  // Tile toggle bar — sits at bottom of the map area above the bottom sheet
+  mapTileBar: {
+    position: "absolute",
+    bottom: 12,
+    left: 12,
+    right: 12,
+    flexDirection: "row",
+    gap: 6,
+    zIndex: 10,
+  },
+  mapTileBtn: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 10,
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.88)",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  mapTileBtnActive: {
+    backgroundColor: "#0F172A",
+    borderColor: "#0F172A",
+  },
+  mapTileBtnText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#64748B",
+  },
+  mapTileBtnTextActive: {
     color: "#FFFFFF",
   },
 });

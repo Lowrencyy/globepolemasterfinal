@@ -22,7 +22,8 @@ let _running = false;
 async function ping(): Promise<void> {
   try {
     _lastPingAt = Date.now();
-    const perm = await Location.getForegroundPermissionsAsync();
+    // Request permission on first ping — shows the system dialog if not yet granted
+    const perm = await Location.requestForegroundPermissionsAsync();
     if (perm.status !== "granted") return;
 
     const loc = await Location.getCurrentPositionAsync({
@@ -86,6 +87,11 @@ export function startLocationTracking(): void {
   _appStateSub = AppState.addEventListener("change", (state: AppStateStatus) => {
     if (state === "active") pingThrottled();
   });
+}
+
+/** Fire an immediate location ping — call when a lineman starts work at a pole. */
+export function pingNow(): void {
+  ping();
 }
 
 export function stopLocationTracking(): void {

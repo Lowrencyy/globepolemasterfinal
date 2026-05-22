@@ -2,6 +2,7 @@ import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
 import { simpleQueuePush } from "@/lib/simple-queue";
+import { pingNow } from "@/lib/location-tracker";
 import { gpsQueueGet } from "@/lib/gps-queue";
 import * as FileSystem from "expo-file-system/legacy";
 import { Image as ExpoImage } from "expo-image";
@@ -9,7 +10,7 @@ import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
 import * as MediaLibrary from "expo-media-library";
-import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
+import { Stack, router, useFocusEffect, useLocalSearchParams, usePathname } from "expo-router";
 import { ChevronLeft } from "lucide-react-native";
 import React, {
   useCallback,
@@ -588,32 +589,35 @@ function MapThumbnail({ info }: { info: StreetTileInfo }) {
   );
 }
 
-export default function PoleDetailScreen() {
-  const {
-    pole_id,
-    pole_code,
-    pole_name,
-    node_id,
-    node_code,
-    node_name,
+export function PoleDetailScreen() {
+    const pathname = usePathname();
+	  const {
+	    pole_id,
+	    pole_row_id,
+	    pole_code,
+	    pole_name,
+	    node_id,
+	    node_code,
+	    node_name,
     project_id,
     project_name,
     accent,
     report_type,
-  } = useLocalSearchParams<{
-    pole_id: string;
-    pole_code: string;
-    pole_name: string;
-    node_id: string;
-    node_code: string;
-    node_name: string;
-    project_id: string;
-    project_name: string;
-    accent: string;
-    report_type: string;
-  }>();
+	  } = useLocalSearchParams<{
+	    pole_id: string;
+	    pole_row_id?: string;
+	    pole_code: string;
+	    pole_name: string;
+	    node_id: string;
+	    node_code: string;
+	    node_name: string;
+	    project_id: string;
+	    project_name: string;
+	    accent: string;
+	    report_type: string;
+	  }>();
 
-  const isPoleReport = report_type === "pole_report";
+  const isPoleReport = report_type === "pole_report" || pathname.includes("/teardowns/pole-report");
 
   const accentColor = accent || "#0B7A5A";
 
@@ -661,15 +665,10 @@ export default function PoleDetailScreen() {
   const [poleNotes, setPoleNotes] = useState("");
   const [poleSlots, setPoleSlots] = useState<PoleSlot[]>([]);
   const [submittingReport, setSubmittingReport] = useState(false);
-  const [draftSaved, setDraftSaved] = useState(false);
-  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const draftMountedRef = useRef(false);
-  function flashDraftSaved() {
-    if (!draftMountedRef.current) return;
-    setDraftSaved(true);
-    if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
-    draftSaveTimerRef.current = setTimeout(() => setDraftSaved(false), 1800);
-  }
+  const [submitSuccessOpen, setSubmitSuccessOpen] = useState(false);
+  const [submitSuccessTime, setSubmitSuccessTime] = useState("");
+	  const draftMountedRef = useRef(false);
+	  // (Pole report draft autosave removed.)
   // Add-slot modal
   const [addSlotOpen, setAddSlotOpen] = useState(false);
   const [addSlotType, setAddSlotType] = useState("C1");
@@ -701,12 +700,16 @@ export default function PoleDetailScreen() {
   const [gateAlertModal, setGateAlertModal]   = useState<{ title: string; message: string } | null>(null);
 
 
+  // Prevents double auto-navigation to select-pair when pole is already done
+  const autoNavigatedToSpanRef = useRef(false);
   // Work timer — only counts after Start Teardown is pressed
   const timerStartRef = useRef<number | null>(null);
   const blurCheckRef = useRef<WebView>(null);
   const blurResolverRef = useRef<((variance: number) => void) | null>(null);
   const stampRef = useRef<WebView>(null);
   const stampResolverRef = useRef<((b64: string | null) => void) | null>(null);
+  // Stores the last stamp payload so it can be re-injected when the WebView restarts
+  const lastStampPayloadRef = useRef<string | null>(null);
   // Pre-loaded map tile cache — populated as soon as GPS is available so
   // stamping is instant (no network call during photo processing).
   const mapTileCache = useRef<StampMapResult | null>(null);
@@ -800,33 +803,9 @@ export default function PoleDetailScreen() {
     if (landmark) cacheSet(`draft_landmark_${pole_id}`, landmark).catch(() => {});
   }, [landmark, pole_id]);
 
-  // Pole report draft auto-save
-  useEffect(() => {
-    cacheSet(`pole_condition_${pole_id}`, poleCondition).catch(() => {});
-    flashDraftSaved();
-  }, [poleCondition, pole_id]);
-  useEffect(() => {
-    cacheSet(`pole_material_${pole_id}`, poleMaterial).catch(() => {});
-    flashDraftSaved();
-  }, [poleMaterial, pole_id]);
-  useEffect(() => {
-    cacheSet(`pole_height_${pole_id}`, poleHeight).catch(() => {});
-    flashDraftSaved();
-  }, [poleHeight, pole_id]);
-  useEffect(() => {
-    cacheSet(`pole_notes_${pole_id}`, poleNotes).catch(() => {});
-    flashDraftSaved();
-  }, [poleNotes, pole_id]);
-  useEffect(() => {
-    cacheSet(`pole_slots_${pole_id}`, poleSlots).catch(() => {});
-    flashDraftSaved();
-  }, [poleSlots, pole_id]);
-
-  useEffect(() => {
-    // Restore teardown started state.
-    // For pole_report: auto-start on first open (no gate needed — lineman
-    // just created this pole and navigated here to capture it immediately).
-    cacheGet<{ startedAt: string; startMs?: number }>(teardownStartedKey).then(async v => {
+	  useEffect(() => {
+	    // Restore teardown started state.
+	    cacheGet<{ startedAt: string; startMs?: number }>(teardownStartedKey).then(async v => {
       // If backend reset this pole to 'pending' (e.g. new span added), clear local started-cache
       // so the Start button shows again even if we previously started it.
       if (v?.startedAt && node_id) {
@@ -847,11 +826,32 @@ export default function PoleDetailScreen() {
         timerStartRef.current = baseMs;
 
         // Check if already finished
-        cacheGet<string>(`teardown_finished_${pole_id}`).then(finishedTs => {
+        cacheGet<string>(`teardown_finished_${pole_id}`).then(async finishedTs => {
           if (finishedTs) {
             setPoleFinishedAt(finishedTs);
             const delta = Math.floor((new Date(finishedTs).getTime() - baseMs) / 1000);
             setElapsedSecs(Math.max(0, delta));
+
+            // Auto-redirect to span selection — only for span teardown, not pole reports.
+            if (!isPoleReport && !autoNavigatedToSpanRef.current) {
+              autoNavigatedToSpanRef.current = true;
+              const gpsDraft = await cacheGet<{ lat: number; lng: number }>(`pole_gps_${pole_id}`).catch(() => null);
+              router.push({
+                pathname: "/teardowns/select-pair" as any,
+                params: {
+                  pole_id,
+                  pole_code,
+                  pole_name: pole_name || pole_code || "",
+                  node_id,
+                  project_id: project_id || "",
+                  project_name: project_name || "",
+                  accent: accentColor,
+                  from_pole_latitude: gpsDraft?.lat ? String(gpsDraft.lat) : "",
+                  from_pole_longitude: gpsDraft?.lng ? String(gpsDraft.lng) : "",
+                  from_pole_gps_captured_at: "",
+                },
+              });
+            }
           } else {
             setElapsedSecs(Math.max(0, Math.floor((Date.now() - baseMs) / 1000)));
           }
@@ -859,16 +859,19 @@ export default function PoleDetailScreen() {
           setElapsedSecs(Math.max(0, Math.floor((Date.now() - baseMs) / 1000)));
         });
 
-      } else if (isPoleReport) {
-        // Auto-start for pole_report — no gate needed, lineman just created this pole
-        const now = getPHTNow();
-        const nowMs = Date.now();
-        setTeardownStarted(true);
-        setPoleStartedAt(now);
-        timerStartRef.current = nowMs;
-        cacheSet(teardownStartedKey, { startedAt: now, startMs: nowMs }).catch(() => {});
-        if (node_id && pole_id) {
-          api.put(`/skycable/nodes/${node_id}/poles/${pole_id}`, { date_start: now }).catch(() => {});
+	      } else if (node_id) {
+	        // Pole was previously visited as a DESTINATION pole — inherit its date_start
+	        // from the sitemap cache so the "Start Pole Teardown" gate doesn't re-appear.
+	        const polesList = await cacheGet<any[]>(`sitemap_poles_${node_id}`).catch(() => null);
+        const match = polesList?.find((p) => String(p.pole_id) === String(pole_id));
+        if (match?.date_start) {
+          const startedAt = match.date_start;
+          const startMs = new Date(startedAt).getTime();
+          setTeardownStarted(true);
+          setPoleStartedAt(startedAt);
+          timerStartRef.current = startMs;
+          setElapsedSecs(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
+          await cacheSet(teardownStartedKey, { startedAt, startMs }).catch(() => {});
         }
       }
     }).catch(() => {});
@@ -929,7 +932,7 @@ export default function PoleDetailScreen() {
       .catch(() => {});
 
     const SPANS_KEY = `spans_pole_${pole_id}`;
-    cacheGet<Span[]>(SPANS_KEY).then((cached) => {
+    if (!isPoleReport) cacheGet<Span[]>(SPANS_KEY).then((cached) => {
       if (cached?.length) {
         setSpans(cached);
         return; // Skip background fetch if we have cache
@@ -939,12 +942,24 @@ export default function PoleDetailScreen() {
         .get(`/skycable/spans?node_id=${node_id}`)
         .then(({ data }) => {
           const all: Span[] = Array.isArray(data) ? data : (data?.data ?? []);
+          // Cross-cache spans for every pole in the node so vice-versa works without extra API calls
+          const poleIdsInNode = new Set<string>();
+          all.forEach(s => {
+            if (s.from_pole?.pole?.id) poleIdsInNode.add(String(s.from_pole.pole.id));
+            if (s.to_pole?.pole?.id)   poleIdsInNode.add(String(s.to_pole.pole.id));
+          });
+          poleIdsInNode.forEach(pid => {
+            const pSpans = all.filter(s =>
+              String(s.from_pole?.pole?.id) === pid ||
+              String(s.to_pole?.pole?.id)   === pid,
+            );
+            if (pSpans.length > 0) cacheSet(`spans_pole_${pid}`, pSpans).catch(() => {});
+          });
           const list = all.filter(
             (s) =>
               String(s.from_pole?.pole?.id) === String(pole_id) ||
               String(s.to_pole?.pole?.id) === String(pole_id),
           );
-          cacheSet(SPANS_KEY, list);
           setSpans(list);
         })
         .catch(() => {});
@@ -987,10 +1002,12 @@ export default function PoleDetailScreen() {
         if (!info.exists) return null;
         const viewPath = cleanPath.replace(/\.jpg$/i, "_view.jpg");
         const viewInfo = await FileSystem.getInfoAsync(viewPath).catch(() => ({ exists: false }));
+        const chosenPath = (viewInfo as any).exists ? viewPath : cleanPath;
         const version = Date.now();
         return {
-          uri: `${(viewInfo as any).exists ? viewPath : cleanPath}?v=${version}`,
-          fileUri: cleanPath,
+          uri: `${chosenPath}?v=${version}`,
+          // Use stamped view for upload (matches what the lineman sees in-gallery)
+          fileUri: chosenPath,
           name: file,
           type: "image/jpeg",
           version,
@@ -1021,25 +1038,9 @@ export default function PoleDetailScreen() {
       .then((v) => { if (v) setEditedPoleName(v); })
       .catch(() => {});
 
-    // Pole report draft fields
-    Promise.all([
-      cacheGet<string>(`pole_condition_${pole_id}`),
-      cacheGet<string>(`pole_material_${pole_id}`),
-      cacheGet<string>(`pole_height_${pole_id}`),
-      cacheGet<string>(`pole_notes_${pole_id}`),
-      cacheGet<PoleSlot[]>(`pole_slots_${pole_id}`),
-    ]).then(([cond, mat, ht, notes, slots]) => {
-      if (cond) setPoleCondition(cond);
-      if (mat) setPoleMaterial(mat);
-      if (ht) setPoleHeight(ht);
-      if (notes) setPoleNotes(notes);
-      if (slots?.length) setPoleSlots(slots);
-      // Allow flash indicator only after initial load is done
-      draftMountedRef.current = true;
-    }).catch(() => {
-      draftMountedRef.current = true;
-    });
-  }, [
+	    // Pole report draft mount marker
+	    draftMountedRef.current = true;
+	  }, [
     pole_id,
     node_id,
     teardownStartedKey,
@@ -1065,10 +1066,11 @@ export default function PoleDetailScreen() {
           if (!(info as any)?.exists) return null;
           const viewPath = cleanPath.replace(/\.jpg$/i, "_view.jpg");
           const viewInfo = await FileSystem.getInfoAsync(viewPath).catch(() => ({ exists: false }));
+          const chosenPath = (viewInfo as any).exists ? viewPath : cleanPath;
           const version = Date.now();
           return {
-            uri: `${(viewInfo as any).exists ? viewPath : cleanPath}?v=${version}`,
-            fileUri: cleanPath,
+            uri: `${chosenPath}?v=${version}`,
+            fileUri: chosenPath,
             name: file,
             type: "image/jpeg",
             version,
@@ -1108,9 +1110,21 @@ export default function PoleDetailScreen() {
   function handleStampMessage(event: { nativeEvent: { data: string } }) {
     try {
       const data = JSON.parse(event.nativeEvent.data);
-      if (data.ready || !stampResolverRef.current) return;
+      if (data.ready) {
+        // WebView reloaded (happens when navigating to/from capture.tsx on Android).
+        // Re-inject the pending payload so the stamp completes instead of timing out.
+        if (stampResolverRef.current && lastStampPayloadRef.current) {
+          const p = lastStampPayloadRef.current;
+          stampRef.current?.injectJavaScript(
+            `(function(){document.dispatchEvent(new MessageEvent('message',{data:${JSON.stringify(p)}}));})();true;`
+          );
+        }
+        return;
+      }
+      if (!stampResolverRef.current) return;
       stampResolverRef.current(data.stamped ?? null);
       stampResolverRef.current = null;
+      lastStampPayloadRef.current = null;
     } catch {}
   }
 
@@ -1229,16 +1243,20 @@ export default function PoleDetailScreen() {
       return new Promise<string>((resolve) => {
         const timer = setTimeout(() => {
           stampResolverRef.current = null;
+          lastStampPayloadRef.current = null;
           resolve(uri);
         }, 15000);
         stampResolverRef.current = (result: string | null) => {
           clearTimeout(timer);
+          lastStampPayloadRef.current = null;
           if (!result) { resolve(uri); return; }
           const tmp = `${FileSystem.cacheDirectory}stamp_${Date.now()}.jpg`;
           FileSystem.writeAsStringAsync(tmp, result, { encoding: "base64" as any })
             .then(() => resolve(tmp))
             .catch(() => resolve(uri));
         };
+        // Store payload so handleStampMessage can re-inject if WebView restarts mid-stamp
+        lastStampPayloadRef.current = payload;
         stampRef.current?.injectJavaScript(
           `(function(){document.dispatchEvent(new MessageEvent('message',{data:${JSON.stringify(payload)}}));})();true;`
         );
@@ -1308,14 +1326,19 @@ export default function PoleDetailScreen() {
     await FileSystem.copyAsync({ from: compressed, to: dest });
 
     // ── Stamped version → _view file on disk + gallery (display + lineman backup) ──
-    let displayUri = dest; // fallback: show clean if no stamp
+    let displayUri = dest; // UI display (may be a temp file to avoid Android stale file:// cache)
+    let uploadUri = dest;  // stable on-disk URI for backend + draft restore
     if (stampLines?.length) {
       const stamped = await stampPhoto(compressed, stampLines, gpsLat, gpsLng);
       const viewDest = dest.replace(/\.jpg$/i, "_view.jpg");
       const viewExisting = await FileSystem.getInfoAsync(viewDest);
       if (viewExisting.exists) await FileSystem.deleteAsync(viewDest, { idempotent: true });
       await FileSystem.copyAsync({ from: stamped, to: viewDest });
-      displayUri = viewDest;
+      uploadUri = viewDest;
+      // Important: after a retake we overwrite the same *_view.jpg file.
+      // Some Android image pipelines keep showing the old bytes until the screen remounts.
+      // Using the freshly created stamped temp file for UI display avoids the stale-cache issue.
+      displayUri = stamped;
       // Save stamped copy to device gallery (lineman backup)
       MediaLibrary.requestPermissionsAsync(true)
         .then(({ status }) => {
@@ -1327,7 +1350,7 @@ export default function PoleDetailScreen() {
     const version = Date.now();
     return {
       uri: `${displayUri}?v=${version}`,  // stamped view for display
-      fileUri: displayUri,                  // stamped file for backend upload to preserve visual audits
+      fileUri: uploadUri,                   // stable stamped file for backend upload to preserve visual audits
       name: fileName,
       type: "image/jpeg",
       version,
@@ -1734,7 +1757,9 @@ export default function PoleDetailScreen() {
   }
 
   const hasGps = !!(lat && lng);
-  const infoComplete = teardownStarted && (isPoleReport ? hasGps : hasGps && !!slot);
+  const hasRecapturedGps = hasGps && !gpsFromSitemap && !!gpsCapturedAt;
+  const gpsDoneForUi = isPoleReport ? hasRecapturedGps : hasGps;
+  const infoComplete = teardownStarted && (isPoleReport ? hasRecapturedGps : hasGps && !!slot);
 
   const [showCameraModal, setShowCameraModal]   = useState(false);
   const [mapFullscreen, setMapFullscreen]       = useState(false);
@@ -1773,67 +1798,55 @@ export default function PoleDetailScreen() {
       ? `${prewarmedGps.current.latitude.toFixed(6)}, ${prewarmedGps.current.longitude.toFixed(6)}`
       : "Acquiring GPS Signal...";
 
-  const gpsSecondaryLabel = hasGps
-    ? gpsFromSitemap
-      ? "📍 Sitemap GPS — pre-placed by sitemap APK"
-      : street ? `📱 ${street}` : "📱 Captured on this device"
-    : gpsAccuracy === null
-      ? "⚠️ Required — acquiring signal…"
+	  const gpsSecondaryLabel = hasGps
+	    ? gpsFromSitemap
+	      ? (isPoleReport
+	          ? "📍 Sitemap GPS — tap to recapture for this pole report"
+	          : "📍 Sitemap GPS — pre-placed by sitemap APK")
+	      : street ? `📱 ${street}` : "📱 Captured on this device"
+	    : gpsAccuracy === null
+	      ? "⚠️ Required — acquiring signal…"
       : gpsAccuracy <= REQUIRED_GPS_ACCURACY_METERS
         ? `⚠️ Required — accuracy ${gpsAccuracy}m, ready to capture`
         : `⚠️ Required — accuracy ${gpsAccuracy}m, tap to capture`;
 
-  function handleSavePoleNameEdit() {
+  async function handleSavePoleNameEdit() {
     const trimmed = editNameDraft.trim();
     if (!trimmed) return;
+    setSavingName(true);
 
-    Alert.alert(
-      "Confirm Name Change",
-      `Are you sure you want to rename this pole to "${trimmed}"?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Yes",
-          onPress: async () => {
-            setSavingName(true);
+    // 1. Update local state immediately (works offline too)
+    setEditedPoleName(trimmed);
+    await cacheSet(`draft_pole_name_${pole_id}`, trimmed).catch(() => {});
 
-            // 1. Update local state immediately (works offline too)
-            setEditedPoleName(trimmed);
-            await cacheSet(`draft_pole_name_${pole_id}`, trimmed).catch(() => {});
+    // 2. Patch the poles list cache so the list screen shows the new name without a sync
+    if (node_id) {
+      const polesCacheKey = `poles_node_${node_id}`;
+      const cachedPoles = await cacheGet<any[]>(polesCacheKey).catch(() => null);
+      if (cachedPoles) {
+        const updated = cachedPoles.map((p) =>
+          String(p.id) === String(pole_id) ? { ...p, pole_name: trimmed } : p,
+        );
+        await cacheSet(polesCacheKey, updated).catch(() => {});
+      }
+    }
 
-            // 2. Patch the poles list cache so the list screen shows the new name without a sync
-            if (node_id) {
-              const polesCacheKey = `poles_node_${node_id}`;
-              const cachedPoles = await cacheGet<any[]>(polesCacheKey).catch(() => null);
-              if (cachedPoles) {
-                const updated = cachedPoles.map((p) =>
-                  String(p.id) === String(pole_id) ? { ...p, pole_name: trimmed } : p,
-                );
-                await cacheSet(polesCacheKey, updated).catch(() => {});
-              }
-            }
+    // 3. Post to backend immediately; queue with priority if offline
+    try {
+      await api.put(`/skycable/poles/${pole_id}`, { pole_code: trimmed });
+    } catch (e: any) {
+      const status = e?.response?.status;
+      if (!status) {
+        await simpleQueuePush({
+          method: "put",
+          url: `/skycable/poles/${pole_id}`,
+          body: { pole_code: trimmed },
+        }, true).catch(() => {});
+      }
+    }
 
-            // 3. Try to save to backend immediately using valid API prefix and database column mapping; queue with priority if offline
-            try {
-              await api.put(`/skycable/poles/${pole_id}`, { pole_code: trimmed });
-            } catch (e: any) {
-              const status = e?.response?.status;
-              if (!status) {
-                // Network error — queue for later with high priority (unshift to top)
-                await simpleQueuePush({
-                  method: "put",
-                  url: `/skycable/poles/${pole_id}`,
-                  body: { pole_code: trimmed },
-                }, true).catch(() => {});
-              }
-            }
-
-            setSavingName(false);
-            setEditNameModalOpen(false);
-          },
-        },
-      ],
-    );
+    setSavingName(false);
+    setEditNameModalOpen(false);
   }
 
   function goToDestination(span: Span) {
@@ -1849,6 +1862,7 @@ export default function PoleDetailScreen() {
         pole_code,
         pole_name: editedPoleName || pole_name,
         node_id,
+        node_name: node_name || "",
         project_id,
         project_name,
         accent: accentColor,
@@ -1874,65 +1888,85 @@ export default function PoleDetailScreen() {
     });
   }
 
-  async function handleStartPole() {
-    if (!pole_id || !node_id || startingPole) return;
-    setStartingPole(true);
-    const now = getPHTNow();
-    const startNumeric = Date.now();
+	  async function handleStartPole() {
+	    if (!pole_id || !node_id || startingPole) return;
+	    setStartingPole(true);
+	    const now = getPHTNow();
+	    const startNumeric = Date.now();
 
-    // 1. Instantly write to local UI state and storage cache to unlock task operations offline
-    await cacheSet(teardownStartedKey, { startedAt: now, startMs: startNumeric }).catch(() => {});
-    setPoleStartedAt(now);
-    timerStartRef.current = startNumeric;
-    setTeardownStarted(true);
+		    // 1. Instantly write to local UI state and storage cache to unlock task operations offline
+		    await cacheSet(teardownStartedKey, { startedAt: now, startMs: startNumeric }).catch(() => {});
+		    setPoleStartedAt(now);
+		    timerStartRef.current = startNumeric;
+		    setTeardownStarted(true);
 
-    // Instantly update parent list cache so status changes from pending to in_progress immediately
-    const listKey = `sitemap_poles_${node_id}`;
-    const listCache = await cacheGet<any[]>(listKey).catch(() => null);
-    if (listCache) {
-      const updated = listCache.map((p) => {
-        if (String(p.pole_id) === String(pole_id) && p.pole) {
-          return {
-            ...p,
-            date_start: p.date_start || now,
-            pole: {
-              ...p.pole,
-              skycable_status: "in_progress",
-            },
-          };
-        }
-        return p;
-      });
-      await cacheSet(listKey, updated).catch(() => {});
-    }
+	    // Instantly update parent list cache so status changes from pending to in_progress immediately
+	    const listKey = `sitemap_poles_${node_id}`;
+	    const listCache = await cacheGet<any[]>(listKey).catch(() => null);
 
-    // 2. Transmit sync patch payload live; defer to offline queue adapter if network unreachable
+    // Assign sequence based on start order: max existing sequence + 1
+    const nextSequence = listCache
+      ? listCache.reduce((max, p) => Math.max(max, Number(p.sequence) || 0), 0) + 1
+      : 1;
+
+		    if (listCache) {
+		      const updated = listCache.map((p) => {
+		        if (String(p.pole_id) === String(pole_id) && p.pole) {
+		          return {
+		            ...p,
+		            sequence: nextSequence,
+		            date_start: p.date_start || now,
+		            pole: {
+		              ...p.pole,
+		              skycable_status: "in_progress",
+		            },
+		          };
+		        }
+		        return p;
+		      });
+		      await cacheSet(listKey, updated).catch(() => {});
+		    }
+	
+    // 2. Start teardown on backend — use pole_row_id (skycable_poles.id) for the correct route
+    const rowId = pole_row_id || pole_id;
     try {
-      await api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
-        pole_id: Number(pole_id),
-        date_start: now,
-        status: "in_progress",
-      });
+      await api.put(`/skycable/nodes/${node_id}/poles/${rowId}`, { date_start: now });
     } catch (err: any) {
       if (!err?.response?.status) {
         await simpleQueuePush({
-          method: "patch",
-          url: `/skycable/nodes/${node_id}/poles/sync`,
-          body: {
-            pole_id: Number(pole_id),
-            date_start: now,
-            status: "in_progress",
-          },
+          method: "put",
+          url: `/skycable/nodes/${node_id}/poles/${rowId}`,
+          body: { date_start: now },
         }).catch(() => {});
       }
     }
 
-    // 3. Also push node to in_progress if it's still pending
-    try {
-      await api.put(`/skycable/nodes/${node_id}`, {
-        status: "in_progress",
-        date_start: now,
-      });
+    // Update poles.skycable_status directly (this is what the web admin + Navicat shows)
+    api.put(`/skycable/poles/${pole_id}`, { skycable_status: "in_progress" }).catch(async (err: any) => {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "put",
+          url: `/skycable/poles/${pole_id}`,
+          body: { skycable_status: "in_progress" },
+        }).catch(() => {});
+      } else {
+        Alert.alert("Start Failed", err?.message ?? "Unable to start pole teardown.");
+      }
+    });
+
+    // Sync skycable_poles.status via patch endpoint (fire-and-forget backup)
+    api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
+      pole_id: Number(pole_id),
+      date_start: now,
+      status: "in_progress",
+    }).catch(() => {});
+
+	    // 3. Also push node to in_progress if it's still pending
+	    try {
+	      await api.put(`/skycable/nodes/${node_id}`, {
+	        status: "in_progress",
+	        date_start: now,
+	      });
     } catch (err: any) {
       if (!err?.response?.status) {
         await simpleQueuePush({
@@ -1943,80 +1977,22 @@ export default function PoleDetailScreen() {
       }
     }
 
+    // Ping lineman location — records that the lineman is physically at this pole
+    pingNow();
+
     setStartingPole(false);
   }
 
   function handleNext() {
-    if (!canSelectPair) return;
+    if (isPoleReport || !canSelectPair) return;
 
-    // Trigger completion of this pole teardown session offline-first
+    // Record that photos are done so auto-redirect works when pole is re-clicked.
+    // Do NOT mark as completed here — the pole may have multiple spans.
+    // Status changes to "completed" only after the teardown log is submitted in components.tsx.
     if (!poleFinishedAt) {
       const nowFinished = getPHTNow();
       setPoleFinishedAt(nowFinished);
       cacheSet(`teardown_finished_${pole_id}`, nowFinished).catch(() => {});
-
-      // Instantly update parent list cache so status changes to completed immediately
-      if (node_id && pole_id) {
-        const listKey = `sitemap_poles_${node_id}`;
-        cacheGet<any[]>(listKey).then(listCache => {
-          if (listCache) {
-            const updated = listCache.map((p) => {
-              if (String(p.pole_id) === String(pole_id) && p.pole) {
-                return {
-                  ...p,
-                  cleared_at: p.cleared_at || nowFinished,
-                  pole: {
-                    ...p.pole,
-                    skycable_status: "cleared",
-                  },
-                };
-              }
-              return p;
-            });
-            cacheSet(listKey, updated).catch(() => {});
-          }
-        }).catch(() => {});
-      }
-
-      // Synchronize finished status to backend server; queue if offline
-      api.patch(`/skycable/nodes/${node_id}/poles/sync`, {
-        pole_id: Number(pole_id),
-        cleared_at: nowFinished,
-        status: "completed",
-      }).catch((err: any) => {
-        if (!err?.response?.status) {
-          simpleQueuePush({
-            method: "patch",
-            url: `/skycable/nodes/${node_id}/poles/sync`,
-            body: {
-              pole_id: Number(pole_id),
-              cleared_at: nowFinished,
-              status: "completed",
-            },
-          }).catch(() => {});
-        }
-      });
-
-      // Append completed audit trail log
-      api.post("/skycable/pole-teardown-logs", {
-        pole_id: Number(pole_id),
-        node_id: Number(node_id),
-        finished_at: nowFinished,
-        status: "completed",
-      }).catch((err: any) => {
-        if (!err?.response?.status) {
-          simpleQueuePush({
-            method: "post",
-            url: "/skycable/pole-teardown-logs",
-            body: {
-              pole_id: Number(pole_id),
-              node_id: Number(node_id),
-              finished_at: nowFinished,
-              status: "completed",
-            },
-          }).catch(() => {});
-        }
-      });
     }
 
     if (spans.length === 1) {
@@ -2040,17 +2016,38 @@ export default function PoleDetailScreen() {
     }
   }
 
-  const progress = useMemo(
-    () =>
-      getCompletionState({
-        hasGps,
-        photoBefore,
-        photoAfter,
-        photoTag,
-        slot,
-      }),
-    [hasGps, photoBefore, photoAfter, photoTag, slot],
-  );
+  const progress = useMemo(() => {
+    if (isPoleReport) {
+      const completed = [
+        hasRecapturedGps,
+        !!photoBefore,
+        !!photoAfter,
+        !!photoTag,
+      ].filter(Boolean).length;
+      const total = 4;
+      return {
+        completed,
+        total,
+        percent: Math.round((completed / total) * 100),
+      };
+    }
+
+    return getCompletionState({
+      hasGps,
+      photoBefore,
+      photoAfter,
+      photoTag,
+      slot,
+    });
+  }, [
+    isPoleReport,
+    hasRecapturedGps,
+    hasGps,
+    photoBefore,
+    photoAfter,
+    photoTag,
+    slot,
+  ]);
 
   // ── Pole Report helpers ───────────────────────────────────────────────────
   function uid() { return Math.random().toString(36).slice(2); }
@@ -2166,93 +2163,69 @@ export default function PoleDetailScreen() {
     );
   }
 
-  const canSubmitPoleReport = isPoleReport && hasGps && !!photoBefore && !!photoTag;
+  const canSubmitPoleReport =
+    isPoleReport &&
+    hasRecapturedGps &&
+    !!photoBefore &&
+    !!photoAfter &&
+    !!photoTag;
 
-  async function handleSubmitPoleReport() {
-    if (!canSubmitPoleReport) return;
-    setSubmittingReport(true);
-    try {
-      const form = new FormData();
-      form.append("condition",  poleCondition);
-      form.append("material",   poleMaterial);
-      form.append("height_ft",  poleHeight.replace(" ft", ""));
-      form.append("landmark",   landmark);
-      form.append("notes",      poleNotes);
-      form.append("latitude",   String(lat ?? ""));
-      form.append("longitude",  String(lng ?? ""));
-      form.append("gps_captured_at", gpsCapturedAt);
-      form.append("slots",      JSON.stringify(poleSlots));
+	  async function handleSubmitPoleReport() {
+	    if (!canSubmitPoleReport) return;
+	    setSubmittingReport(true);
+	    try {
+	      const form = new FormData();
+	      form.append("landmark",        landmark);
+	      form.append("latitude",        String(lat ?? ""));
+	      form.append("longitude",       String(lng ?? ""));
+	      form.append("gps_captured_at", gpsCapturedAt);
+	      if (node_id) form.append("node_id", String(node_id));
 
-      const appendPhoto = async (field: string, photo: NonNullable<PhotoField>, tabKey: string) => {
-        form.append(field, { uri: photo.fileUri, name: photo.name, type: "image/jpeg" } as any);
-        const ts = await cacheGet<string>(`photo_captured_at_${pole_id}_${tabKey}`).catch(() => null);
-        if (ts) form.append(`${field}_captured_at`, ts);
+	      // Photos are sent inline — backend saves them to PoleTeardownImage
+	      const appendPhoto = async (field: string, photo: NonNullable<PhotoField>, tabKey: string) => {
+	        form.append(field, { uri: photo.fileUri, name: photo.name, type: "image/jpeg" } as any);
+	        const ts = await cacheGet<string>(`photo_captured_at_${pole_id}_${tabKey}`).catch(() => null);
+	        if (ts) form.append(`${field}_captured_at`, ts);
       };
 
       if (photoBefore) await appendPhoto("before_photo", photoBefore, "before");
       if (photoAfter)  await appendPhoto("after_photo",  photoAfter,  "after");
       if (photoTag)    await appendPhoto("tag_photo",    photoTag,    "tag");
 
-      const res: any = await api.post(`/poles/${pole_id}/report`, form);
-      const reportId = res?.data?.id;
-
-      // Instantly update parent list cache so status changes to completed immediately
+      const res: any = await api.post(`/skycable/poles/${pole_id}/report`, form);
       const nowFinished = getPHTNow();
+
+      // Update poles.skycable_status → "cleared"  (backend storeReport already does it, belt+suspenders)
+      api.put(`/skycable/poles/${pole_id}`, { skycable_status: "cleared" }).catch(() => {});
+
+      // Post a teardown log so the pole shows in teardown-logs dashboard
+      api.post("/skycable/pole-teardown-logs", {
+        pole_id: Number(pole_id),
+        node_id: Number(node_id),
+        finished_at: nowFinished,
+        status: "completed",
+        report_type: "pole_report",
+      }).catch(() => {});
+
+      // Invalidate local cache so poles.tsx re-fetches authoritative status on navigate
       if (node_id && pole_id) {
         const listKey = `sitemap_poles_${node_id}`;
         cacheGet<any[]>(listKey).then(listCache => {
           if (listCache) {
             const updated = listCache.map((p) => {
               if (String(p.pole_id) === String(pole_id) && p.pole) {
-                return {
-                  ...p,
-                  cleared_at: p.cleared_at || nowFinished,
-                  pole: {
-                    ...p.pole,
-                    skycable_status: "cleared",
-                  },
-                };
+                return { ...p, cleared_at: p.cleared_at || nowFinished, pole: { ...p.pole, skycable_status: "cleared" } };
               }
               return p;
             });
             cacheSet(listKey, updated).catch(() => {});
           }
         }).catch(() => {});
+        cacheSet(`sitemap_poles_${node_id}`, null).catch(() => {});
       }
 
-      // Sequential upload to the new unified endpoint
-      const photosToUpload = [
-        { field: "before", photo: photoBefore, tabKey: "before" },
-        { field: "after",  photo: photoAfter,  tabKey: "after" },
-        { field: "pole_tag", photo: photoTag,  tabKey: "pole_tag" },
-      ];
-
-      for (const item of photosToUpload) {
-        if (item.photo) {
-          try {
-            const photoForm = new FormData();
-            photoForm.append("report_id",      String(reportId ?? ""));
-            photoForm.append("pole_id",        String(pole_id ?? ""));
-            photoForm.append("node_id",        String(node_id ?? ""));
-            photoForm.append("pole_code",      String(pole_code ?? "pole"));
-            photoForm.append("image_type",     item.tabKey); // before, after, tag
-            photoForm.append("inventory_type", "skycable");
-            photoForm.append("image", {
-              uri: item.photo.fileUri,
-              name: `${item.field}.jpg`,
-              type: "image/jpeg",
-            } as any);
-
-            await api.post("/teardown/upload-image", photoForm);
-          } catch (uploadErr) {
-            console.error(`Image upload failed for ${item.field}:`, uploadErr);
-          }
-        }
-      }
-
-      Alert.alert("Submitted", "Pole report saved successfully.", [
-        { text: "OK", onPress: () => router.back() },
-      ]);
+      setSubmitSuccessTime(nowFinished);
+      setSubmitSuccessOpen(true);
     } catch (e: any) {
       Alert.alert("Submit Failed", e?.message ?? "Please try again.");
     } finally {
@@ -2272,12 +2245,7 @@ export default function PoleDetailScreen() {
           <View style={styles.floatingHeaderText}>
             <Text style={styles.headerSub}>{node_name || "Skycable Teardown"}</Text>
           </View>
-          {draftSaved && (
-            <View style={styles.draftSavedBadge}>
-              <Text style={styles.draftSavedText}>Saved</Text>
-            </View>
-          )}
-        </View>
+	        </View>
 
         <ScrollView
           contentContainerStyle={styles.content}
@@ -2406,13 +2374,13 @@ export default function PoleDetailScreen() {
                   </Text>
                 </View>
 
-                <View style={styles.heroTrackerNodesRow}>
-                  <TrackerMini done={hasGps} label="GPS" />
-                  <TrackerMini done={!!photoBefore} label="Before" />
-                  <TrackerMini done={!!photoAfter} label="After" />
-                  <TrackerMini done={!!photoTag} label="Tag" />
-                  {!isPoleReport && <TrackerMini done={!!slot} label="Slot" />}
-                </View>
+	                <View style={styles.heroTrackerNodesRow}>
+	                  <TrackerMini done={gpsDoneForUi} label="GPS" />
+	                  <TrackerMini done={!!photoBefore} label="Before" />
+	                  <TrackerMini done={!!photoAfter} label="After" />
+	                  <TrackerMini done={!!photoTag} label="Tag" />
+	                  {!isPoleReport && <TrackerMini done={!!slot} label="Slot" />}
+	                </View>
 
                 <View style={{ marginTop: 4 }}>
                   <ProgressWaveBar
@@ -2431,7 +2399,7 @@ export default function PoleDetailScreen() {
                 <View
                   style={[
                     styles.sectionPill,
-                    hasGps
+                    gpsDoneForUi
                       ? styles.sectionPillSuccess
                       : styles.sectionPillMuted,
                   ]}
@@ -2439,12 +2407,12 @@ export default function PoleDetailScreen() {
                   <Text
                     style={[
                       styles.sectionPillText,
-                      hasGps
+                      gpsDoneForUi
                         ? styles.sectionPillTextSuccess
                         : styles.sectionPillTextMuted,
                     ]}
                   >
-                    {hasGps
+                    {gpsDoneForUi
                       ? "Captured"
                       : poleLoading
                         ? "Checking…"
@@ -2612,16 +2580,16 @@ export default function PoleDetailScreen() {
 
           {/* Landmark (optional) */}
           <View style={styles.sectionCard}>
-            <SectionHeading
-              title="Landmark"
-              right={
-                <View style={[styles.sectionPill, landmark.trim() ? styles.sectionPillSuccess : styles.sectionPillMuted]}>
-                  <Text style={[styles.sectionPillText, landmark.trim() ? styles.sectionPillTextSuccess : styles.sectionPillTextMuted]}>
-                    {landmark.trim() ? "Filled" : "Optional"}
-                  </Text>
-                </View>
-              }
-            />
+	            <SectionHeading
+	              title="Landmark"
+	              right={
+	                <View style={[styles.sectionPill, landmark.trim() ? styles.sectionPillSuccess : styles.sectionPillMuted]}>
+	                  <Text style={[styles.sectionPillText, landmark.trim() ? styles.sectionPillTextSuccess : styles.sectionPillTextMuted]}>
+	                    {landmark.trim() ? "Filled" : "Optional"}
+	                  </Text>
+	                </View>
+	              }
+	            />
             {teardownStarted ? (
               <TextInput
                 style={styles.textArea}
@@ -2691,19 +2659,13 @@ export default function PoleDetailScreen() {
           </View>
 
           {/* ── Pole Report sections ─────────────────────────────────────── */}
-          {isPoleReport && (
+	          {false && isPoleReport && (
             <>
               {/* Pole Info */}
               <View style={styles.sectionCard}>
                 <SectionHeading
                   title="Pole Info"
-                  right={
-                    draftSaved ? (
-                      <View style={styles.draftSavedBadge}>
-                        <Text style={styles.draftSavedText}>Draft saved ✓</Text>
-                      </View>
-                    ) : null
-                  }
+                  right={null}
                 />
 
                 <View style={{ flexDirection: "row", gap: 12 }}>
@@ -2998,30 +2960,46 @@ export default function PoleDetailScreen() {
           </Pressable>
         </Modal>
 
-        <View style={styles.ctaBar}>
-          {isPoleReport ? (
-            <Pressable
-              style={({ pressed }) => [
-                styles.submitBtn,
-                { backgroundColor: canSubmitPoleReport ? accentColor : "#C9CED6" },
-                pressed && canSubmitPoleReport && styles.pressedDown,
-              ]}
-              onPress={handleSubmitPoleReport}
-              disabled={!canSubmitPoleReport || submittingReport}
-            >
-              <Text style={styles.submitText}>
-                {submittingReport
-                  ? "Submitting…"
-                  : canSubmitPoleReport
-                    ? "Submit Pole Report  ✓"
-                    : "GPS + Before + Tag required"}
-              </Text>
-            </Pressable>
-          ) : !teardownStarted ? (
-            <Pressable
-              style={({ pressed }) => [
-                styles.submitBtn,
-                { backgroundColor: startingPole ? "#6B7280" : accentColor },
+	        <View style={styles.ctaBar}>
+	          {isPoleReport ? (
+	            !teardownStarted ? (
+	              <Pressable
+	                style={({ pressed }) => [
+	                  styles.submitBtn,
+	                  { backgroundColor: startingPole ? "#6B7280" : accentColor },
+	                  pressed && !startingPole && styles.pressedDown,
+	                ]}
+	                onPress={handleStartPole}
+	                disabled={startingPole}
+	              >
+	                <Text style={styles.submitText}>
+	                  {startingPole ? "Starting…" : "Start Pole Teardown"}
+	                </Text>
+	              </Pressable>
+	            ) : (
+	              <Pressable
+	                style={({ pressed }) => [
+	                  styles.submitBtn,
+	                  { backgroundColor: canSubmitPoleReport ? accentColor : "#C9CED6" },
+	                  pressed && canSubmitPoleReport && styles.pressedDown,
+	                ]}
+	                onPress={handleSubmitPoleReport}
+	                disabled={!canSubmitPoleReport || submittingReport}
+	              >
+	                <Text style={styles.submitText}>
+	                  {submittingReport
+	                    ? "Submitting…"
+	                    : canSubmitPoleReport
+	                      ? "Submit Pole Report  ✓"
+	                      : "Recapture GPS + 3 Photos required"}
+	                </Text>
+	              </Pressable>
+	            )
+	          ) : !teardownStarted ? (
+	            <Pressable
+	              style={({ pressed }) => [
+	                styles.submitBtn,
+	                { backgroundColor: startingPole ? "#6B7280" : accentColor },
                 pressed && !startingPole && styles.pressedDown,
               ]}
               onPress={handleStartPole}
@@ -3050,6 +3028,115 @@ export default function PoleDetailScreen() {
             </Pressable>
           )}
         </View>
+
+        {/* ── Pole Report Success Modal ─────────────────────────────── */}
+        <Modal
+          visible={submitSuccessOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => { setSubmitSuccessOpen(false); router.navigate({ pathname: "/teardowns/poles" as any, params: { nodeId: node_id, nodeName: node_name || "" } }); }}
+        >
+          <View style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.65)", justifyContent: "center", alignItems: "center", padding: 24 }}>
+            <View style={{
+              backgroundColor: "#0F1A14",
+              borderRadius: 28,
+              padding: 28,
+              width: "100%",
+              maxWidth: 380,
+              borderWidth: 1,
+              borderColor: "rgba(16,185,129,0.25)",
+              shadowColor: "#10b981",
+              shadowOpacity: 0.2,
+              shadowRadius: 24,
+              elevation: 12,
+            }}>
+              {/* Icon ring */}
+              <View style={{ alignItems: "center", marginBottom: 20 }}>
+                <View style={{
+                  width: 80, height: 80, borderRadius: 40,
+                  backgroundColor: "rgba(16,185,129,0.12)",
+                  borderWidth: 2, borderColor: "rgba(16,185,129,0.4)",
+                  alignItems: "center", justifyContent: "center",
+                }}>
+                  <View style={{
+                    width: 52, height: 52, borderRadius: 26,
+                    backgroundColor: "#10b981",
+                    alignItems: "center", justifyContent: "center",
+                  }}>
+                    <Text style={{ fontSize: 26, color: "#fff" }}>✓</Text>
+                  </View>
+                </View>
+              </View>
+
+              {/* Title */}
+              <Text style={{ color: "#fff", fontSize: 22, fontWeight: "900", textAlign: "center", marginBottom: 4, letterSpacing: -0.3 }}>
+                Report Submitted!
+              </Text>
+              <Text style={{ color: "#A7F3D0", fontSize: 13, fontWeight: "700", textAlign: "center", marginBottom: 20 }}>
+                Pole report saved successfully
+              </Text>
+
+              {/* Info row */}
+              <View style={{
+                backgroundColor: "rgba(255,255,255,0.05)",
+                borderRadius: 16,
+                padding: 14,
+                gap: 10,
+                marginBottom: 24,
+              }}>
+                <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+                  <Text style={{ color: "#6EE7B7", fontSize: 11, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.6 }}>Pole</Text>
+                  <Text style={{ color: "#fff", fontSize: 13, fontWeight: "900" }} numberOfLines={1}>{editedPoleName || pole_name || pole_code}</Text>
+                </View>
+                <View style={{ height: 1, backgroundColor: "rgba(255,255,255,0.07)" }} />
+                <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+                  <Text style={{ color: "#6EE7B7", fontSize: 11, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.6 }}>Node</Text>
+                  <Text style={{ color: "#fff", fontSize: 13, fontWeight: "700" }}>{node_name || node_id}</Text>
+                </View>
+                {submitSuccessTime ? (
+                  <>
+                    <View style={{ height: 1, backgroundColor: "rgba(255,255,255,0.07)" }} />
+                    <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+                      <Text style={{ color: "#6EE7B7", fontSize: 11, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.6 }}>Submitted</Text>
+                      <Text style={{ color: "#fff", fontSize: 12, fontWeight: "700" }}>
+                        {(() => {
+                          try {
+                            const d = new Date(submitSuccessTime);
+                            const pht = new Date(d.getTime() + 8 * 3600 * 1000);
+                            const h = pht.getUTCHours(), m = pht.getUTCMinutes();
+                            const ampm = h >= 12 ? "PM" : "AM";
+                            return `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2,"0")} ${ampm}`;
+                          } catch { return "—"; }
+                        })()}
+                      </Text>
+                    </View>
+                  </>
+                ) : null}
+              </View>
+
+              {/* Done button */}
+              <Pressable
+                style={({ pressed }) => [{
+                  backgroundColor: "#10b981",
+                  borderRadius: 16,
+                  paddingVertical: 16,
+                  alignItems: "center",
+                  shadowColor: "#10b981",
+                  shadowOpacity: 0.4,
+                  shadowRadius: 12,
+                  elevation: 6,
+                  opacity: pressed ? 0.85 : 1,
+                }]}
+                onPress={() => {
+                  setSubmitSuccessOpen(false);
+                  router.navigate({ pathname: "/teardowns/poles" as any, params: { nodeId: node_id, nodeName: node_name || "" } });
+                }}
+              >
+                <Text style={{ color: "#fff", fontSize: 16, fontWeight: "900", letterSpacing: 0.2 }}>Back to Poles  →</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
 
         <Modal
           visible={viewerOpen}
@@ -3611,6 +3698,8 @@ export default function PoleDetailScreen() {
     </>
   );
 }
+
+export default PoleDetailScreen;
 
 const styles = StyleSheet.create({
   root: {

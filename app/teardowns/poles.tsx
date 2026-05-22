@@ -5,7 +5,7 @@ import { getPHTNow } from "@/lib/display-time";
 import { gpsQueueReadAll } from "@/lib/gps-queue";
 import { simpleQueuePush } from "@/lib/simple-queue";
 import { getTileCacheDir, offlineTileLayerJs } from "@/lib/tile-cache";
-import { getNodeDetail, getNodePoles, SkycablePole, startNodeTeardown, startPoleTeardown } from "@/services/skycable";
+import { getNodeDetail, getNodePoles, SkycablePole, startNodeTeardown } from "@/services/skycable";
 import * as Location from "expo-location";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
@@ -195,8 +195,9 @@ function VicinityMap({
 
 // ─── Full Leaflet map HTML for WebView preview ───────────────────────────────
 // Copied from explore.tsx buildBaseMapHtml — same init pattern that's proven to work
-function buildPolesMapHtml(): string {
+function buildPolesMapHtml(opts?: { isPoleReport?: boolean }): string {
   const offlineJs = offlineTileLayerJs(getTileCacheDir());
+  const startLabel = opts?.isPoleReport ? "Open Pole Report" : "Start Teardown";
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -235,12 +236,22 @@ html,body,#map{
 #fallback.ready{
   display:none;
 }
+.pp-wrap{
+  width:48px;
+  height:48px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
 .pp{
-  width:13px;
-  height:13px;
+  width:14px;
+  height:14px;
   border-radius:50%;
   border:2px solid rgba(255,255,255,0.98);
-  box-shadow:0 0 0 1px rgba(15,23,42,0.15),0 5px 12px rgba(0,0,0,0.35);
+  box-shadow:0 0 0 1.5px rgba(15,23,42,0.18),0 3px 8px rgba(0,0,0,0.35);
+  pointer-events:none;
 }
 .pw{min-width:170px;font-family:system-ui,sans-serif;}
 .pt{font-size:13px;font-weight:900;color:#111827;margin-bottom:5px;}
@@ -305,15 +316,15 @@ html,body,#map{
       var lbl = p.status==='cleared' ? 'Completed' : p.status==='in_progress' ? 'Ongoing' : 'Pending';
       var icon = L.divIcon({
         className: "",
-        html: '<div class="pp" style="background:'+c+'"></div>',
-        iconSize: [13,13],
-        iconAnchor: [6,6]
+        html: '<div class="pp-wrap"><div class="pp" style="background:'+c+'"></div></div>',
+        iconSize: [48,48],
+        iconAnchor: [24,24]
       });
       var btn = p.status!=='cleared'
-        ? '<button class="pstart" onclick="window._tap('+i+')">Start Teardown</button>'
+        ? '<button class="pstart" onclick="window._tap('+i+')">${startLabel}</button>'
         : '';
       var pop = '<div class="pw"><div class="pt">'+p.code+'</div><div class="pb" style="background:'+c+'22;color:'+c+'"><span style="width:6px;height:6px;border-radius:50%;background:'+c+';display:inline-block;margin-right:4px"></span>'+lbl+'</div>'+btn+'</div>';
-      L.marker([p.lat, p.lng], {icon: icon}).addTo(markerGroup).bindPopup(pop);
+      L.marker([p.lat, p.lng], {icon: icon, zIndexOffset: 1000}).addTo(markerGroup).bindPopup(pop);
       bounds.push([p.lat, p.lng]);
     });
     setTimeout(function(){
@@ -323,37 +334,64 @@ html,body,#map{
     }, 300);
   };
 
+  var _tileLayer = null;
+  var _labelLayer = null;
+  var TILE_URLS = {
+    street:    {url:"https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",                                                                     sub:"abc",  maxZoom:22, maxNativeZoom:19},
+    satellite: {url:"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",                         sub:null,   maxZoom:22, maxNativeZoom:18},
+    dark:      {url:"https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",                                                         sub:"abcd", maxZoom:22, maxNativeZoom:20}
+  };
+  window.setTileLayer = function(type){
+    if(!map) return;
+    if(_tileLayer){ map.removeLayer(_tileLayer); _tileLayer=null; }
+    if(_labelLayer){ map.removeLayer(_labelLayer); _labelLayer=null; }
+    var t = TILE_URLS[type] || TILE_URLS.street;
+    var opts = {maxZoom:t.maxZoom, maxNativeZoom:t.maxNativeZoom, attribution:""};
+    if(t.sub) opts.subdomains = t.sub;
+    _tileLayer = L.tileLayer(t.url, opts).addTo(map);
+    if(type==="satellite"){
+      _labelLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png",
+        {maxZoom:22, maxNativeZoom:20, opacity:0.85, subdomains:"abcd", attribution:""}).addTo(map);
+    }
+  };
+
   function init(){
     if(map) return;
-    map = L.map("map", {zoomControl:true, attributionControl:false, preferCanvas:true}).setView(PH_CENTER, 13);
-    ${offlineJs}
-    addOfflineTiles(map);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png", {maxZoom:21, opacity:0.9, subdomains:"abcd"}).addTo(map);
+    map = L.map("map", {zoomControl:true, attributionControl:false, preferCanvas:true, maxZoom:22}).setView(PH_CENTER, 13);
+    window.setTileLayer('street');
     markerGroup = L.layerGroup().addTo(map);
     hideFallback();
     post({type:"MAP_READY"});
-    // User location + compass arrow — injected from React Native via setLoc/setHdg
+    // User location + compass arrow
+    // pointer-events:none → clicks pass through to pole markers underneath
     var _userMarker = null;
     var _locIcon = L.divIcon({
       className:'',
-      html:'<div style="position:relative;width:28px;height:28px;display:flex;align-items:center;justify-content:center;">'
-        +'<div style="position:absolute;width:46px;height:46px;border-radius:50%;background:rgba(37,99,235,0.18);top:50%;left:50%;animation:gps-pulse 1.8s ease-out infinite;"></div>'
-        +'<div id="u-arrow" style="display:flex;align-items:center;justify-content:center;transform:rotate(0deg);transition:transform 0.3s;">'
-        +'<svg width="22" height="22" viewBox="0 0 24 24"><polygon points="12,2 20,22 12,17 4,22" fill="#2563EB" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"/></svg>'
+      html:'<div style="position:relative;width:32px;height:32px;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0.82;">'
+        +'<div style="position:absolute;width:52px;height:52px;border-radius:50%;background:rgba(37,99,235,0.15);top:50%;left:50%;transform:translate(-50%,-50%);animation:gps-pulse 1.8s ease-out infinite;"></div>'
+        +'<div id="u-arrow" style="display:flex;align-items:center;justify-content:center;transition:transform 0.25s linear;">'
+        +'<svg width="24" height="24" viewBox="0 0 24 24"><polygon points="12,2 20,22 12,17 4,22" fill="#2563EB" stroke="rgba(255,255,255,0.9)" stroke-width="2" stroke-linejoin="round"/></svg>'
         +'</div></div>',
-      iconSize:[28,28], iconAnchor:[14,14]
+      iconSize:[32,32], iconAnchor:[16,16]
     });
     window.setLoc = function(lat, lng){
       if(!map) return;
       if(!_userMarker){
-        _userMarker = L.marker([lat,lng],{icon:_locIcon,zIndexOffset:999}).addTo(map);
+        // zIndexOffset 2000 → always renders on top of pole markers visually,
+        // but pointer-events:none means taps fall through to poles below
+        _userMarker = L.marker([lat,lng],{icon:_locIcon,zIndexOffset:2000,interactive:false}).addTo(map);
       } else {
         _userMarker.setLatLng([lat,lng]);
       }
     };
+    // Smooth 360° rotation — accumulate angle to avoid shortest-path flip at 0°/360°
+    var _hdgAccum = 0;
     window.setHdg = function(deg){
       var el = document.getElementById('u-arrow');
-      if(el) el.style.transform = 'rotate('+deg+'deg)';
+      if(!el) return;
+      var diff = ((deg - (_hdgAccum % 360)) + 540) % 360 - 180;
+      _hdgAccum += diff;
+      el.style.transform = 'rotate('+_hdgAccum+'deg)';
     };
   }
 
@@ -448,6 +486,34 @@ const mp = StyleSheet.create({
     marginLeft: "auto",
   },
 
+  // ── Tile view toggle ──
+  tileToggleRow: {
+    flexDirection: "row",
+    gap: 6,
+    marginTop: 8,
+  },
+  tileBtn: {
+    flex: 1,
+    paddingVertical: 7,
+    borderRadius: 10,
+    alignItems: "center",
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+  },
+  tileBtnActive: {
+    backgroundColor: "#0F172A",
+    borderColor: "#0F172A",
+  },
+  tileBtnText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#64748B",
+  },
+  tileBtnTextActive: {
+    color: "#FFFFFF",
+  },
+
   // ── Bottom card — exact match of explore.tsx floatingNoGpsCard ──
   floatingBottomCard: {
     position: "absolute",
@@ -532,6 +598,7 @@ type NodeSession = {
   expected_cable: number | null;
   actual_cable: number | null;
   progress_percentage: number | null;
+  report_type: "full_report" | "pole_report" | null;
 };
 
 const SC: Record<string, { label: string; color: string; bg: string }> = {
@@ -655,7 +722,25 @@ export default function PolesScreen() {
     reportType?: string;
   }>();
 
-  const isPoleReport = reportType === "pole_report";
+  const [session, setSession] = useState<NodeSession | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [gateVisible, setGateVisible] = useState(false);
+  const GATE_KEY = `td_gate_seen_${nodeId}`;
+  const [pendingOpenPole, setPendingOpenPole] = useState<null | {
+    poleRowId: number;
+    poleId: string;
+    poleCode?: string;
+  }>(null);
+
+  const resolvedReportType =
+    (reportType === "full_report" || reportType === "pole_report"
+      ? reportType
+      : null) ??
+    (session?.report_type ?? "full_report");
+
+  const isPoleReport = resolvedReportType === "pole_report";
+  const poleDetailPath = isPoleReport ? "/teardowns/pole-report" : "/teardowns/pole-detail";
 
   const userTeamId = (user as any)?.team_id ?? null;
   const accessDenied = !!nodeTeamId && !!userTeamId && String(nodeTeamId) !== String(userTeamId);
@@ -665,19 +750,21 @@ export default function PolesScreen() {
   const [loading, setLoading] = useState(true);
   const [offline, setOffline] = useState(false);
   const [showCompleted, setShowCompleted] = useState(false);
-
-  const [session, setSession] = useState<NodeSession | null>(null);
-  const [sessionLoading, setSessionLoading] = useState(true);
-  const [starting, setStarting] = useState(false);
-  const [gateVisible, setGateVisible] = useState(false);
-  const GATE_KEY = `td_gate_seen_${nodeId}`;
+  // Tracks when each pole was last tapped from this list — used for most-recent-first sort
+  const [lastSelectedMap, setLastSelectedMap] = useState<Record<string, number>>({});
 
   const [mapPreviewVisible, setMapPreviewVisible] = useState(false);
+  const [mapTileView, setMapTileView] = useState<"street" | "satellite" | "dark">("street");
+
+  const switchTileView = (view: "street" | "satellite" | "dark") => {
+    setMapTileView(view);
+    mapWvRef.current?.injectJavaScript(`if(window.setTileLayer)window.setTileLayer('${view}');true;`);
+  };
 
   // ── Inline map overlay (WebView always mounted so CDN loads in background) ─
   const insets = useSafeAreaInsets();
   const mapWvRef = useRef<any>(null);
-  const [mapHtml] = useState(() => buildPolesMapHtml());
+  const mapHtml = useMemo(() => buildPolesMapHtml({ isPoleReport }), [isPoleReport]);
   const [mapReady, setMapReady] = useState(false);
   // Cache last known position/heading so we can inject immediately on MAP_READY
   const lastPosRef = useRef<{ lat: number; lng: number } | null>(null);
@@ -730,6 +817,8 @@ export default function PolesScreen() {
   const [newPoleCode, setNewPoleCode]           = useState("");
   const [addingPole, setAddingPole]             = useState(false);
 
+  // Pole report mode still respects the node session start gate: poles are "pending"
+  // until the node teardown session is started.
   const isStarted = !!session?.date_start;
 
   // ── Load node session offline-first ──────────────────────────────────────
@@ -755,6 +844,7 @@ export default function PolesScreen() {
             expected_cable: node.expected_cable ?? null,
             actual_cable: node.actual_cable ?? null,
             progress_percentage: node.progress_percentage ?? null,
+            report_type: (node.report_type === "full_report" || node.report_type === "pole_report") ? node.report_type : null,
           };
           setSession(freshSession);
           cacheSet(SESSION_CACHE_KEY, freshSession).catch(() => {});
@@ -848,6 +938,22 @@ export default function PolesScreen() {
     }, [token, nodeId])
   );
 
+  // ── Reload last-selected timestamps on every focus (so sort order is fresh after returning) ──
+  useFocusEffect(
+    useCallback(() => {
+      if (!nodeId) return;
+      cacheGet<SkycablePole[]>(`sitemap_poles_${nodeId}`).then(cached => {
+        if (!cached?.length) return;
+        const ids = cached.map(p => String(p.pole_id));
+        Promise.all(ids.map(id => cacheGet<number>(`pole_last_selected_${id}`))).then(tsArr => {
+          const map: Record<string, number> = {};
+          ids.forEach((id, i) => { if (tsArr[i] != null) map[id] = tsArr[i]!; });
+          setLastSelectedMap(map);
+        });
+      }).catch(() => {});
+    }, [nodeId])
+  );
+
   // ── Derived values ───────────────────────────────────────────────────────
   const isCompleted = (p: SkycablePole) => p.pole?.skycable_status === "cleared";
 
@@ -862,8 +968,14 @@ export default function PolesScreen() {
   const filtered = useMemo(() => {
     const base = showCompleted ? completedPoles : activePoles;
     const q = search.toLowerCase();
-    return q ? base.filter(p => p.pole?.pole_code?.toLowerCase().includes(q)) : base;
-  }, [search, showCompleted, activePoles, completedPoles]);
+    const result = q ? base.filter(p => p.pole?.pole_code?.toLowerCase().includes(q)) : base;
+    // Sort by most-recently-selected first; poles never selected stay in original API order
+    return [...result].sort((a, b) => {
+      const ta = lastSelectedMap[String(a.pole_id)] ?? 0;
+      const tb = lastSelectedMap[String(b.pole_id)] ?? 0;
+      return tb - ta;
+    });
+  }, [search, showCompleted, activePoles, completedPoles, lastSelectedMap]);
 
   const vicinityLocs = useMemo(
     () =>
@@ -918,6 +1030,7 @@ export default function PolesScreen() {
   function dismissGate() {
     AsyncStorage.setItem(GATE_KEY, "1").catch(() => { });
     setGateVisible(false);
+    setPendingOpenPole(null);
   }
 
   async function handleStartTeardown() {
@@ -932,19 +1045,109 @@ export default function PolesScreen() {
     cacheSet(`session_node_${nodeId}`, updatedSession).catch(() => {});
     dismissGate();
 
-    // 2. Transmit session start payload to server; fallback to simpleQueue if offline
-    try {
-      await startNodeTeardown(Number(nodeId), token, now);
-    } catch (err: any) {
+	    // 2. Transmit session start payload to server; fallback to simpleQueue if offline
+	    try {
+	      await startNodeTeardown(Number(nodeId), token, now);
+	    } catch (err: any) {
+	      if (!err?.response?.status) {
+	        await simpleQueuePush({
+	          method: "put",
+	          url: `/skycable/nodes/${nodeId}`,
+	          body: { date_start: now, status: "in_progress" },
+	        }).catch(() => {});
+	      } else {
+	        Alert.alert("Start Failed", err?.message ?? "Unable to start teardown.");
+	      }
+	    }
+    setStarting(false);
+
+    // If user tapped a pole while pending, continue straight to that pole after starting.
+    if (pendingOpenPole) {
+      router.push({
+        pathname: poleDetailPath,
+        params: {
+          pole_id: pendingOpenPole.poleId,
+          pole_row_id: String(pendingOpenPole.poleRowId),
+          pole_code: pendingOpenPole.poleCode,
+          pole_name: pendingOpenPole.poleCode,
+          node_id: nodeId,
+          node_name: nodeName,
+          accent: "#0B7A5A",
+          report_type: resolvedReportType,
+        },
+      } as any);
+      setPendingOpenPole(null);
+    }
+  }
+
+  async function handleStartPoleFromList(poleId: number, poleRowId?: number) {
+    if (!nodeId || !token) return;
+    const now = getPHTNow();
+    const CACHE_KEY = `sitemap_poles_${nodeId}`;
+    const nextSequence = poles.reduce((max, p) => Math.max(max, Number(p.sequence) || 0), 0) + 1;
+
+    // 1. Optimistic local state update
+    setPoles(prev => {
+      const updated = prev.map(p =>
+        String(p.pole_id) === String(poleId)
+          ? {
+              ...p,
+              date_start: p.date_start || now,
+              sequence: p.sequence || nextSequence,
+              pole: p.pole ? { ...p.pole, skycable_status: "in_progress" as const } : p.pole,
+            }
+          : p,
+      );
+      cacheSet(CACHE_KEY, updated).catch(() => {});
+      return updated;
+    });
+
+    // 2. Backend sync — queue if offline
+    api.patch(`/skycable/nodes/${nodeId}/poles/sync`, {
+      pole_id: Number(poleId),
+      date_start: now,
+      status: "in_progress",
+      sequence: nextSequence,
+    }).catch(async (err: any) => {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "patch",
+          url: `/skycable/nodes/${nodeId}/poles/sync`,
+          body: {
+            pole_id: Number(poleId),
+            date_start: now,
+            status: "in_progress",
+            sequence: nextSequence,
+          },
+        }).catch(() => {});
+      }
+    });
+
+    // Skycable pole pivot row (skycable_poles) — use the pivot ID when available
+    if (poleRowId) {
+      api.put(`/skycable/nodes/${nodeId}/poles/${poleRowId}`, { date_start: now }).catch(async (err: any) => {
+        if (!err?.response?.status) {
+          await simpleQueuePush({
+            method: "put",
+            url: `/skycable/nodes/${nodeId}/poles/${poleRowId}`,
+            body: { date_start: now },
+          }).catch(() => {});
+        }
+      });
+    }
+
+    // Base pole record (poles.skycable_status) — this is what the web admin table shows
+    api.put(`/skycable/poles/${poleId}`, { skycable_status: "in_progress" }).catch(async (err: any) => {
       if (!err?.response?.status) {
         await simpleQueuePush({
           method: "put",
-          url: `/skycable/nodes/${nodeId}`,
-          body: { date_start: now },
+          url: `/skycable/poles/${poleId}`,
+          body: { skycable_status: "in_progress" },
         }).catch(() => {});
+      } else {
+        Alert.alert("Start Failed", err?.message ?? "Unable to start pole teardown.");
       }
-    }
-    setStarting(false);
+    });
   }
 
   // ── Add Pole (pole_report only) ─────────────────────────────────────────
@@ -952,29 +1155,33 @@ export default function PolesScreen() {
     const code = newPoleCode.trim();
     if (!code) { Alert.alert("Required", "Please enter a pole code."); return; }
     if (!nodeId || !token || addingPole) return;
-    setAddingPole(true);
-    try {
-      const { data } = await api.post("/skycable/poles", {
-        pole_code: code,
-        node_id: Number(nodeId),
-      });
-      const newPole = data?.data ?? data;
-      const poleId  = String(newPole?.id ?? "");
+      setAddingPole(true);
+      try {
+        const { data } = await api.post("/skycable/poles", {
+          pole_code: code,
+          node_id: Number(nodeId),
+        });
+      const payload = (data as any)?.data ?? data;
+      const createdPole = payload?.pole ?? null;
+      const createdNodePole = payload?.node_pole ?? null;
+      const poleId = String(createdPole?.id ?? "");
+      const poleRowId = String(createdNodePole?.id ?? "");
+      if (!poleId || !poleRowId) throw new Error("Unexpected backend response while creating pole.");
 
       // Add to local poles list so the listahan stays updated when they come back
       const fakeSkyPole = {
-        id: newPole?.id,
+        id: Number(poleRowId),
         node_id: Number(nodeId),
-        pole_id: newPole?.id,
-        sequence: poles.length + 1,
-        date_start: null,
-        cleared_at: null,
+        pole_id: Number(poleId),
+        sequence: Number(createdNodePole?.sequence) || poles.length + 1,
+        date_start: createdNodePole?.date_start ?? null,
+        cleared_at: createdNodePole?.cleared_at ?? null,
         pole: {
-          id: newPole?.id,
+          id: Number(poleId),
           pole_code: code,
-          lat: null,
-          lng: null,
-          skycable_status: "pending" as const,
+          lat: createdPole?.lat ?? null,
+          lng: createdPole?.lng ?? null,
+          skycable_status: (createdPole?.skycable_status ?? "pending") as "pending" | "in_progress" | "cleared",
           cableSlots: [],
         },
       };
@@ -986,9 +1193,10 @@ export default function PolesScreen() {
       setNewPoleCode("");
       setAddPoleVisible(false);
       router.push({
-        pathname: "/teardowns/pole-detail",
+        pathname: poleDetailPath,
         params: {
           pole_id:   poleId,
+          pole_row_id: poleRowId,
           pole_code: code,
           pole_name: code,
           node_id:   nodeId,
@@ -1067,8 +1275,8 @@ export default function PolesScreen() {
         <View style={[StyleSheet.absoluteFillObject, { backgroundColor: "#0d1117" }]}>
           <WebView
             ref={mapWvRef}
-            key={`pm-${nodeId}-${mapPolePins.length}`}
-            source={{ html: mapHtml, baseUrl: "https://gis-pole-map.local/" }}
+             key={`pm-${nodeId}-${mapPolePins.length}-${isPoleReport ? "pr" : "fr"}`}
+             source={{ html: mapHtml, baseUrl: "https://gis-pole-map.local/" }}
             style={{ flex: 1 }}
             originWhitelist={["*"]}
             scrollEnabled={false}
@@ -1090,6 +1298,8 @@ export default function PolesScreen() {
                   // Use ref — never reads a stale closure value
                   const j = JSON.stringify(mapPolePinsRef.current);
                   mapWvRef.current?.injectJavaScript(`if(window.setPoles)window.setPoles(${j});true;`);
+                  // Apply tile view (user may have switched before MAP_READY)
+                  mapWvRef.current?.injectJavaScript(`if(window.setTileLayer)window.setTileLayer('${mapTileView}');true;`);
                   // Immediately show current location — don't wait for next watcher tick
                   if (lastPosRef.current) {
                     const { lat, lng } = lastPosRef.current;
@@ -1102,36 +1312,32 @@ export default function PolesScreen() {
                 if (msg.type === "start") {
                   setMapPreviewVisible(false);
 
-                  const now = getPHTNow();
-                  const CACHE_KEY = `sitemap_poles_${nodeId}`;
-
-                  // 1. Optimistic local state update
-                  setPoles(prev => {
-                    const updated = prev.map(p =>
-                      p.id === msg.id
-                        ? { ...p, date_start: now, pole: { ...p.pole, skycable_status: "in_progress" as const } }
-                        : p
-                    );
-                    // 2. Write updated list to cache immediately so useFocusEffect
-                    //    reads in_progress on return — not the stale pending value
-                    cacheSet(CACHE_KEY, updated).catch(() => {});
-                    return updated;
-                  });
-
-                  // 3. Backend sync — fire-and-forget; queue if offline
-                  if (nodeId && token) {
-                    startPoleTeardown(Number(nodeId), msg.id, token, now).catch(async (err: any) => {
-                      if (!err?.response?.status) {
-                        await simpleQueuePush({
-                          method: "put",
-                          url: `/skycable/nodes/${nodeId}/poles/${msg.id}`,
-                          body: { date_start: now },
-                        }).catch(() => {});
-                      }
+                  if (!isStarted) {
+                    setPendingOpenPole({
+                      poleRowId: msg.id,
+                      poleId: String(msg.pole_id),
+                      poleCode: String(msg.code ?? ""),
                     });
+                    setGateVisible(true);
+                    return;
                   }
 
-                  router.push({ pathname: "/teardowns/pole-detail", params: { pole_id: String(msg.pole_id), node_id: nodeId ?? "", node_name: nodeName, report_type: reportType ?? "full_report" } } as any);
+                  // Full report: start pole immediately so status becomes ongoing right away.
+                  // Pole report: let the user land first, then start inside pole-report screen.
+                  if (!isPoleReport) {
+                    handleStartPoleFromList(Number(msg.pole_id), Number(msg.id)).catch(() => {});
+                  }
+
+                    router.push({
+                      pathname: poleDetailPath,
+                      params: {
+                        pole_id: String(msg.pole_id),
+                        pole_row_id: String(msg.id),
+                        node_id: nodeId ?? "",
+                        node_name: nodeName,
+                        report_type: resolvedReportType,
+                      },
+                    } as any);
                 }
               } catch {}
             }}
@@ -1165,6 +1371,22 @@ export default function PolesScreen() {
               <Text style={mp.dropdownLabel}>PENDING</Text>
               <Text style={[mp.dropdownValue, { color: "#f59e0b" }]}>{mapPolePins.filter(p => p.status !== "cleared" && p.status !== "in_progress").length}</Text>
             </View>
+          </View>
+
+          {/* Tile view toggle */}
+          <View style={mp.tileToggleRow}>
+            {(["street", "satellite", "dark"] as const).map(v => (
+              <TouchableOpacity
+                key={v}
+                style={[mp.tileBtn, mapTileView === v && mp.tileBtnActive]}
+                onPress={() => switchTileView(v)}
+                activeOpacity={0.75}
+              >
+                <Text style={[mp.tileBtnText, mapTileView === v && mp.tileBtnTextActive]}>
+                  {v === "street" ? "🗺 Street" : v === "satellite" ? "🛰 Satellite" : "🌑 Dark"}
+                </Text>
+              </TouchableOpacity>
+            ))}
           </View>
         </View>
 
@@ -1295,9 +1517,9 @@ export default function PolesScreen() {
 
             <Text style={s.notStartedTitle}>Teardown Not Started</Text>
 
-            <Text style={s.notStartedSub}>
-              Press the button below to officially begin{"\n"}this node's teardown session.
-            </Text>
+	            <Text style={s.notStartedSub}>
+	              Press the button below to officially begin{"\n"}this node’s teardown session.
+	            </Text>
 
             <TouchableOpacity
               style={[s.notStartedBtn, starting && { opacity: 0.65 }]}
@@ -1537,22 +1759,37 @@ export default function PolesScreen() {
                       activeOpacity={isStarted ? 0.8 : 1}
                       onPress={() => {
                         if (!isStarted) {
+                          setPendingOpenPole({
+                            poleRowId: np.id,
+                            poleId: String(np.pole_id),
+                            poleCode: poleInfo.pole_code,
+                          });
                           setGateVisible(true);
                           return;
                         }
 
+                        const poleId = String(np.pole_id);
+                        const nowMs = Date.now();
+
+                        // Track last-selected for sort order (most-recent-first)
+                        cacheSet(`pole_last_selected_${poleId}`, nowMs).catch(() => {});
+                        setLastSelectedMap(prev => ({ ...prev, [poleId]: nowMs }));
+
+                        if (!isPoleReport) {
+                          handleStartPoleFromList(Number(np.pole_id), Number(np.id)).catch(() => {});
+                        }
+
                         router.push({
-                          pathname: "/teardowns/pole-detail",
+                          pathname: poleDetailPath,
                           params: {
                             pole_id: np.pole_id,
+                            pole_row_id: np.id,
                             pole_code: poleInfo.pole_code,
                             pole_name: poleInfo.pole_code,
                             node_id: nodeId,
                             node_name: nodeName,
                             accent: "#0B7A5A",
-                            // pass the actual report type so pole-detail knows
-                            // whether to show full teardown flow or pole report only
-                            report_type: isPoleReport ? "pole_report" : "teardown",
+                            report_type: resolvedReportType,
                           },
                         });
                       }}

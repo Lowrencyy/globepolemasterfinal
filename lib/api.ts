@@ -3,10 +3,10 @@ import { tokenStore } from "@/lib/token";
 import { cacheWebTime } from "@/lib/display-time";
 
 export const BASE_URL =
-  "https://disguisedly-enarthrodial-kristi.ngrok-free.dev/api/v1";
+  "https://jam-meetings-centuries-sold.trycloudflare.com/api/v1";
 
 export const ASSET_BASE =
-  "https://disguisedly-enarthrodial-kristi.ngrok-free.dev/";
+  "https://jam-meetings-centuries-sold.trycloudflare.com/";
 
 /** Converts a stored path like "project-logos/abc.png" to a full URL */
 export function assetUrl(path: string | null | undefined): string | null {

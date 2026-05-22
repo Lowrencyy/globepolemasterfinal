@@ -36,7 +36,8 @@ import api, { BASE_URL } from "@/lib/api";
 import { getBridgeToken } from "@/lib/token-bridge";
 import { tokenStore } from "@/lib/token";
 
-const TEARDOWN_LOGS_ENDPOINT = `${BASE_URL}/skycable/teardowns`;
+const TEARDOWN_LOGS_ENDPOINT  = `${BASE_URL}/skycable/teardowns`;
+const POLE_REPORTS_ENDPOINT   = `${BASE_URL}/skycable/pole-reports`;
 
 const REQUEST_TIMEOUT_MS = 15000;
 const RETRY_INTERVAL_MS = 30000;
@@ -56,6 +57,26 @@ const LIGHT_MUTED = "#98A2B3";
 const BORDER = "#E4E7EC";
 const BG = "#F6F8FB";
 const WHITE = "#FFFFFF";
+
+type PoleReport = {
+  id: number;
+  pole_id: number;
+  node_id: number | null;
+  submitted_by: number;
+  condition: string | null;
+  material: string | null;
+  height_ft: string | null;
+  landmark: string | null;
+  notes: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  gps_captured_at: string | null;
+  slots: any[] | null;
+  created_at: string;
+  pole: { id: number; pole_code: string } | null;
+  node: { id: number; name: string } | null;
+  submitter: { id: number; first_name: string; last_name: string; team?: { id: number; name: string } | null } | null;
+};
 
 type TeardownLog = {
   id?: number | string;
@@ -896,8 +917,118 @@ function TeardownLogCard({
   );
 }
 
+function PoleReportCard({
+  report,
+  index,
+}: {
+  report: PoleReport;
+  index: number;
+}) {
+  const poleCode = report.pole?.pole_code ?? `Pole #${report.pole_id}`;
+  const nodeName = report.node?.name ?? "Unknown Node";
+  const submitter = report.submitter
+    ? `${report.submitter.first_name} ${report.submitter.last_name}`.trim()
+    : "Unknown Lineman";
+  const hasGps = report.latitude !== null && report.longitude !== null;
+
+  return (
+    <View style={s.logCard}>
+      <View style={s.logHeader}>
+        <View style={s.logHeaderLeft}>
+          <View style={[s.logNumberBadge, { backgroundColor: "#D1FAE5" }]}>
+            <Hash size={13} color="#059669" />
+            <Text selectable style={[s.logNumberText, { color: "#059669" }]}>
+              {String(index + 1).padStart(2, "0")}
+            </Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={s.logEyebrow}>POLE REPORT</Text>
+            <Text selectable style={s.logTitle} numberOfLines={1}>
+              {poleCode}
+            </Text>
+          </View>
+        </View>
+        <View style={[s.statusPill, { backgroundColor: "#D1FAE5" }]}>
+          <CheckCircle2 size={13} color="#059669" />
+          <Text selectable style={[s.statusText, { color: "#059669" }]}>
+            cleared
+          </Text>
+        </View>
+      </View>
+
+      <View style={s.routePanel}>
+        <View style={s.routeHeaderRow}>
+          <View style={[s.routeIconCircle, { backgroundColor: "#D1FAE5" }]}>
+            <MapPin size={16} color="#059669" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={s.routeLabel}>POLE</Text>
+            <Text selectable style={s.routeTitle} numberOfLines={1}>
+              {poleCode}
+            </Text>
+          </View>
+        </View>
+        <View style={[s.nodeStrip, { backgroundColor: "#D1FAE5" }]}>
+          <MapPin size={13} color="#059669" />
+          <Text selectable style={[s.nodeText, { color: "#059669" }]} numberOfLines={1}>
+            {nodeName}
+          </Text>
+        </View>
+      </View>
+
+      <View style={s.detailGrid}>
+        <DetailRow
+          icon={<UserRound size={15} color={AMBER} />}
+          label="Submitted By"
+          value={submitter}
+        />
+        {(report.condition || report.material) && (
+          <DetailRow
+            icon={<FileText size={15} color={BLUE} />}
+            label="Condition / Material"
+            value={[report.condition, report.material].filter(Boolean).join(" · ")}
+          />
+        )}
+        {report.height_ft && (
+          <DetailRow
+            icon={<Zap size={15} color={AMBER} />}
+            label="Height"
+            value={`${report.height_ft} ft`}
+          />
+        )}
+        {hasGps && (
+          <DetailRow
+            icon={<MapPin size={15} color={RED} />}
+            label="Captured GPS"
+            value={formatCoord(report.latitude, report.longitude)}
+          />
+        )}
+        {report.notes && (
+          <DetailRow
+            icon={<FileText size={15} color={MUTED} />}
+            label="Notes"
+            value={report.notes}
+          />
+        )}
+      </View>
+
+      {report.slots && report.slots.length > 0 && (
+        <View style={s.componentsRow}>
+          {report.slots.slice(0, 4).map((slot: any, i: number) => (
+            <View key={i} style={[s.componentChip, s.componentBlue]}>
+              <Text selectable style={s.componentValue}>{slot.label ?? slot}</Text>
+              <Text style={s.componentLabel}>Slot</Text>
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  );
+}
+
 export default function LogsScreen() {
   const [logs, setLogs] = useState<TeardownLog[]>([]);
+  const [poleReports, setPoleReports] = useState<PoleReport[]>([]);
   const [isAttempting, setIsAttempting] = useState(true);
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
@@ -920,18 +1051,38 @@ export default function LogsScreen() {
   const loadLogs = useCallback(async () => {
     try {
       setIsAttempting(true);
-      const result = await api.get("/skycable/teardowns");
-      const nextLogs = extractLogsFromResponse(result.data);
+
+      const [spanResult, poleResult] = await Promise.allSettled([
+        api.get("/skycable/teardowns"),
+        api.get("/skycable/pole-reports?per_page=100"),
+      ]);
 
       if (!isMounted.current) return;
 
-      if (nextLogs.length > 0) {
-        setLogs(nextLogs);
+      const nextLogs =
+        spanResult.status === "fulfilled"
+          ? extractLogsFromResponse(spanResult.value.data)
+          : [];
+
+      const nextPoleReports: PoleReport[] =
+        poleResult.status === "fulfilled"
+          ? Array.isArray(poleResult.value.data)
+            ? poleResult.value.data
+            : (poleResult.value.data?.data ?? [])
+          : [];
+
+      setLogs(nextLogs);
+      setPoleReports(nextPoleReports);
+
+      const hasAny = nextLogs.length > 0 || nextPoleReports.length > 0;
+      if (hasAny) {
         setLastError(null);
         setLastSyncedAt(new Date());
         setIsAttempting(false);
+      } else if (spanResult.status === "rejected") {
+        setLastError((spanResult.reason as any)?.message ?? "Unable to reach backend.");
+        setIsAttempting(true);
       } else {
-        setLogs([]);
         setLastError("No teardown reports found in backend database.");
         setIsAttempting(false);
       }
@@ -955,6 +1106,22 @@ export default function LogsScreen() {
       return bTime - aTime;
     });
   }, [logs]);
+
+  type FeedItem =
+    | { kind: "span"; data: TeardownLog }
+    | { kind: "pole"; data: PoleReport };
+
+  const feed = useMemo<FeedItem[]>(() => {
+    const items: FeedItem[] = [
+      ...sortedLogs.map((d) => ({ kind: "span" as const, data: d })),
+      ...poleReports.map((d) => ({ kind: "pole" as const, data: d })),
+    ];
+    return items.sort((a, b) => {
+      const at = safeDate(a.kind === "span" ? asRecord(a.data).start_time : a.data.created_at)?.getTime() ?? 0;
+      const bt = safeDate(b.kind === "span" ? asRecord(b.data).start_time : b.data.created_at)?.getTime() ?? 0;
+      return bt - at;
+    });
+  }, [sortedLogs, poleReports]);
 
   const selectedId = Array.isArray(id) ? Number(id[0]) : Number(id);
 
@@ -1009,7 +1176,7 @@ export default function LogsScreen() {
     setViewerTitle(title);
   };
 
-  if (isAttempting && !sortedLogs.length) {
+  if (isAttempting && !feed.length) {
     return (
       <ServerConnectionAttempting
         onBack={() => router.back()}
@@ -1020,7 +1187,7 @@ export default function LogsScreen() {
   }
 
   // Handle empty state gracefully instead of showing loading screen
-  if (!sortedLogs.length) {
+  if (!feed.length) {
     return (
       <>
         <Stack.Screen options={{ headerShown: false }} />
@@ -1078,7 +1245,7 @@ export default function LogsScreen() {
                 Whole Teardown Logs
               </Text>
               <Text style={s.heroSubtitle}>
-                Backend data view · {sortedLogs.length} total reports
+                Backend data view · {feed.length} total reports
               </Text>
             </View>
 
@@ -1091,7 +1258,7 @@ export default function LogsScreen() {
             <StatPill
               icon={<Hash size={15} color={WHITE} />}
               label="Logs"
-              value={String(sortedLogs.length)}
+              value={String(feed.length)}
             />
 
             <StatPill
@@ -1197,18 +1364,26 @@ export default function LogsScreen() {
 
             <View style={s.countBadge}>
               <Text selectable style={s.countBadgeText}>
-                {sortedLogs.length}
+                {feed.length}
               </Text>
             </View>
           </View>
 
-          {sortedLogs.map((log, index) => {
-            const key = toSafeText(asRecord(log).id, String(index));
-
+          {feed.map((item, index) => {
+            if (item.kind === "pole") {
+              return (
+                <PoleReportCard
+                  key={`pole-${item.data.id}`}
+                  report={item.data}
+                  index={index}
+                />
+              );
+            }
+            const key = toSafeText(asRecord(item.data).id, String(index));
             return (
               <TeardownLogCard
-                key={`${key}-${index}`}
-                log={log}
+                key={`span-${key}-${index}`}
+                log={item.data}
                 index={index}
                 onViewPhoto={openViewer}
               />

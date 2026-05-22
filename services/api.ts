@@ -1,4 +1,4 @@
-const BASE_URL = "https://disguisedly-enarthrodial-kristi.ngrok-free.dev/api/v1";
+const BASE_URL = "https://jam-meetings-centuries-sold.trycloudflare.com/api/v1";
 
 const TIMEOUT_MS      = 15_000;  // 15 s — normal requests
 const UPLOAD_TIMEOUT_MS = 120_000; // 2 min — multipart uploads

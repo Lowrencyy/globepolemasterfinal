@@ -2,6 +2,7 @@ import api from "@/lib/api";
 import { captureEvents } from "@/lib/capture-events";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
+import { pingNow } from "@/lib/location-tracker";
 import { startPoleTeardown } from "@/services/skycable";
 import { useAuth } from "@/context/auth-context";
 import { simpleQueuePush } from "@/lib/simple-queue";
@@ -131,14 +132,12 @@ function getCompletionState({
   photoAfter,
   photoTag,
   slot,
-  landmark,
 }: {
   hasGps: boolean;
   photoBefore: PhotoField;
   photoAfter: PhotoField;
   photoTag: PhotoField;
   slot: string;
-  landmark: string;
 }) {
   const completed = [
     hasGps,
@@ -146,13 +145,12 @@ function getCompletionState({
     !!photoAfter,
     !!photoTag,
     !!slot,
-    !!landmark.trim(),
   ].filter(Boolean).length;
 
   return {
     completed,
-    total: 6,
-    percent: Math.round((completed / 6) * 100),
+    total: 5,
+    percent: Math.round((completed / 5) * 100),
   };
 }
 
@@ -672,33 +670,68 @@ export default function DestinationPoleScreen() {
     // 1. Immediately update local state & cached list to unblock offline progression instantly
     setPoleStartedAt(now);
     const cached = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`).catch(() => null);
+
+    // Assign sequence based on start order: max existing sequence + 1
+    const nextSequence = cached
+      ? cached.reduce((max, p) => Math.max(max, Number(p.sequence) || 0), 0) + 1
+      : 1;
+
     if (cached?.length) {
       const updated = cached.map(p =>
-        String(p.pole_id) === String(params.to_pole_id) ? { ...p, date_start: now } : p
+        String(p.pole_id) === String(params.to_pole_id)
+          ? { ...p, sequence: nextSequence, date_start: now }
+          : p
       );
       await cacheSet(`sitemap_poles_${params.node_id}`, updated).catch(() => {});
     }
 
-    // 2. Transmit active state patch to server; queue payload if connectivity drops
+    // 2. Start teardown on backend — resolve skycable_poles.id (pivot PK) from cache
+    //    The route uses the pivot row ID, not poles.id (FK).
+    const sitemapPoles = await cacheGet<any[]>(`sitemap_poles_${params.node_id}`).catch(() => null);
+    const pivotEntry = sitemapPoles?.find(p => String(p.pole_id) === String(params.to_pole_id));
+    const rowId = pivotEntry?.id ? String(pivotEntry.id) : params.to_pole_id;
+
     try {
-      await api.patch(`/skycable/nodes/${params.node_id}/poles/sync`, {
-        pole_id: Number(params.to_pole_id),
-        date_start: now,
-        status: "in_progress",
-      });
+      await api.put(`/skycable/nodes/${params.node_id}/poles/${rowId}`, { date_start: now });
     } catch (err: any) {
       if (!err?.response?.status) {
         await simpleQueuePush({
-          method: "patch",
-          url: `/skycable/nodes/${params.node_id}/poles/sync`,
-          body: {
-            pole_id: Number(params.to_pole_id),
-            date_start: now,
-            status: "in_progress",
-          },
+          method: "put",
+          url: `/skycable/nodes/${params.node_id}/poles/${rowId}`,
+          body: { date_start: now },
         }).catch(() => {});
       }
     }
+
+    // Update poles.skycable_status directly (this is what the web admin + Navicat shows)
+    api.put(`/skycable/poles/${params.to_pole_id}`, { skycable_status: "in_progress" }).catch(async (err: any) => {
+      if (!err?.response?.status) {
+        await simpleQueuePush({
+          method: "put",
+          url: `/skycable/poles/${params.to_pole_id}`,
+          body: { skycable_status: "in_progress" },
+        }).catch(() => {});
+      } else {
+        Alert.alert("Start Failed", err?.message ?? "Unable to start pole teardown.");
+      }
+    });
+
+    // Sync skycable_poles.status via patch endpoint (fire-and-forget backup)
+    api.patch(`/skycable/nodes/${params.node_id}/poles/sync`, {
+      pole_id: Number(params.to_pole_id),
+      date_start: now,
+      status: "in_progress",
+    }).catch(() => {});
+
+    // Directly update this pole's status on the backend (fire-and-forget)
+    api.put(`/skycable/nodes/${params.node_id}/poles/${params.to_pole_id}`, {
+      status: "in_progress",
+      date_start: now,
+    }).catch(() => {});
+
+    // Ping lineman location — records that the lineman is physically at this destination pole
+    pingNow();
+
     setPoleStarting(false);
   }
 
@@ -719,7 +752,7 @@ export default function DestinationPoleScreen() {
   const captureMapPrefetchedRef = useRef(false);
 
   const hasGps = !!capturedGps;
-  const infoComplete = hasGps && !!slot && !!landmark.trim();
+  const infoComplete = hasGps && !!slot;
 
   // Always allow starting — don't block the user with "complete required fields first"
 
@@ -731,9 +764,8 @@ export default function DestinationPoleScreen() {
         photoAfter,
         photoTag,
         slot,
-        landmark,
       }),
-    [hasGps, photoBefore, photoAfter, photoTag, slot, landmark],
+    [hasGps, photoBefore, photoAfter, photoTag, slot],
   );
 
   useEffect(() => {
@@ -889,9 +921,11 @@ export default function DestinationPoleScreen() {
 
       // Load a photo for this teardown session.
       // Priority 1: teardown_drafts (captured on this screen — always fresh).
-      // Priority 2 (before & tag only): pole_drafts from a previous pole-detail visit.
-      //   → copied into teardown_drafts so submission reads from one place.
-      // After is NEVER reused — each span needs a fresh after photo.
+      // Priority 2: pole_drafts from a previous pole-detail visit for this same pole.
+      //   → If Pole 1 was already a FROM pole (captured before/after/tag in pole-detail),
+      //     all 3 are reused here when Pole 1 becomes a destination on a different span.
+      //   → Copied into teardown_drafts so submission reads from one consistent place.
+      //   → When b+a+t are all found, auto-proceeds to components immediately.
       const load = async (
         tdFile: string,
         pdFile: string | null, // null = never fall back to pole_drafts
@@ -901,10 +935,11 @@ export default function DestinationPoleScreen() {
         if ((tdInfo as any).exists) {
           const viewPath = tdPath.replace(/\.jpg$/i, "_view.jpg");
           const viewInfo = await FileSystem.getInfoAsync(viewPath).catch(() => ({ exists: false }));
+          const chosenPath = (viewInfo as any).exists ? viewPath : tdPath;
           const version = Date.now();
           return {
-            uri: `${(viewInfo as any).exists ? viewPath : tdPath}?v=${version}`,
-            fileUri: tdPath,
+            uri: `${chosenPath}?v=${version}`,
+            fileUri: chosenPath,
             name: tdFile,
             type: "image/jpeg",
             version,
@@ -924,10 +959,11 @@ export default function DestinationPoleScreen() {
               await FileSystem.copyAsync({ from: pdViewPath, to: tdViewPath }).catch(() => {});
             }
             const viewInfo = await FileSystem.getInfoAsync(tdViewPath).catch(() => ({ exists: false }));
+            const chosenPath = (viewInfo as any).exists ? tdViewPath : tdPath;
             const version = Date.now();
             return {
-              uri: `${(viewInfo as any).exists ? tdViewPath : tdPath}?v=${version}`,
-              fileUri: tdPath,
+              uri: `${chosenPath}?v=${version}`,
+              fileUri: chosenPath,
               name: tdFile,
               type: "image/jpeg",
               version,
@@ -1288,14 +1324,18 @@ export default function DestinationPoleScreen() {
     await FileSystem.copyAsync({ from: compressed, to: dest });
 
     // ── Stamped version → _view file on disk + gallery (display + lineman backup) ──
-    let displayUri = dest;
+    let displayUri = dest; // UI display (may be temp file to avoid Android stale file:// cache)
+    let uploadUri = dest;  // stable on-disk URI for backend + draft restore
     if (stampLines?.length) {
       const stamped = await stampPhoto(compressed, stampLines, gpsLat, gpsLng);
       const viewDest = dest.replace(/\.jpg$/i, "_view.jpg");
       const viewExisting = await FileSystem.getInfoAsync(viewDest);
       if ((viewExisting as any).exists) await FileSystem.deleteAsync(viewDest, { idempotent: true });
       await FileSystem.copyAsync({ from: stamped, to: viewDest });
-      displayUri = viewDest;
+      uploadUri = viewDest;
+      // See pole-detail.tsx: overwriting the same *_view.jpg can show stale bytes on Android.
+      // Use the freshly generated stamped temp file for immediate UI display.
+      displayUri = stamped;
       MediaLibrary.requestPermissionsAsync(true)
         .then(({ status }) => {
           if (status === "granted") MediaLibrary.saveToLibraryAsync(stamped).catch(() => {});
@@ -1315,10 +1355,10 @@ export default function DestinationPoleScreen() {
           const existingClean = await FileSystem.getInfoAsync(poleCleanDest);
           if ((existingClean as any).exists) await FileSystem.deleteAsync(poleCleanDest, { idempotent: true });
           await FileSystem.copyAsync({ from: compressed, to: poleCleanDest });
-          if (displayUri !== dest) {
+          if (uploadUri !== dest) {
             const existingView = await FileSystem.getInfoAsync(poleViewDest);
             if ((existingView as any).exists) await FileSystem.deleteAsync(poleViewDest, { idempotent: true });
-            return FileSystem.copyAsync({ from: displayUri, to: poleViewDest });
+            return FileSystem.copyAsync({ from: uploadUri, to: poleViewDest });
           }
         })
         .catch(() => {});
@@ -1327,7 +1367,7 @@ export default function DestinationPoleScreen() {
     const version = Date.now();
     return {
       uri: `${displayUri}?v=${version}`,
-      fileUri: displayUri,
+      fileUri: uploadUri,
       name: fileName,
       type: "image/jpeg",
       version,
@@ -1668,7 +1708,17 @@ export default function DestinationPoleScreen() {
 
       <SafeAreaView style={styles.root} edges={["top"]}>
         <View style={styles.floatingHeader}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+          <TouchableOpacity
+            onPress={() => {
+              // Mark destination pole as recently visited so it floats to the top of the poles list
+              cacheSet(`pole_last_selected_${params.to_pole_id}`, Date.now()).catch(() => {});
+              router.navigate({
+                pathname: "/teardowns/poles" as any,
+                params: { nodeId: params.node_id, nodeName: params.node_name || "", accent: params.accent },
+              });
+            }}
+            style={styles.backBtn}
+          >
             <ChevronLeft size={22} color="#111827" />
           </TouchableOpacity>
           <View style={styles.floatingHeaderText}>
@@ -1978,7 +2028,7 @@ export default function DestinationPoleScreen() {
               right={
                 <View style={[styles.sectionPill, landmark.trim() ? styles.sectionPillSuccess : styles.sectionPillMuted]}>
                   <Text style={[styles.sectionPillText, landmark.trim() ? styles.sectionPillTextSuccess : styles.sectionPillTextMuted]}>
-                    {landmark.trim() ? "Filled" : "Required"}
+                    {landmark.trim() ? "Filled" : "Optional"}
                   </Text>
                 </View>
               }
@@ -1998,7 +2048,7 @@ export default function DestinationPoleScreen() {
           <View style={styles.sectionCard}>
             <SectionHeading
               title="Pole Photos"
-              subtitle={infoComplete ? "Click a card to capture · tap again to view" : "Fill GPS, Slot & Landmark first"}
+              subtitle={infoComplete ? "Click a card to capture · tap again to view" : "Fill GPS & Slot first"}
             />
             <View style={styles.photoTileRow}>
               <PhotoTile

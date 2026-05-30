@@ -61,6 +61,7 @@ export type ImageQueueEntry = {
     node_id?: string;
     pole_code?: string;
     image_type?: string;
+    to_pole_id?: string;
   };
   status: SyncStatus;
   retryCount: number;
@@ -372,11 +373,14 @@ export async function processImageQueue(): Promise<void> {
       if (!info.exists) throw new Error(`Image file missing: ${img.uri}`);
 
       const form = new FormData();
-      if (img.meta.report_id) form.append("report_id",   img.meta.report_id);
-      if (img.meta.pole_id)   form.append("pole_id",     img.meta.pole_id);
-      if (img.meta.node_id)   form.append("node_id",     img.meta.node_id);
-      if (img.meta.pole_code) form.append("pole_code",   img.meta.pole_code);
-      if (img.meta.image_type) form.append("image_type", img.meta.image_type);
+      if (img.meta.report_id)  form.append("report_id",   img.meta.report_id);
+      if (img.meta.pole_id)    form.append("pole_id",     img.meta.pole_id);
+      if (img.meta.node_id)    form.append("node_id",     img.meta.node_id);
+      if (img.meta.pole_code)  form.append("pole_code",   img.meta.pole_code);
+      if (img.meta.image_type) form.append("image_type",  img.meta.image_type);
+      if (img.meta.image_type === "bunching" && img.meta.to_pole_id) {
+        form.append("to_pole_id", img.meta.to_pole_id);
+      }
       form.append("inventory_type", "skycable");
       form.append("idempotency_key", `${img.reportLocalId}_${img.fieldName}`);
       form.append("image", { uri: img.uri, name: `${img.fieldName}.jpg`, type: "image/jpeg" } as any);

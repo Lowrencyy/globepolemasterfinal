@@ -25,7 +25,6 @@ export interface SkycableNode {
   subcontractor_id?: number | null;
   team?: { id: number; name: string } | null;
   subcontractor?: { id: number; name: string } | null;
-  // Teardown session fields
   date_start?: string | null;
   due_date?: string | null;
   date_finished?: string | null;
@@ -86,9 +85,16 @@ export const startPoleTeardown = async (nodeId: number, poleId: number, token: s
   await api.request(`/skycable/nodes/${nodeId}/poles/${poleId}`, { method: "PUT", body: JSON.stringify({ date_start: dateStart }) }, token);
 };
 
-// ─── Delivery / Warehouse types ──────────────────────────────────────────────
-// Source of truth: GET /skycable/teardowns returns TeardownLog records.
-// Each completed teardown has the actual collected quantities already recorded.
+// ─── Teardown Log types ───────────────────────────────────────────────────────
+// Source of truth: GET /skycable/teardowns returns SkycableTeardownReport records.
+
+export interface TeardownPhoto {
+  id: number;
+  photo_type: "before" | "after" | "pole_tag" | "bunching" | "supporting"
+    | "from_before" | "from_after" | "from_pole_tag"
+    | "to_before"   | "to_after"   | "to_pole_tag";
+  image_path: string;
+}
 
 export interface TeardownLog {
   id: number;
@@ -103,79 +109,43 @@ export interface TeardownLog {
   ps_housing_collected: number;
   start_time: string;
   end_time: string | null;
-  team?: { id: number; name: string } | null;
-  span?: { span_code?: string | null; node?: { id: number; name: string } | null } | null;
+  notes?: string | null;
+  team?: { id: number; name: string; subcontractor_id?: number | null; subcontractor?: { id: number; name: string } | null } | null;
+  span?: {
+    span_code?: string | null;
+    node?: { id: number; name: string } | null;
+    fromPole?: { pole?: { pole_code?: string; lat?: string | null; lng?: string | null } } | null;
+    toPole?:   { pole?: { pole_code?: string; lat?: string | null; lng?: string | null } } | null;
+  } | null;
+  lineman?: { id: number; first_name: string; last_name: string } | null;
+  photos?: TeardownPhoto[];
+  subcontractor_id?: number | null;
+  team_id?: number | null;
+  captured_lat?: number | string | null;
+  captured_lng?: number | string | null;
 }
 
-// Warehouse staging flow:
-// submitted → at_subcon_warehouse → in_transit → at_warehouse → processing → final_warehouse → sold | pulled_out
-export type DeliveryStatus =
-  | "submitted"
-  | "at_subcon_warehouse"
-  | "in_transit"
-  | "at_warehouse"
-  | "processing"
-  | "final_warehouse"
-  | "sold"
-  | "pulled_out";
-
-export const DELIVERY_STATUS_LABELS: Record<DeliveryStatus, string> = {
-  submitted:           "Submitted",
-  at_subcon_warehouse: "At Subcon Warehouse",
-  in_transit:          "In Transit",
-  at_warehouse:        "At Warehouse",
-  processing:          "Processing",
-  final_warehouse:     "Final Warehouse",
-  sold:                "Sold",
-  pulled_out:          "Pulled Out",
+/** GET /skycable/teardowns — all teardown logs (filter by node_id, date etc.) */
+export const getTeardownLogs = async (token: string): Promise<TeardownLog[]> => {
+  const res = await api.request<TeardownLog[] | { data: TeardownLog[] }>(
+    "/skycable/teardowns?per_page=500", {}, token
+  );
+  return Array.isArray(res) ? res : (res as any)?.data ?? [];
 };
 
-export const DELIVERY_STATUS_COLORS: Record<DeliveryStatus, string> = {
-  submitted:           "#64748b",
-  at_subcon_warehouse: "#0b6cff",
-  in_transit:          "#f59e0b",
-  at_warehouse:        "#8b5cf6",
-  processing:          "#06b6d4",
-  final_warehouse:     "#059669",
-  sold:                "#10b981",
-  pulled_out:          "#ef4444",
-};
-
-// One entry per movement in the chain of custody
-export interface DeliveryMovement {
-  id: number;
-  delivery_id: number;
-  from_stage: string | null;
-  to_stage: string;
-  location_name: string;
-  notes?: string | null;
-  moved_by?: { id: number; name: string } | null;
-  timestamp: string;
+/** Filter teardown logs to a specific PHT date (yyyy-mm-dd) */
+export function filterLogsByDate(logs: TeardownLog[], date: string): TeardownLog[] {
+  return logs.filter(l => {
+    const ts = l.end_time ?? l.start_time;
+    if (!ts) return false;
+    const pht = new Date(new Date(ts).getTime() + 8 * 3600 * 1000);
+    return pht.toISOString().slice(0, 10) === date;
+  });
 }
 
-export interface TeardownDelivery {
-  id: number;
-  token: string;           // e.g. TDL-20260519-A3F2
-  date: string;
-  status: DeliveryStatus;
-  current_location?: string | null;
-  total_cable: number;
-  total_node: number;
-  total_amplifier: number;
-  total_extender: number;
-  total_tsc: number;
-  total_psu: number;
-  total_psu_case: number;
-  teardown_count: number;
-  notes?: string | null;
-  team?: { id: number; name: string } | null;
-  submitted_by?: { id: number; name: string } | null;
-  movements?: DeliveryMovement[];
-  created_at?: string;
-  updated_at?: string;
-}
+// ─── Collected totals helpers ─────────────────────────────────────────────────
 
-export interface DeliveryTotals {
+export interface CollectedTotals {
   cable: number;
   node: number;
   amplifier: number;
@@ -185,45 +155,230 @@ export interface DeliveryTotals {
   psuCase: number;
 }
 
-/** Aggregate actual collected quantities from teardown logs for a given date */
-export function calcDeliveryTotals(logs: TeardownLog[]): DeliveryTotals {
+// calcDeliveryTotals and sumTeardownLogs are identical — kept both names for compat
+export function calcDeliveryTotals(logs: TeardownLog[]): CollectedTotals {
   return logs.reduce(
     (acc, l) => {
-      acc.cable     += l.actual_cable          ?? 0;
-      acc.node      += l.nodes_collected       ?? 0;
-      acc.amplifier += l.amplifiers_collected  ?? 0;
-      acc.extender  += l.extenders_collected   ?? 0;
-      acc.tsc       += l.tsc_collected         ?? 0;
-      acc.psu       += l.powersupply_collected ?? 0;
-      acc.psuCase   += l.ps_housing_collected  ?? 0;
+      acc.cable     += Number(l.actual_cable          ?? 0);
+      acc.node      += Number(l.nodes_collected       ?? 0);
+      acc.amplifier += Number(l.amplifiers_collected  ?? 0);
+      acc.extender  += Number(l.extenders_collected   ?? 0);
+      acc.tsc       += Number(l.tsc_collected         ?? 0);
+      acc.psu       += Number(l.powersupply_collected ?? 0);
+      acc.psuCase   += Number(l.ps_housing_collected  ?? 0);
       return acc;
     },
     { cable: 0, node: 0, amplifier: 0, extender: 0, tsc: 0, psu: 0, psuCase: 0 }
   );
 }
 
-/** Filter teardown logs to a specific PHT date (yyyy-mm-dd) */
-export function filterLogsByDate(logs: TeardownLog[], date: string): TeardownLog[] {
-  return logs.filter(l => {
-    const ts = l.end_time ?? l.start_time;
-    if (!ts) return false;
-    // Convert UTC ISO to PHT (UTC+8) date
-    const pht = new Date(new Date(ts).getTime() + 8 * 3600 * 1000);
-    return pht.toISOString().slice(0, 10) === date;
-  });
+export const sumTeardownLogs = calcDeliveryTotals;
+
+// ─── Warehouse types ──────────────────────────────────────────────────────────
+
+export interface Warehouse {
+  id: number;
+  name: string;
+  location?: string | null;
+  type?: string | null;
+  subcontractor_id?: number | null;
+  lat?: number | null;
+  lng?: number | null;
+  subcontractor?: { id: number; name: string } | null;
+  stocks?: WarehouseStock[];
 }
 
-/** GET /skycable/teardowns — all teardown logs (filter by date client-side) */
-export const getTeardownLogs = async (token: string): Promise<TeardownLog[]> => {
-  const res = await api.request<TeardownLog[] | { data: TeardownLog[] }>(
-    "/skycable/teardowns?per_page=500", {}, token
-  );
-  return Array.isArray(res) ? res : (res as any)?.data ?? [];
+export interface WarehouseStock {
+  id: number;
+  warehouse_id: number;
+  item_type: "node" | "amplifier" | "extender" | "tsc" | "cable" | "powersupply";
+  quantity: number;
+  unit: string;
+}
+
+// ─── Warehouse Receipt types ──────────────────────────────────────────────────
+// POST /skycable/warehouse-receipts — field staff submits collected items to a warehouse
+// PUT  /skycable/warehouse-receipts/{id}/approve — warehouse in-charge approves → stocks++
+
+export interface WarehouseReceiptItem {
+  id: number;
+  receipt_id: number;
+  item_type: string;
+  quantity: number;
+  unit: string;
+}
+
+export interface WarehouseReceipt {
+  id: number;
+  warehouse_id: number;
+  subcontractor_id?: number | null;
+  node_id?: number | null;
+  received_by?: number | null;
+  receipt_date: string;            // yyyy-mm-dd
+  status: "pending" | "arrived" | "approved" | "rejected";
+  approved_by?: number | null;
+  notes?: string | null;
+  submitted_lat?: number | null;
+  submitted_lng?: number | null;
+  items?: WarehouseReceiptItem[];
+  node?: { id: number; name: string } | null;
+  warehouse?: Warehouse | null;
+  receivedBy?: { id: number; name: string } | null;
+  approvedBy?: { id: number; name: string } | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Convert totals to receipt items array (skips zero quantities) */
+export function totalsToReceiptItems(
+  totals: CollectedTotals
+): { item_type: string; quantity: number; unit: string }[] {
+  return [
+    { item_type: "cable",       quantity: totals.cable,     unit: "m"   },
+    { item_type: "node",        quantity: totals.node,      unit: "pcs" },
+    { item_type: "amplifier",   quantity: totals.amplifier, unit: "pcs" },
+    { item_type: "extender",    quantity: totals.extender,  unit: "pcs" },
+    { item_type: "tsc",         quantity: totals.tsc,       unit: "pcs" },
+    { item_type: "powersupply", quantity: totals.psu,       unit: "pcs" },
+  ].filter(i => i.quantity > 0);
+}
+
+/** POST /skycable/warehouse-receipts */
+export const createWarehouseReceipt = async (
+  token: string,
+  payload: {
+    warehouse_id: number;
+    node_id?: number | null;
+    subcontractor_id?: number | null;
+    receipt_date: string;
+    items: { item_type: string; quantity: number; unit: string }[];
+    submitted_lat?: number | null;
+    submitted_lng?: number | null;
+  }
+): Promise<WarehouseReceipt> => {
+  return api.request<WarehouseReceipt>("/skycable/warehouse-receipts", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, token);
 };
 
-// ─── Backend-native delivery / warehouse types ───────────────────────────────
+/** PUT /skycable/warehouse-receipts/{id}/approve */
+export const approveWarehouseReceipt = async (
+  token: string,
+  receiptId: number,
+  action: "approve" | "reject"
+): Promise<WarehouseReceipt> => {
+  return api.request<WarehouseReceipt>(`/skycable/warehouse-receipts/${receiptId}/approve`, {
+    method: "PUT",
+    body: JSON.stringify({ action }),
+  }, token);
+};
 
-/** One line-item inside a dispatched delivery */
+/** PUT /skycable/warehouse-receipts/{id}/arrive — mark receipt as arrived at warehouse */
+export const markWarehouseReceiptArrived = async (
+  token: string,
+  receiptId: number
+): Promise<WarehouseReceipt> => {
+  return api.request<WarehouseReceipt>(`/skycable/warehouse-receipts/${receiptId}/arrive`, {
+    method: "PUT",
+  }, token);
+};
+
+/** GET /skycable/warehouse-receipts/{id} */
+export const getWarehouseReceiptById = async (
+  token: string,
+  receiptId: number
+): Promise<WarehouseReceipt> => {
+  return api.request<WarehouseReceipt>(`/skycable/warehouse-receipts/${receiptId}`, {}, token);
+};
+
+/** POST /skycable/warehouse-receipts/{id}/verify — warehouse in-charge confirms quantities + attaches proof */
+export const verifyWarehouseReceipt = async (
+  token: string,
+  receiptId: number,
+  payload: {
+    items: { item_type: string; quantity: number }[];
+    notes?: string;
+    proof_image?: { uri: string; name: string; type: string };
+  }
+): Promise<WarehouseReceipt> => {
+  const form = new FormData();
+  payload.items.forEach((it, i) => {
+    form.append(`items[${i}][item_type]`, it.item_type);
+    form.append(`items[${i}][quantity]`, String(it.quantity));
+  });
+  if (payload.notes) form.append("notes", payload.notes);
+  if (payload.proof_image) {
+    form.append("proof_image", payload.proof_image as unknown as Blob);
+  }
+  return api.request<WarehouseReceipt>(`/skycable/warehouse-receipts/${receiptId}/verify`, {
+    method: "POST",
+    body: form,
+  }, token);
+};
+
+/** GET /skycable/warehouses/{warehouse}/receipts */
+export const getWarehouseReceipts = async (
+  token: string,
+  warehouseId: number,
+  status?: string
+): Promise<WarehouseReceipt[]> => {
+  const qs = status ? `?status=${status}&per_page=200` : "?per_page=200";
+  try {
+    const res = await api.request<WarehouseReceipt[] | { data: WarehouseReceipt[] }>(
+      `/skycable/warehouses/${warehouseId}/receipts${qs}`, {}, token
+    );
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** PUT /skycable/warehouses/{id} — update warehouse (name, sqm, status, lat, lng) */
+export const updateWarehouse = async (
+  token: string,
+  warehouseId: number,
+  payload: { name?: string; sqm?: number | null; status?: "active" | "inactive"; lat?: number | null; lng?: number | null }
+): Promise<Warehouse> => {
+  return api.request<Warehouse>(`/skycable/warehouses/${warehouseId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  }, token);
+};
+
+/** GET /skycable/warehouses */
+export const getWarehouses = async (token: string): Promise<Warehouse[]> => {
+  try {
+    const res = await api.request<Warehouse[] | { data: Warehouse[] }>("/skycable/warehouses", {}, token);
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** GET /skycable/warehouses/:id/stocks */
+export const getWarehouseStocks = async (token: string, warehouseId: number): Promise<WarehouseStock[]> => {
+  try {
+    const res = await api.request<WarehouseStock[] | { data: WarehouseStock[] }>(
+      `/skycable/warehouses/${warehouseId}/stocks`, {}, token
+    );
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** Convert WarehouseStock array → CollectedTotals for display */
+export function stocksToTotals(stocks: WarehouseStock[]): CollectedTotals {
+  const t: CollectedTotals = { cable: 0, node: 0, amplifier: 0, extender: 0, tsc: 0, psu: 0, psuCase: 0 };
+  for (const s of stocks) {
+    if (s.item_type === "cable")      t.cable     += Number(s.quantity ?? 0);
+    if (s.item_type === "node")       t.node      += Number(s.quantity ?? 0);
+    if (s.item_type === "amplifier")  t.amplifier += Number(s.quantity ?? 0);
+    if (s.item_type === "extender")   t.extender  += Number(s.quantity ?? 0);
+    if (s.item_type === "tsc")        t.tsc       += Number(s.quantity ?? 0);
+    if (s.item_type === "powersupply")t.psu       += Number(s.quantity ?? 0);
+  }
+  return t;
+}
+
+// ─── Warehouse-to-Warehouse Delivery types (pickup request → dispatch → accept) ─
+// These are INTERNAL warehouse transfers, not teardown submissions.
+
 export interface DeliveryItem {
   id: number;
   delivery_id: number;
@@ -232,7 +387,6 @@ export interface DeliveryItem {
   unit: string;
 }
 
-/** A dispatched delivery as the backend actually returns it */
 export interface BackendDelivery {
   id: number;
   pickup_request_id: number;
@@ -250,7 +404,6 @@ export interface BackendDelivery {
   updated_at?: string;
 }
 
-/** A pickup request */
 export interface PickupRequest {
   id: number;
   from_warehouse_id: number;
@@ -258,69 +411,13 @@ export interface PickupRequest {
   requested_by?: number | null;
   approved_by?: number | null;
   approved_at?: string | null;
-  status: "pending" | "approved" | "cancelled";
+  status: "pending" | "approved" | "dispatched" | "cancelled";
   notes?: string | null;
   created_at?: string;
   updated_at?: string;
 }
 
-/** Current inventory for one item type in a warehouse */
-export interface WarehouseStock {
-  id: number;
-  warehouse_id: number;
-  item_type: "node" | "amplifier" | "extender" | "tsc" | "cable" | "powersupply";
-  quantity: number;
-  unit: string;
-}
-
-export interface Warehouse {
-  id: number;
-  name: string;
-  location?: string | null;
-}
-
-// ─── Summable totals derived from TeardownLog records ────────────────────────
-export interface CollectedTotals {
-  cable: number;      // actual_cable (meters)
-  node: number;       // nodes_collected
-  amplifier: number;  // amplifiers_collected
-  extender: number;   // extenders_collected
-  tsc: number;        // tsc_collected
-  psu: number;        // powersupply_collected
-  psuCase: number;    // ps_housing_collected
-}
-
-export function sumTeardownLogs(logs: TeardownLog[]): CollectedTotals {
-  return logs.reduce(
-    (acc, l) => {
-      acc.cable     += Number(l.actual_cable          ?? 0);
-      acc.node      += Number(l.nodes_collected       ?? 0);
-      acc.amplifier += Number(l.amplifiers_collected  ?? 0);
-      acc.extender  += Number(l.extenders_collected   ?? 0);
-      acc.tsc       += Number(l.tsc_collected         ?? 0);
-      acc.psu       += Number(l.powersupply_collected ?? 0);
-      acc.psuCase   += Number(l.ps_housing_collected  ?? 0);
-      return acc;
-    },
-    { cable: 0, node: 0, amplifier: 0, extender: 0, tsc: 0, psu: 0, psuCase: 0 }
-  );
-}
-
-// Convert a WarehouseStock array → CollectedTotals for display
-export function stocksToTotals(stocks: WarehouseStock[]): CollectedTotals {
-  const t: CollectedTotals = { cable: 0, node: 0, amplifier: 0, extender: 0, tsc: 0, psu: 0, psuCase: 0 };
-  for (const s of stocks) {
-    if (s.item_type === "cable")      t.cable     += Number(s.quantity ?? 0);
-    if (s.item_type === "node")       t.node      += Number(s.quantity ?? 0);
-    if (s.item_type === "amplifier")  t.amplifier += Number(s.quantity ?? 0);
-    if (s.item_type === "extender")   t.extender  += Number(s.quantity ?? 0);
-    if (s.item_type === "tsc")        t.tsc       += Number(s.quantity ?? 0);
-    if (s.item_type === "powersupply")t.psu       += Number(s.quantity ?? 0);
-  }
-  return t;
-}
-
-/** GET /skycable/deliveries — backend-native dispatched deliveries */
+/** GET /skycable/deliveries — warehouse-to-warehouse transfers */
 export const getBackendDeliveries = async (token: string, status?: string): Promise<BackendDelivery[]> => {
   const qs = status ? `?status=${status}&per_page=500` : "?per_page=500";
   try {
@@ -342,42 +439,14 @@ export const getPickupRequests = async (token: string, status?: string): Promise
   } catch { return []; }
 };
 
-/** GET /skycable/warehouses */
-export const getWarehouses = async (token: string): Promise<Warehouse[]> => {
-  try {
-    const res = await api.request<Warehouse[] | { data: Warehouse[] }>("/skycable/warehouses", {}, token);
-    return Array.isArray(res) ? res : (res as any)?.data ?? [];
-  } catch { return []; }
-};
-
-/** GET /skycable/warehouses/:id/stocks */
-export const getWarehouseStocks = async (token: string, warehouseId: number): Promise<WarehouseStock[]> => {
-  try {
-    const res = await api.request<WarehouseStock[] | { data: WarehouseStock[] }>(
-      `/skycable/warehouses/${warehouseId}/stocks`, {}, token
-    );
-    return Array.isArray(res) ? res : (res as any)?.data ?? [];
-  } catch { return []; }
-};
-
-/** PUT /skycable/deliveries/:id/accept — receive delivery at destination warehouse (photo required) */
-export const acceptDelivery = async (
-  token: string,
-  deliveryId: number,
-  photoUri: string,
-  notes?: string
-): Promise<void> => {
-  const form = new FormData();
-  form.append("notes", notes ?? "");
-  form.append("received_photo", { uri: photoUri, type: "image/jpeg", name: "received_photo.jpg" } as any);
-  await api.request(`/skycable/deliveries/${deliveryId}/accept`, {
+/** PUT /skycable/deliveries/{id}/accept — accept a warehouse-to-warehouse delivery */
+export const acceptDelivery = async (token: string, deliveryId: number): Promise<BackendDelivery> => {
+  return api.request<BackendDelivery>(`/skycable/deliveries/${deliveryId}/accept`, {
     method: "PUT",
-    body: form,
-    headers: { "Content-Type": "multipart/form-data" },
   }, token);
 };
 
-/** POST /skycable/pickup-requests — request transfer of items to another warehouse */
+/** POST /skycable/pickup-requests */
 export const createPickupRequest = async (
   token: string,
   payload: { from_warehouse_id: number; to_warehouse_id: number; notes?: string }
@@ -388,101 +457,19 @@ export const createPickupRequest = async (
   }, token);
 };
 
-/** PUT /skycable/pickup-requests/:id/approve — approve a pickup request */
-export const approvePickupRequest = async (token: string, id: number): Promise<void> => {
-  await api.request(`/skycable/pickup-requests/${id}/approve`, { method: "PUT" }, token);
-};
-
-/** GET /skycable/deliveries — legacy alias (kept for delivery/index.tsx) */
-export const getDeliveries = async (token: string, date?: string): Promise<TeardownDelivery[]> => {
-  const qs = date ? `?date=${date}` : "";
-  try {
-    const res = await api.request<TeardownDelivery[] | { data: TeardownDelivery[] }>(
-      `/skycable/deliveries${qs}`, {}, token
-    );
-    return Array.isArray(res) ? res : (res as any)?.data ?? [];
-  } catch {
-    return [];
-  }
-};
-
-/** Generate a unique human-readable tracking token for a delivery batch */
-export function generateDeliveryToken(date: string): string {
-  const compact = date.replace(/-/g, "");                              // 20260519
-  const rand = Math.random().toString(36).slice(2, 6).toUpperCase();  // A3F2
-  return `TDL-${compact}-${rand}`;
-}
-
-/** POST /skycable/deliveries — submit today's teardown as a warehouse delivery */
-export const submitDelivery = async (
+/** PUT /skycable/pickup-requests/:id/approve */
+export const approvePickupRequest = async (
   token: string,
-  payload: {
-    token: string;
-    date: string;
-    teardown_log_ids: number[];
-    totals: DeliveryTotals;
-    notes?: string | null;
-  }
-): Promise<TeardownDelivery> => {
-  return api.request<TeardownDelivery>("/skycable/deliveries", {
-    method: "POST",
-    body: JSON.stringify({
-      token:               payload.token,
-      date:                payload.date,
-      teardown_log_ids:    payload.teardown_log_ids,
-      total_cable:         payload.totals.cable,
-      total_node:          payload.totals.node,
-      total_amplifier:     payload.totals.amplifier,
-      total_extender:      payload.totals.extender,
-      total_tsc:           payload.totals.tsc,
-      total_psu:           payload.totals.psu,
-      total_psu_case:      payload.totals.psuCase,
-      notes:               payload.notes ?? null,
-    }),
+  id: number,
+  action: "approve" | "reject"
+): Promise<PickupRequest> => {
+  return api.request<PickupRequest>(`/skycable/pickup-requests/${id}/approve`, {
+    method: "PUT",
+    body: JSON.stringify({ action }),
   }, token);
 };
 
-/**
- * POST /skycable/deliveries/:id/move
- * Advance a delivery to the next warehouse/stage in the chain.
- */
-export const moveDelivery = async (
-  token: string,
-  deliveryId: number,
-  payload: { to_stage: DeliveryStatus; location_name: string; notes?: string | null }
-): Promise<TeardownDelivery> => {
-  return api.request<TeardownDelivery>(`/skycable/deliveries/${deliveryId}/move`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  }, token);
-};
-
-/**
- * POST /skycable/deliveries/:id/sold
- * Mark delivery as sold/distributed at final stage.
- */
-export const markDeliverySold = async (token: string, deliveryId: number, notes?: string): Promise<void> => {
-  await api.request(`/skycable/deliveries/${deliveryId}/sold`, {
-    method: "POST",
-    body: JSON.stringify({ notes: notes ?? null }),
-  }, token);
-};
-
-/**
- * POST /skycable/deliveries/:id/pullout
- * Mark delivery as pulled out / returned.
- */
-export const markDeliveryPullout = async (token: string, deliveryId: number, notes?: string): Promise<void> => {
-  await api.request(`/skycable/deliveries/${deliveryId}/pullout`, {
-    method: "POST",
-    body: JSON.stringify({ notes: notes ?? null }),
-  }, token);
-};
-
-/** POST /skycable/deliveries/:id/approve — warehouse in-charge receives delivery at subcon warehouse */
-export const approveDelivery = async (token: string, deliveryId: number): Promise<void> => {
-  await api.request(`/skycable/deliveries/${deliveryId}/approve`, { method: "POST" }, token);
-};
+// ─── Sitemap download ─────────────────────────────────────────────────────────
 
 export const downloadSitemapData = async (token: string): Promise<boolean> => {
   try {
@@ -495,7 +482,6 @@ export const downloadSitemapData = async (token: string): Promise<boolean> => {
       const nodes = nodesRes.data;
       await cacheSet(`sitemap_nodes_${area.id}`, nodes);
 
-      // Download poles in small chunks to avoid overwhelming the network
       const chunkSize = 5;
       for (let i = 0; i < nodes.length; i += chunkSize) {
         const chunk = nodes.slice(i, i + chunkSize);
@@ -504,7 +490,7 @@ export const downloadSitemapData = async (token: string): Promise<boolean> => {
             try {
               const poles = await getNodePoles(node.id, token);
               await cacheSet(`sitemap_poles_${node.id}`, poles);
-            } catch (e) {
+            } catch {
               console.warn(`Failed to cache poles for node ${node.id}`);
             }
           })

@@ -2,6 +2,7 @@ import { useAuth } from "@/context/auth-context";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getTileUri, networkUrl } from "@/lib/tile-cache";
 import { getNodes, SkycableNode, SkycablePole } from "@/services/skycable";
+import { shouldRefresh, markSynced, lockSync, unlockSync } from "@/lib/sync-guard";
 
 function TileImage({ z, y, x, style }: { z: number; y: number; x: number; style: any }) {
   const [uri, setUri] = useState(() => networkUrl(z, y, x));
@@ -263,13 +264,20 @@ export default function NodesScreen() {
       if (cached?.length) setNodes(cached);
       setLoading(false); // Always unblock UI after cache check
 
+      const GUARD_KEY = `nodes_${areaId}_${teamId ?? 0}`;
+      const stale = await shouldRefresh(GUARD_KEY, 5 * 60 * 1000);
+      if (!stale && cached?.length) return;
+      if (!lockSync(GUARD_KEY)) return;
       try {
         const response = await getNodes(Number(areaId), token, teamId);
         setNodes(response.data);
         cacheSet(CACHE_KEY, response.data).catch(() => {});
+        await markSynced(GUARD_KEY);
         setOffline(false);
       } catch {
         if (!cached?.length) setOffline(true);
+      } finally {
+        unlockSync(GUARD_KEY);
       }
     }
     loadNodes();

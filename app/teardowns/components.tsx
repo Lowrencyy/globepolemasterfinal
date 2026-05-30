@@ -7,6 +7,8 @@ import * as FileSystem from "expo-file-system/legacy";
 import { Image as ExpoImage } from "expo-image";
 import * as ImagePicker from "expo-image-picker";
 import * as Location from "expo-location";
+import { captureEvents } from "@/lib/capture-events";
+import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
 import {
   Stack,
   router,
@@ -85,13 +87,17 @@ setTimeout(function(){map.invalidateSize();},120);
 </body></html>`;
 }
 
-export function buildPoleMapHtml(lat: number, lng: number, accentColor: string, satellite = false) {
+export function buildPoleMapHtml(lat: number, lng: number, accentColor: string, satellite = false, poleCode = "") {
   const tileUrl = satellite
     ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
     : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
   const tileOpts = satellite
     ? 'maxZoom:19,attribution:""'
     : 'subdomains:"abcd",maxZoom:20,attribution:""';
+  const safeName = poleCode.replace(/'/g, "\\'").replace(/</g, "&lt;");
+  const labelHtml = safeName
+    ? `<div class="pole-label">${safeName}</div>`
+    : '';
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -117,6 +123,19 @@ html,body,#map{width:100%;height:100%;background:#0d1117;}
   border:2.5px solid #fff;
   box-shadow:0 2px 8px rgba(0,0,0,0.5);
 }
+.pole-label{
+  margin-top:5px;
+  background:rgba(0,0,0,0.72);
+  color:#fff;
+  font-size:11px;
+  font-weight:700;
+  font-family:system-ui,-apple-system,sans-serif;
+  padding:3px 8px;
+  border-radius:6px;
+  white-space:nowrap;
+  letter-spacing:0.3px;
+  border:1px solid rgba(255,255,255,0.15);
+}
 @keyframes ring-pulse{
   0%{box-shadow:0 0 0 0 ${accentColor}55;}
   70%{box-shadow:0 0 0 16px ${accentColor}00;}
@@ -141,9 +160,9 @@ L.tileLayer('${tileUrl}',{${tileOpts}}).addTo(map);
 
 var icon=L.divIcon({
   className:'',
-  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div></div>',
-  iconSize:[36,36],
-  iconAnchor:[18,18]
+  html:'<div class="pin-wrap"><div class="pin-ring"><div class="pin-dot"></div></div>${labelHtml}</div>',
+  iconSize:[120,${safeName ? 60 : 36}],
+  iconAnchor:[60,18]
 });
 
 L.marker([${lat},${lng}],{icon:icon}).addTo(map);
@@ -578,11 +597,151 @@ function StaticSpanMapView({
   );
 }
 
+// ── Shared stamp HTML (used for bunching photo metadata overlay) ────────────
+export const STAMP_HTML = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#000"><canvas id="c"></canvas><script>
+function rr(ctx,x,y,w,h,r){
+  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
+}
+function drawStamp(ctx,img,lines,mapB64,mapDotX,mapDotY,mapTiles){
+  var W=img.width,H=img.height;
+  var gap=Math.round(W*0.012);
+  var fSize=Math.min(Math.max(14,Math.round(W*0.020)),Math.floor((H*0.22)/(lines.length*1.55+1.5)));
+  var lh=Math.round(fSize*1.55);
+  var vPad=Math.round(fSize*0.9);
+  var hPad=Math.round(fSize*0.75);
+  var panelH=lines.length*lh+vPad*2;
+  var r=Math.round(panelH*0.14);
+  var mapSize=(mapB64||(mapTiles&&mapTiles.length))?panelH:0;
+  var textW=W-gap*2-mapSize-(mapSize?gap:0);
+  var panelY=H-panelH-gap;
+  var mapY=panelY;
+  var fadeH=panelH+gap*4;
+  var grad=ctx.createLinearGradient(0,H-fadeH,0,H);
+  grad.addColorStop(0,'rgba(0,0,0,0)');grad.addColorStop(1,'rgba(0,0,0,0.38)');
+  ctx.fillStyle=grad;ctx.fillRect(0,H-fadeH,W,fadeH);
+  function drawTextPanel(){
+    ctx.save();rr(ctx,gap,panelY,textW,panelH,r);
+    ctx.fillStyle='rgba(0,0,0,0.52)';ctx.fill();ctx.restore();
+    ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=3;
+    var startY=panelY+(panelH-lines.length*lh)/2;
+    lines.forEach(function(line,i){
+      var y=startY+(i+0.78)*lh;
+      var maxW=textW-hPad*2;
+      if(i===0){ctx.font='bold '+Math.round(fSize*1.05)+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
+      else if(i===lines.length-1){ctx.font=Math.round(fSize*0.84)+'px Arial,sans-serif';ctx.fillStyle='rgba(255,255,255,0.72)';}
+      else{ctx.font='bold '+fSize+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
+      var txt=line;while(ctx.measureText(txt).width>maxW&&txt.length>4)txt=txt.slice(0,-2);
+      if(txt!==line)txt=txt.slice(0,-1)+'…';
+      ctx.fillText(txt,gap+hPad,y);
+    });
+    ctx.shadowBlur=0;
+  }
+  function drawMapPanel(mapImgs){
+    var mx=gap+textW+gap,my=mapY;
+    ctx.save();rr(ctx,mx,my,mapSize,mapSize,r);ctx.clip();
+    var dotFX=(mapDotX!=null&&!isNaN(mapDotX))?mapDotX:0.5;
+    var dotFY=(mapDotY!=null&&!isNaN(mapDotY))?mapDotY:0.5;
+    if(Array.isArray(mapImgs)){
+      mapImgs.forEach(function(t){
+        if(!t||!t.img)return;
+        var dx=Number(t.dx)||0,dy=Number(t.dy)||0;
+        ctx.drawImage(t.img,mx+(dx+0.5-dotFX)*mapSize,my+(dy+0.5-dotFY)*mapSize,mapSize,mapSize);
+      });
+    }else if(mapImgs){
+      ctx.drawImage(mapImgs,mx+(0.5-dotFX)*mapSize,my+(0.5-dotFY)*mapSize,mapSize,mapSize);
+    }
+    ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(mx,my,mapSize,mapSize);
+    var dotR=Math.round(mapSize*0.07);
+    var dX=mx+mapSize/2,dY=my+mapSize/2;
+    ctx.beginPath();ctx.arc(dX,dY,dotR,0,2*Math.PI);
+    ctx.fillStyle='#EF4444';ctx.fill();
+    ctx.strokeStyle='#FFFFFF';ctx.lineWidth=Math.max(2,Math.round(dotR*0.35));ctx.stroke();
+    ctx.restore();
+  }
+  function finish(){
+    var b64=document.getElementById('c').toDataURL('image/jpeg',0.93).split(',')[1];
+    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
+  }
+  function loadMapImages(cb){
+    var tilePayload=Array.isArray(mapTiles)?mapTiles.filter(function(t){return t&&t.b64;}):[];
+    if(tilePayload.length){
+      var loaded=[],pending=tilePayload.length;
+      tilePayload.forEach(function(t){
+        var im=new Image();
+        im.onload=function(){loaded.push({img:im,dx:Number(t.dx)||0,dy:Number(t.dy)||0});if(--pending===0)cb(loaded.length?loaded:null);};
+        im.onerror=function(){if(--pending===0)cb(loaded.length?loaded:null);};
+        im.src='data:image/png;base64,'+t.b64;
+      });
+      return;
+    }
+    if(mapB64){var mapImg=new Image();mapImg.onload=function(){cb(mapImg);};mapImg.onerror=function(){cb(null);};mapImg.src='data:image/png;base64,'+mapB64;return;}
+    cb(null);
+  }
+  if(mapSize>0&&(mapB64||(mapTiles&&mapTiles.length))){loadMapImages(function(mapImgs){drawTextPanel();if(mapImgs)drawMapPanel(mapImgs);finish();});}else{drawTextPanel();finish();}
+}
+function stamp(payload){
+  var data;try{data=JSON.parse(payload);}catch(ex){window.ReactNativeWebView.postMessage(JSON.stringify({error:'parse'}));return;}
+  var img=new Image();
+  img.onload=function(){
+    var c=document.getElementById('c');c.width=img.width;c.height=img.height;
+    var ctx=c.getContext('2d');ctx.drawImage(img,0,0);
+    drawStamp(ctx,img,data.lines,data.mapB64||null,data.mapDotX!=null?data.mapDotX:0.5,data.mapDotY!=null?data.mapDotY:0.5,data.mapTiles||null);
+  };
+  img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({error:'load'}));};
+  img.src='data:image/jpeg;base64,'+data.b64;
+}
+document.addEventListener('message',function(e){stamp(e.data);});
+window.addEventListener('message',function(e){stamp(e.data);});
+window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
+<\/script></body></html>`;
+
+type StampMapTile = { b64: string; dx: number; dy: number };
+type StampMapResult = { b64: string; tiles: StampMapTile[]; dotX: number; dotY: number };
+const _STAMP_OFFSETS = [-1, 0, 1] as const;
+const _CARTO_SUBS = ["a", "b", "c", "d"] as const;
+
+function _bunchingTileInfo(lat: number, lng: number, zoom = 18) {
+  const n = Math.pow(2, zoom);
+  const xFrac = ((lng + 180) / 360) * n;
+  const latRad = (lat * Math.PI) / 180;
+  const yFrac = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
+  const tileX = Math.floor(xFrac);
+  const tileY = Math.floor(yFrac);
+  return { tileX, tileY, zoom, dotX: xFrac - tileX, dotY: yFrac - tileY };
+}
+
+async function _fetchBunchingMapTileB64(lat: number, lng: number): Promise<StampMapResult | null> {
+  try {
+    const { tileX, tileY, zoom, dotX, dotY } = _bunchingTileInfo(lat, lng, 18);
+    // Fetch only the center tile (fast single download instead of 3×3 grid)
+    const startIdx = Math.abs(tileX + tileY) % _CARTO_SUBS.length;
+    const candidates = [
+      ...[..._CARTO_SUBS].slice(startIdx), ...[..._CARTO_SUBS].slice(0, startIdx),
+    ].map(s => `https://${s}.basemaps.cartocdn.com/rastertiles/voyager/${zoom}/${tileX}/${tileY}.png`);
+    candidates.push(`https://tile.openstreetmap.org/${zoom}/${tileX}/${tileY}.png`);
+    for (const url of candidates) {
+      const tmp = `${FileSystem.cacheDirectory}bstamp_${Date.now()}_center.png`;
+      try {
+        const dl = await FileSystem.downloadAsync(url, tmp);
+        const b64 = await FileSystem.readAsStringAsync(dl.uri, { encoding: "base64" as any });
+        FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {});
+        const center: StampMapTile = { b64, dx: 0, dy: 0 };
+        return { b64: center.b64, tiles: [center], dotX, dotY };
+      } catch { FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {}); }
+    }
+    return null;
+  } catch { return null; }
+}
+
 export default function TeardownComponentsScreen() {
   const params = useLocalSearchParams<{
     pole_code: string;
     pole_name: string;
     node_id: string;
+    node_name?: string;
     project_id: string;
     project_name: string;
     accent: string;
@@ -652,6 +811,22 @@ export default function TeardownComponentsScreen() {
   const [actualRuns, setActualRuns] = useState(declaredRuns || 1);
   const [cableReason, setCableReason] = useState("");
   const [cablePhoto, setCablePhoto] = useState<PhotoFile>(null);
+
+  // ── Bunching photo capture + GPS + stamp ──────────────────────────────────
+  const [bunchingCapturing, setBunchingCapturing] = useState(false);
+  const [bunchingGps, setBunchingGps] = useState<{ lat: number; lng: number; capturedAt: string } | null>(null);
+  const [bunchingStreet, setBunchingStreet] = useState("");
+  const [bunchingCity, setBunchingCity] = useState("");
+  const [bunchingRegion, setBunchingRegion] = useState("");
+  const [bunchingPreviewOpen, setBunchingPreviewOpen] = useState(false);
+  // Refs so the captureEvents listener always reads fresh values (avoids stale closure)
+  const bunchingGpsRef = useRef<{ lat: number; lng: number; capturedAt: string } | null>(null);
+  const bunchingStreetRef = useRef("");
+  const bunchingCityRef = useRef("");
+  const bunchingRegionRef = useRef("");
+  const bunchingStampRef = useRef<WebView>(null);
+  const bunchingStampResolverRef = useRef<((b64: string | null) => void) | null>(null);
+  const bunchingMapCache = useRef<StampMapResult | null>(null);
 
   const [collectedNode, setCollectedNode] = useState(0);
   const [collectedAmp, setCollectedAmp] = useState(0);
@@ -961,39 +1136,175 @@ export default function TeardownComponentsScreen() {
     } catch {}
   }
 
-  async function captureCablePhoto() {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== "granted") {
-      Alert.alert("Permission required", "Please allow camera access.");
-      return;
-    }
+  function handleBunchingStampMessage(event: { nativeEvent: { data: string } }) {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      if (data.ready || !bunchingStampResolverRef.current) return;
+      bunchingStampResolverRef.current(data.stamped ?? null);
+      bunchingStampResolverRef.current = null;
+    } catch {}
+  }
 
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ["images"],
-      quality: 0.5,
+  function buildBunchingStampLines(lat: number, lng: number, street: string, city: string, region: string): string[] {
+    const phtIso = getPHTNow();
+    const [datePart, timeRaw] = phtIso.substring(0, 19).split("T");
+    const [yr, mo, dy] = datePart.split("-").map(Number);
+    const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const lines: string[] = [`${MON[mo - 1]} ${dy}, ${yr}  ${timeRaw}`];
+    if (street) lines.push(street);
+    const cityProv = [city, region].filter(Boolean).join(", ");
+    if (cityProv) lines.push(cityProv);
+    const fromCode_ = params.pole_code ?? params.from_pole_id ?? "";
+    const toCode_ = params.to_pole_code ?? params.to_pole_id ?? "";
+    lines.push(`${fromCode_} → ${toCode_}  (BUNCHING)`);
+    const nodeLabel = params.node_name || "";
+    if (nodeLabel) lines.push(`node name: ${nodeLabel}`);
+    return lines;
+  }
+
+  async function stampBunchingPhoto(uri: string, lines: string[], lat: number, lng: number): Promise<string> {
+    try {
+      const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" as any });
+      const mapResult = bunchingMapCache.current
+        ?? await _fetchBunchingMapTileB64(lat, lng).catch(() => null);
+      if (mapResult) bunchingMapCache.current = mapResult;
+      const payload = JSON.stringify({
+        b64, lines,
+        mapB64: mapResult?.b64 ?? null,
+        mapTiles: mapResult?.tiles ?? null,
+        mapDotX: mapResult?.dotX ?? 0.5,
+        mapDotY: mapResult?.dotY ?? 0.5,
+      });
+      return new Promise<string>((resolve) => {
+        const timer = setTimeout(() => { bunchingStampResolverRef.current = null; resolve(uri); }, 15000);
+        bunchingStampResolverRef.current = (result: string | null) => {
+          clearTimeout(timer);
+          if (!result) { resolve(uri); return; }
+          const tmp = `${FileSystem.cacheDirectory}bstamp_out_${Date.now()}.jpg`;
+          FileSystem.writeAsStringAsync(tmp, result, { encoding: "base64" as any })
+            .then(() => resolve(tmp))
+            .catch(() => resolve(uri));
+        };
+        bunchingStampRef.current?.injectJavaScript(
+          `(function(){document.dispatchEvent(new MessageEvent('message',{data:${JSON.stringify(payload)}}));})();true;`
+        );
+      });
+    } catch { return uri; }
+  }
+
+  // Keep refs in sync so the captureEvents listener always has fresh GPS/address
+  useEffect(() => { bunchingGpsRef.current = bunchingGps; }, [bunchingGps]);
+  useEffect(() => { bunchingStreetRef.current = bunchingStreet; }, [bunchingStreet]);
+  useEffect(() => { bunchingCityRef.current = bunchingCity; }, [bunchingCity]);
+  useEffect(() => { bunchingRegionRef.current = bunchingRegion; }, [bunchingRegion]);
+
+  // Listen for photo from capture.tsx
+  useEffect(() => {
+    const spanId = params.span_id ?? "";
+    return captureEvents.on(async (result) => {
+      if (result.ownerType !== "bunching" || result.ownerPoleId !== spanId) return;
+      setBunchingCapturing(true);
+      try {
+        // Wait for capture.tsx navigation-back animation to complete
+        await new Promise(r => setTimeout(r, 350));
+
+        const gps = bunchingGpsRef.current;
+
+        // Compress
+        const manip = ImageManipulator.manipulate(result.uri);
+        manip.resize({ width: 1280 });
+        const imgCtx = await manip.renderAsync();
+        const compressed = await imgCtx.saveAsync({ compress: 0.82, format: SaveFormat.JPEG });
+
+        await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true });
+        const dest = draftDir + `${fromCode}_bunching.jpg`;
+
+        if (gps && !bunchingMapCache.current) {
+          bunchingMapCache.current = await _fetchBunchingMapTileB64(gps.lat, gps.lng).catch(() => null);
+        }
+
+        let displayUri = compressed.uri;
+        if (gps) {
+          const lines = buildBunchingStampLines(
+            gps.lat, gps.lng,
+            bunchingStreetRef.current, bunchingCityRef.current, bunchingRegionRef.current,
+          );
+          const stamped = await stampBunchingPhoto(compressed.uri, lines, gps.lat, gps.lng);
+          await FileSystem.copyAsync({ from: stamped, to: dest }).catch(() => {});
+          displayUri = stamped;
+        } else {
+          await FileSystem.copyAsync({ from: compressed.uri, to: dest }).catch(() => {});
+          displayUri = dest;
+        }
+
+        photoTimestamps.current.before_span = gps?.capturedAt ?? await getDisplayTime();
+        setCablePhoto({ uri: displayUri } as PhotoFile);
+        setBunchingPreviewOpen(true);
+      } catch (e: any) {
+        Alert.alert("Capture Failed", e?.message ?? "Could not take photo.");
+      } finally {
+        setBunchingCapturing(false);
+      }
     });
+  }, [params.span_id]);
 
-    if (!result.canceled && result.assets[0]) {
-      const uri = result.assets[0].uri;
-      const fileName = `${fromCode}_cable.jpg`;
-      photoTimestamps.current.before_span = await getDisplayTime();
+  async function openBunchingCamera() {
+    bunchingMapCache.current = null;
 
-      await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true });
-      await FileSystem.copyAsync({ from: uri, to: draftDir + fileName }).catch(
-        () => {},
-      );
-
-      setCablePhoto({
-        uri: draftDir + fileName,
-        name: fileName,
-        type: "image/jpeg",
-      } as any);
+    // Capture GPS before navigating so the overlay in capture.tsx shows it
+    const { status: locStatus } = await Location.requestForegroundPermissionsAsync();
+    let gps: { lat: number; lng: number; capturedAt: string } | null = null;
+    if (locStatus === "granted") {
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }).catch(() => null);
+      if (pos) {
+        gps = { lat: pos.coords.latitude, lng: pos.coords.longitude, capturedAt: getPHTNow() };
+        setBunchingGps(gps);
+        bunchingGpsRef.current = gps;
+        Location.reverseGeocodeAsync({ latitude: pos.coords.latitude, longitude: pos.coords.longitude })
+          .then(addrs => {
+            const a = addrs[0];
+            if (a) {
+              const street = String(a.street ?? a.name ?? "").trim();
+              const city   = String(a.city ?? a.district ?? a.subregion ?? "").trim();
+              const region = String(a.region ?? "").trim();
+              setBunchingStreet(street); bunchingStreetRef.current = street;
+              setBunchingCity(city);     bunchingCityRef.current   = city;
+              setBunchingRegion(region); bunchingRegionRef.current = region;
+            }
+          })
+          .catch(() => {});
+      }
     }
+
+    router.push({
+      pathname: "/capture" as any,
+      params: {
+        label: "BUNCHING",
+        poleCode: `${params.pole_code ?? ""} → ${params.to_pole_code ?? ""}`,
+        nodeName: params.node_name ?? "",
+        lat: gps ? String(gps.lat) : "",
+        lng: gps ? String(gps.lng) : "",
+        ownerType: "bunching",
+        ownerPoleId: params.span_id ?? "",
+        returnKey: `bunching_${params.span_id ?? ""}`,
+        tab: "before",
+      },
+    });
+  }
+
+  function retakeBunchingPhoto() {
+    setCablePhoto(null);
+    setBunchingGps(null); bunchingGpsRef.current = null;
+    setBunchingStreet(""); bunchingStreetRef.current = "";
+    setBunchingCity("");   bunchingCityRef.current = "";
+    setBunchingRegion(""); bunchingRegionRef.current = "";
+    bunchingMapCache.current = null;
+    openBunchingCamera();
   }
 
   const canProceed = useCallback(() => {
     if (step === 0) {
-      return collectedAll !== null && recoveredCable.trim() !== "";
+      return collectedAll !== null && recoveredCable.trim() !== "" && !!cablePhoto;
     }
 
     const fromPhotosOk = polePreSubmitted || (!!photos.from_before && !!photos.from_tag);
@@ -1004,7 +1315,7 @@ export default function TeardownComponentsScreen() {
       !!photos.to_tag &&
       collectedAll !== null
     );
-  }, [step, collectedAll, recoveredCable, polePreSubmitted, photos]);
+  }, [step, collectedAll, recoveredCable, cablePhoto, polePreSubmitted, photos]);
 
   function goNext() {
     if (step < STEPS.length - 1) {
@@ -1168,6 +1479,7 @@ export default function TeardownComponentsScreen() {
     if (recoveredCable.trim() === "") {
       missing.push("Actual cable collected (meters)");
     }
+    if (!cablePhoto) missing.push("Bunching photo");
 
     if (missing.length > 0) {
       Alert.alert(
@@ -1280,6 +1592,9 @@ export default function TeardownComponentsScreen() {
             photoForm.append("pole_code",      String(poleCode ?? "pole"));
             photoForm.append("image_type",     imageType);
             photoForm.append("inventory_type", "skycable");
+            if (imageType === "bunching" && params.to_pole_id) {
+              photoForm.append("to_pole_id", String(params.to_pole_id));
+            }
             photoForm.append("image", { uri, name: `${fieldName}.jpg`, type: "image/jpeg" } as any);
             return { fieldName, uri, poleId, poleCode, imageType, result: await api.post("/teardown/upload-image", photoForm) };
           })
@@ -1309,6 +1624,9 @@ export default function TeardownComponentsScreen() {
                 node_id:    String(params.node_id ?? ""),
                 pole_code:  String(isToPole ? params.to_pole_code : params.pole_code ?? ""),
                 image_type: imageType,
+                ...(imageType === "bunching" && params.to_pole_id
+                  ? { to_pole_id: String(params.to_pole_id) }
+                  : {}),
               },
             };
           }),
@@ -1392,7 +1710,7 @@ export default function TeardownComponentsScreen() {
       });
   }
 
-  const cableStepDone = collectedAll !== null && recoveredCable.trim() !== "";
+  const cableStepDone = collectedAll !== null && recoveredCable.trim() !== "" && !!cablePhoto;
   const componentsTotal =
     collectedNode +
     collectedAmp +
@@ -1407,6 +1725,7 @@ export default function TeardownComponentsScreen() {
     !!photos.to_before,
     !!photos.to_after,
     !!photos.to_tag,
+    !!cablePhoto,
   ].filter(Boolean).length;
 
   const progress = useMemo(() => {
@@ -1414,7 +1733,7 @@ export default function TeardownComponentsScreen() {
     const completed = [
       cableStepDone,
       step === 1 && currentStepComplete,
-      requiredPhotosDone === 5,
+      requiredPhotosDone === 6,
       componentsTotal > 0,
     ].filter(Boolean).length;
 
@@ -1615,7 +1934,7 @@ export default function TeardownComponentsScreen() {
 
             <View style={styles.trackerRow}>
               <TrackerMini done={cableStepDone} label="Cable" />
-              <TrackerMini done={requiredPhotosDone === 5} label="Photos" />
+              <TrackerMini done={requiredPhotosDone === 6} label="Photos" />
               <TrackerMini done={componentsTotal > 0} label="Items" />
             </View>
 
@@ -1636,7 +1955,7 @@ export default function TeardownComponentsScreen() {
                   <View
                     style={[
                       styles.sectionPill,
-                      requiredPhotosDone === 5
+                      requiredPhotosDone === 6
                         ? styles.sectionPillSuccess
                         : styles.sectionPillMuted,
                     ]}
@@ -1644,7 +1963,7 @@ export default function TeardownComponentsScreen() {
                     <Text
                       style={[
                         styles.sectionPillText,
-                        requiredPhotosDone === 5
+                        requiredPhotosDone === 6
                           ? styles.sectionPillTextSuccess
                           : styles.sectionPillTextMuted,
                       ]}
@@ -1693,11 +2012,12 @@ export default function TeardownComponentsScreen() {
                   required
                   onPress={() => openViewer("To Tag", photos.to_tag)}
                 />
-                {!collectedAll && cablePhoto ? (
+                {cablePhoto ? (
                   <PhotoCircleItem
-                    label="Cable"
+                    label="Bunching"
                     photo={cablePhoto}
-                    onPress={() => openViewer("Cable Photo", cablePhoto)}
+                    required
+                    onPress={() => openViewer("Bunching Image", cablePhoto)}
                   />
                 ) : null}
               </View>
@@ -1742,6 +2062,7 @@ export default function TeardownComponentsScreen() {
           </View>
 
           {step === 0 ? (
+            <>
             <View style={styles.sectionCard}>
               <SectionHeading
                 title="Cable Collection"
@@ -1914,39 +2235,81 @@ export default function TeardownComponentsScreen() {
                     />
                   </View>
 
-                  <View style={[styles.fieldGroup, { marginBottom: 0 }]}>
-                    <View style={styles.inlineHeader}>
-                      <Text style={styles.fieldLabelInline}>Cable Photo</Text>
-                      <Text style={styles.fieldMeta}>Optional</Text>
-                    </View>
-
-                    <TouchableOpacity
-                      onPress={captureCablePhoto}
-                      activeOpacity={0.85}
-                      style={[
-                        styles.cablePhotoBox,
-                        cablePhoto && { borderColor: accentColor },
-                      ]}
-                    >
-                      {cablePhoto ? (
-                        <ExpoImage
-                          source={{ uri: cablePhoto.uri }}
-                          style={styles.cablePhotoImage}
-                          contentFit="cover"
-                        />
-                      ) : (
-                        <View style={styles.cablePhotoEmpty}>
-                          <Text style={styles.cablePhotoEmptyIcon}>📷</Text>
-                          <Text style={styles.cablePhotoEmptyText}>
-                            Tap to capture
-                          </Text>
-                        </View>
-                      )}
-                    </TouchableOpacity>
-                  </View>
                 </>
               ) : null}
             </View>
+
+            <View style={styles.sectionCard}>
+              <SectionHeading
+                title="Bunching Image"
+                subtitle="Photo of cables bundled after teardown"
+                right={
+                  <View style={[styles.sectionPill, cablePhoto ? styles.sectionPillSuccess : styles.sectionPillMuted]}>
+                    <Text style={[styles.sectionPillText, cablePhoto ? styles.sectionPillTextSuccess : styles.sectionPillTextMuted]}>
+                      {cablePhoto ? "Captured" : "Required"}
+                    </Text>
+                  </View>
+                }
+              />
+              {cablePhoto ? (
+                <>
+                  {/* Full-width photo — tap to open preview modal */}
+                  <TouchableOpacity
+                    activeOpacity={0.88}
+                    style={styles.bunchingFullPhotoBox}
+                    onPress={() => setBunchingPreviewOpen(true)}
+                  >
+                    <ExpoImage
+                      source={{ uri: cablePhoto.uri }}
+                      style={StyleSheet.absoluteFillObject}
+                      contentFit="cover"
+                    />
+                    {/* GPS overlay at bottom-left */}
+                    {bunchingGps ? (
+                      <View style={styles.bunchingPhotoMetaOverlay}>
+                        <Text style={styles.bunchingPhotoMetaCoords}>
+                          📍 {bunchingGps.lat.toFixed(6)}, {bunchingGps.lng.toFixed(6)}
+                        </Text>
+                        {(bunchingStreet || bunchingCity) ? (
+                          <Text style={styles.bunchingPhotoMetaAddr} numberOfLines={1}>
+                            {[bunchingStreet, bunchingCity].filter(Boolean).join(", ")}
+                          </Text>
+                        ) : null}
+                        <Text style={styles.bunchingPhotoMetaTime}>
+                          {bunchingGps.capturedAt.replace("T", "  ").substring(0, 22)}
+                        </Text>
+                      </View>
+                    ) : null}
+                    <View style={styles.bunchingExpandHint}>
+                      <Text style={styles.bunchingExpandHintText}>⛶ Tap to preview</Text>
+                    </View>
+                  </TouchableOpacity>
+
+                  {/* Retake button */}
+                  <TouchableOpacity
+                    style={[styles.retakeBtn, { borderColor: accentColor }]}
+                    onPress={retakeBunchingPhoto}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[styles.retakeBtnText, { color: accentColor }]}>↺  Retake</Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <TouchableOpacity
+                  onPress={openBunchingCamera}
+                  activeOpacity={0.85}
+                  style={[styles.cablePhotoBox, { borderColor: "#EF4444", borderStyle: "dashed" }]}
+                >
+                  <View style={styles.cablePhotoEmpty}>
+                    <Text style={styles.cablePhotoEmptyIcon}>📷</Text>
+                    <Text style={[styles.cablePhotoEmptyText, { color: "#EF4444" }]}>
+                      Tap to capture (Required)
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              )}
+            </View>
+            </>
           ) : null}
 
           {step === 1 ? (
@@ -2303,7 +2666,7 @@ export default function TeardownComponentsScreen() {
                   {cablePhoto ? (
                     <View style={styles.summaryPhotoItem}>
                       <Pressable
-                        onPress={() => openViewer("Cable", cablePhoto)}
+                        onPress={() => openViewer("Bunching Image", cablePhoto)}
                         style={({ pressed }) => [pressed && styles.pressedDown]}
                       >
                         <ExpoImage
@@ -2312,7 +2675,7 @@ export default function TeardownComponentsScreen() {
                           contentFit="cover"
                         />
                       </Pressable>
-                      <Text style={styles.summaryPhotoLabel}>Cable</Text>
+                      <Text style={styles.summaryPhotoLabel}>Bunching</Text>
                       <Text
                         style={[
                           styles.summaryPhotoStatus,
@@ -2360,7 +2723,7 @@ export default function TeardownComponentsScreen() {
                 <View style={styles.summaryCableRow}>
                   {cablePhoto ? (
                     <Pressable
-                      onPress={() => openViewer("Cable", cablePhoto)}
+                      onPress={() => openViewer("Bunching Image", cablePhoto)}
                       style={({ pressed }) => [pressed && styles.pressedDown]}
                     >
                       <ExpoImage
@@ -2450,7 +2813,66 @@ export default function TeardownComponentsScreen() {
             </Modal>
           </SafeAreaView>
         </Modal>
+      {/* Hidden stamp WebView for bunching photo metadata overlay */}
+      <WebView
+        ref={bunchingStampRef}
+        style={{ position: "absolute", width: 0, height: 0, opacity: 0 }}
+        source={{ html: STAMP_HTML }}
+        onMessage={handleBunchingStampMessage}
+        javaScriptEnabled
+        domStorageEnabled
+        originWhitelist={["*"]}
+      />
       </SafeAreaView>
+
+      {/* ── Bunching Photo Preview Modal ──────────────────────────── */}
+      <Modal
+        visible={bunchingPreviewOpen}
+        animationType="slide"
+        statusBarTranslucent
+        onRequestClose={() => setBunchingPreviewOpen(false)}
+      >
+        <SafeAreaView style={styles.bunchingPreviewRoot} edges={["top", "bottom"]}>
+          {/* Header */}
+          <View style={styles.bunchingPreviewHeader}>
+            <Text style={styles.bunchingPreviewTitle}>Bunching Photo</Text>
+            <TouchableOpacity
+              onPress={() => setBunchingPreviewOpen(false)}
+              style={styles.bunchingPreviewClose}
+            >
+              <Text style={styles.bunchingPreviewCloseText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Full-screen photo */}
+          <View style={{ flex: 1 }}>
+            {cablePhoto ? (
+              <ExpoImage
+                source={{ uri: cablePhoto.uri }}
+                style={StyleSheet.absoluteFillObject}
+                contentFit="contain"
+              />
+            ) : null}
+          </View>
+
+          {/* Actions */}
+          <View style={styles.bunchingPreviewActions}>
+            <TouchableOpacity
+              style={[styles.bunchingPreviewBtn, { backgroundColor: "#FEF2F2", borderColor: "#FECACA" }]}
+              onPress={() => { setBunchingPreviewOpen(false); retakeBunchingPhoto(); }}
+            >
+              <Text style={[styles.bunchingPreviewBtnText, { color: "#DC2626" }]}>↺  Retake</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.bunchingPreviewBtn, { backgroundColor: "#F0FDF4", borderColor: "#BBF7D0", flex: 1 }]}
+              onPress={() => setBunchingPreviewOpen(false)}
+            >
+              <Text style={[styles.bunchingPreviewBtnText, { color: "#15803D" }]}>✓  Keep Photo</Text>
+            </TouchableOpacity>
+          </View>
+        </SafeAreaView>
+      </Modal>
+
     </>
   );
 }
@@ -2982,9 +3404,39 @@ const styles = StyleSheet.create({
     height: 220,
   },
 
-  cablePhotoImage: {
-    width: "100%",
-    height: "100%",
+  bunchingFullPhotoBox: {
+    borderRadius: 16,
+    overflow: "hidden",
+    height: 260,
+    marginBottom: 10,
+    backgroundColor: "#0F172A",
+  },
+
+  bunchingPhotoMetaOverlay: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(0,0,0,0.52)",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 2,
+  },
+  bunchingPhotoMetaCoords: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#FFFFFF",
+    fontFamily: "monospace",
+  },
+  bunchingPhotoMetaAddr: {
+    fontSize: 10,
+    fontWeight: "500",
+    color: "#CBD5E1",
+  },
+  bunchingPhotoMetaTime: {
+    fontSize: 10,
+    fontWeight: "600",
+    color: "#94A3B8",
   },
 
   cablePhotoEmpty: {
@@ -3002,6 +3454,88 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "800",
     color: "#667085",
+  },
+
+  bunchingExpandHint: {
+    position: "absolute",
+    bottom: 10,
+    right: 10,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  bunchingExpandHintText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#fff",
+  },
+
+  retakeBtn: {
+    marginTop: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 11,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    backgroundColor: "#F8FAFC",
+  },
+  retakeBtnText: {
+    fontSize: 13,
+    fontWeight: "900",
+  },
+
+  bunchingPreviewRoot: {
+    flex: 1,
+    backgroundColor: "#FFFFFF",
+  },
+  bunchingPreviewHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F1F5F9",
+  },
+  bunchingPreviewTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: "#0F172A",
+  },
+  bunchingPreviewClose: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#F1F5F9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  bunchingPreviewCloseText: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#64748B",
+  },
+  bunchingPreviewActions: {
+    flexDirection: "row",
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#F1F5F9",
+  },
+  bunchingPreviewBtn: {
+    minHeight: 52,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+    borderRadius: 16,
+    borderWidth: 1.5,
+  },
+  bunchingPreviewBtnText: {
+    fontSize: 14,
+    fontWeight: "900",
   },
 
   counterRow: {

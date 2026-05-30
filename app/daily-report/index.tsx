@@ -9,7 +9,7 @@ import {
   ChevronRight,
   RefreshCw,
 } from "lucide-react-native";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -112,6 +112,7 @@ function ComponentBox({
 export default function DailyReportScreen() {
   const router = useRouter();
 
+  const lastFetchRef = useRef<number>(0);
   const [logs, setLogs] = useState<TeardownLog[]>(
     USE_FAKE_DATA ? FAKE_LOGS : [],
   );
@@ -180,8 +181,11 @@ export default function DailyReportScreen() {
       let active = true;
 
       const start = async () => {
+        const now = Date.now();
         const hasCache = await loadCache();
         if (!active) return;
+        if (now - lastFetchRef.current < 2 * 60 * 1000 && hasCache) return;
+        lastFetchRef.current = now;
         await fetchLogs(hasCache);
       };
 

@@ -1,6 +1,7 @@
 import { useAuth } from "@/context/auth-context";
 import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
+import * as FileSystem from "expo-file-system/legacy";
 import { getPHTNow } from "@/lib/display-time";
 import { gpsQueueReadAll } from "@/lib/gps-queue";
 import { simpleQueuePush } from "@/lib/simple-queue";
@@ -25,10 +26,12 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
   FlatList,
   Image,
   LayoutChangeEvent,
   Modal,
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -36,6 +39,8 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 
@@ -320,8 +325,9 @@ html,body,#map{
         iconSize: [48,48],
         iconAnchor: [24,24]
       });
+      var btnLabel = ${opts?.isPoleReport ? '"Open Pole Report"' : 'p.status==="in_progress"?"Continue Teardown":"Start Teardown"'};
       var btn = p.status!=='cleared'
-        ? '<button class="pstart" onclick="window._tap('+i+')">${startLabel}</button>'
+        ? '<button class="pstart" onclick="window._tap('+i+')">'+btnLabel+'</button>'
         : '';
       var pop = '<div class="pw"><div class="pt">'+p.code+'</div><div class="pb" style="background:'+c+'22;color:'+c+'"><span style="width:6px;height:6px;border-radius:50%;background:'+c+';display:inline-block;margin-right:4px"></span>'+lbl+'</div>'+btn+'</div>';
       L.marker([p.lat, p.lng], {icon: icon, zIndexOffset: 1000}).addTo(markerGroup).bindPopup(pop);
@@ -755,6 +761,11 @@ export default function PolesScreen() {
 
   const [mapPreviewVisible, setMapPreviewVisible] = useState(false);
   const [mapTileView, setMapTileView] = useState<"street" | "satellite" | "dark">("street");
+  const [completedPole, setCompletedPole] = useState<SkycablePole | null>(null);
+  const [completedPhotos, setCompletedPhotos] = useState<{ before: string | null; after: string | null; tag: string | null }>({ before: null, after: null, tag: null });
+  const [completedPhotoViewer, setCompletedPhotoViewer] = useState<{ uri: string; label: string } | null>(null);
+  const completedModalScale = useRef(new Animated.Value(0.88)).current;
+  const completedModalOpacity = useRef(new Animated.Value(0)).current;
 
   const switchTileView = (view: "street" | "satellite" | "dark") => {
     setMapTileView(view);
@@ -763,6 +774,7 @@ export default function PolesScreen() {
 
   // ── Inline map overlay (WebView always mounted so CDN loads in background) ─
   const insets = useSafeAreaInsets();
+  const lastFetchRef = useRef<number>(0);
   const mapWvRef = useRef<any>(null);
   const mapHtml = useMemo(() => buildPolesMapHtml({ isPoleReport }), [isPoleReport]);
   const [mapReady, setMapReady] = useState(false);
@@ -890,15 +902,18 @@ export default function PolesScreen() {
         });
       };
 
-      // Show cached poles immediately, then always fetch fresh so
-      // coordinates and status updated on backend reflect right away
+      // Show cached poles immediately; throttle network call to 30s to avoid
+      // re-fetching on every return from pole-detail when nothing has changed.
       cacheGet<SkycablePole[]>(CACHE_KEY).then(async cached => {
         if (cached?.length) {
           setPoles(await mergeGps(cached));
         }
         setLoading(false); // Always unblock UI after cache check
 
-        // Always fetch fresh from API regardless of cache
+        const now = Date.now();
+        if (now - lastFetchRef.current < 30_000 && cached?.length) return;
+        lastFetchRef.current = now;
+
         getNodePoles(Number(nodeId), token)
           .then(async data => {
             const enhancedData = data.map(freshPole => {
@@ -997,7 +1012,7 @@ export default function PolesScreen() {
           lat: parseFloat(p.pole.lat),
           lng: parseFloat(p.pole.lng),
           status: p.pole.skycable_status ?? "pending",
-          code: p.pole.pole_code ?? "Pole",
+          code: p.pole.pole_code ?? "",
           id: p.id,
           pole_id: p.pole.id,
         })),
@@ -1079,6 +1094,59 @@ export default function PolesScreen() {
       setPendingOpenPole(null);
     }
   }
+
+  // Load photos from pole_drafts when a completed pole is selected
+  useEffect(() => {
+    if (!completedPole) {
+      setCompletedPhotos({ before: null, after: null, tag: null });
+      return;
+    }
+    const poleId = String(completedPole.pole_id);
+    const nId = String(completedPole.node_id ?? nodeId);
+    const ts = Date.now();
+
+    (async () => {
+      const base = `${FileSystem.documentDirectory}pole_drafts/`;
+      const result = { before: null as string | null, after: null as string | null, tag: null as string | null };
+
+      try {
+        const projects = await FileSystem.readDirectoryAsync(base).catch(() => [] as string[]);
+        for (const proj of projects) {
+          const dir = `${base}${proj}/${nId}/${poleId}/`;
+          const dirInfo = await FileSystem.getInfoAsync(dir).catch(() => ({ exists: false }));
+          if (!(dirInfo as any).exists) continue;
+
+          const tryLoad = async (view: string, raw: string): Promise<string | null> => {
+            const vi = await FileSystem.getInfoAsync(dir + view).catch(() => ({ exists: false }));
+            if ((vi as any).exists) return `${dir}${view}?v=${ts}`;
+            const ri = await FileSystem.getInfoAsync(dir + raw).catch(() => ({ exists: false }));
+            if ((ri as any).exists) return `${dir}${raw}?v=${ts}`;
+            return null;
+          };
+
+          result.before = await tryLoad(`pole_${poleId}_before_view.jpg`, `pole_${poleId}_before.jpg`);
+          result.after  = await tryLoad(`pole_${poleId}_after_view.jpg`,  `pole_${poleId}_after.jpg`);
+          result.tag    = await tryLoad(`pole_${poleId}_poletag_view.jpg`, `pole_${poleId}_poletag.jpg`);
+
+          if (result.before || result.after || result.tag) break;
+        }
+      } catch {}
+
+      setCompletedPhotos(result);
+    })();
+  }, [completedPole?.pole_id]);
+
+  // Zoom-in animation when completed pole modal opens
+  useEffect(() => {
+    if (completedPole) {
+      completedModalScale.setValue(0.88);
+      completedModalOpacity.setValue(0);
+      Animated.parallel([
+        Animated.spring(completedModalScale, { toValue: 1, useNativeDriver: true, tension: 180, friction: 12 }),
+        Animated.timing(completedModalOpacity, { toValue: 1, duration: 180, useNativeDriver: true }),
+      ]).start();
+    }
+  }, [completedPole?.pole_id]);
 
   async function handleStartPoleFromList(poleId: number, poleRowId?: number) {
     if (!nodeId || !token) return;
@@ -1328,14 +1396,20 @@ export default function PolesScreen() {
                     handleStartPoleFromList(Number(msg.pole_id), Number(msg.id)).catch(() => {});
                   }
 
+                    const tappedPin = mapPolePinsRef.current.find(p => String(p.pole_id) === String(msg.pole_id));
                     router.push({
                       pathname: poleDetailPath,
                       params: {
                         pole_id: String(msg.pole_id),
                         pole_row_id: String(msg.id),
+                        pole_code: String(msg.code ?? ""),
+                        pole_name: String(msg.code ?? ""),
                         node_id: nodeId ?? "",
                         node_name: nodeName,
+                        accent: "#0B7A5A",
                         report_type: resolvedReportType,
+                        sitemap_lat: tappedPin?.lat ? String(tappedPin.lat) : "",
+                        sitemap_lng: tappedPin?.lng ? String(tappedPin.lng) : "",
                       },
                     } as any);
                 }
@@ -1435,6 +1509,170 @@ export default function PolesScreen() {
             </TouchableOpacity>
             <TouchableOpacity style={s.addPoleCancelBtn} onPress={() => { setAddPoleVisible(false); setNewPoleCode(""); }}>
               <Text style={s.addPoleCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Completed Pole Full-Screen Preview ── */}
+      <Modal
+        visible={!!completedPole}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => setCompletedPole(null)}
+      >
+        <View style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.35)" }}>
+          <Animated.View style={{ flex: 1, backgroundColor: "#F8FAFC", transform: [{ scale: completedModalScale }], opacity: completedModalOpacity }}>
+            {/* Green header */}
+            <View style={{ backgroundColor: "#0B7A5A", paddingTop: 54, paddingBottom: 20, paddingHorizontal: 20 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                  <View style={{ width: 42, height: 42, borderRadius: 21, backgroundColor: "rgba(255,255,255,0.18)", alignItems: "center", justifyContent: "center" }}>
+                    <Text style={{ fontSize: 20 }}>✓</Text>
+                  </View>
+                  <View>
+                    <Text style={{ color: "rgba(255,255,255,0.7)", fontSize: 10, fontWeight: "700", letterSpacing: 1.5 }}>LANDMARK</Text>
+                    <Text style={{ color: "#FFF", fontSize: 22, fontWeight: "900", marginTop: 2 }}>
+                      {completedPole?.pole?.pole_code ?? "Pole"}
+                    </Text>
+                  </View>
+                </View>
+                <TouchableOpacity
+                  onPress={() => setCompletedPole(null)}
+                  style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(255,255,255,0.18)", alignItems: "center", justifyContent: "center" }}
+                >
+                  <X size={20} color="#FFF" />
+                </TouchableOpacity>
+              </View>
+
+              {/* Status + dates row */}
+              <View style={{ flexDirection: "row", gap: 10, marginTop: 16 }}>
+                <View style={{ backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, flex: 1 }}>
+                  <Text style={{ color: "rgba(255,255,255,0.65)", fontSize: 9, fontWeight: "700", letterSpacing: 1.2 }}>STARTED AT</Text>
+                  <Text style={{ color: "#FFF", fontSize: 11, fontWeight: "800", marginTop: 3 }}>
+                    {completedPole?.date_start ? fmtPHT(completedPole.date_start) : "—"}
+                  </Text>
+                </View>
+                <View style={{ backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, flex: 1 }}>
+                  <Text style={{ color: "rgba(255,255,255,0.65)", fontSize: 9, fontWeight: "700", letterSpacing: 1.2 }}>CLEARED AT</Text>
+                  <Text style={{ color: "#A7F3D0", fontSize: 11, fontWeight: "800", marginTop: 3 }}>
+                    {completedPole?.cleared_at ? fmtPHT(completedPole.cleared_at) : "—"}
+                  </Text>
+                </View>
+                <View style={{ backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, flex: 1 }}>
+                  <Text style={{ color: "rgba(255,255,255,0.65)", fontSize: 9, fontWeight: "700", letterSpacing: 1.2 }}>STATUS</Text>
+                  <Text style={{ color: "#A7F3D0", fontSize: 11, fontWeight: "800", marginTop: 3 }}>Completed</Text>
+                </View>
+              </View>
+            </View>
+
+            <ScrollView contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+              {/* GPS map */}
+              {!!completedPole?.pole?.lat && !!completedPole?.pole?.lng && (
+                <View style={{ marginHorizontal: 16, marginTop: 16, borderRadius: 16, overflow: "hidden", height: 180, backgroundColor: "#E2E8F0" }}>
+                  <StaticTileMap lat={parseFloat(completedPole.pole.lat)} lng={parseFloat(completedPole.pole.lng)} />
+                  <View style={{ position: "absolute", bottom: 8, left: 10, backgroundColor: "rgba(0,0,0,0.55)", borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4 }}>
+                    <Text style={{ color: "#FFF", fontSize: 10, fontWeight: "700" }}>
+                      {Number(completedPole.pole.lat).toFixed(6)}, {Number(completedPole.pole.lng).toFixed(6)}
+                    </Text>
+                  </View>
+                  <View style={{ position: "absolute", top: 8, right: 10, backgroundColor: "rgba(6,118,71,0.85)", borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4 }}>
+                    <Text style={{ color: "#FFF", fontSize: 9, fontWeight: "800", letterSpacing: 0.8 }}>CAPTURED</Text>
+                  </View>
+                </View>
+              )}
+
+              {/* Photos section */}
+              <View style={{ marginHorizontal: 16, marginTop: 16 }}>
+                <Text style={{ color: "#94A3B8", fontSize: 10, fontWeight: "700", letterSpacing: 1.4, marginBottom: 10 }}>PHOTOS</Text>
+                <View style={{ flexDirection: "row", gap: 10 }}>
+                  {([
+                    { label: "Before", uri: completedPhotos.before },
+                    { label: "After",  uri: completedPhotos.after },
+                    { label: "Tag",    uri: completedPhotos.tag },
+                  ] as const).map(({ label, uri }) => (
+                    <TouchableOpacity
+                      key={label}
+                      style={{ flex: 1, aspectRatio: 0.75, borderRadius: 14, overflow: "hidden", backgroundColor: "#F1F5F9", borderWidth: 1.5, borderColor: uri ? "#0B7A5A" : "#E2E8F0" }}
+                      activeOpacity={uri ? 0.8 : 1}
+                      onPress={() => uri && setCompletedPhotoViewer({ uri, label })}
+                    >
+                      {uri ? (
+                        <Image source={{ uri }} style={StyleSheet.absoluteFillObject} resizeMode="cover" />
+                      ) : (
+                        <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
+                          <Text style={{ fontSize: 24, marginBottom: 4 }}>📷</Text>
+                          <Text style={{ color: "#CBD5E1", fontSize: 9, fontWeight: "700" }}>NO PHOTO</Text>
+                        </View>
+                      )}
+                      <View style={{ position: "absolute", bottom: 0, left: 0, right: 0, backgroundColor: "rgba(0,0,0,0.5)", paddingVertical: 5, alignItems: "center" }}>
+                        <Text style={{ color: "#FFF", fontSize: 9, fontWeight: "800", letterSpacing: 1 }}>{label.toUpperCase()}</Text>
+                      </View>
+                      {uri && (
+                        <View style={{ position: "absolute", top: 6, right: 6, width: 18, height: 18, borderRadius: 9, backgroundColor: "#0B7A5A", alignItems: "center", justifyContent: "center" }}>
+                          <Text style={{ color: "#FFF", fontSize: 9, fontWeight: "900" }}>✓</Text>
+                        </View>
+                      )}
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+
+              {/* Cable slots */}
+              <View style={{ marginHorizontal: 16, marginTop: 16 }}>
+                <Text style={{ color: "#94A3B8", fontSize: 10, fontWeight: "700", letterSpacing: 1.4, marginBottom: 10 }}>CABLE SLOTS</Text>
+                {(completedPole?.pole?.cableSlots?.length ?? 0) === 0 ? (
+                  <View style={{ backgroundColor: "#F1F5F9", borderRadius: 12, paddingVertical: 18, alignItems: "center", borderWidth: 1, borderColor: "#E2E8F0" }}>
+                    <Text style={{ color: "#CBD5E1", fontSize: 13, fontWeight: "700" }}>No slots detected</Text>
+                  </View>
+                ) : (
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                    {completedPole!.pole.cableSlots.map(sl => {
+                      const isFree = sl.occupied_by === "free";
+                      const col = SLOT_COLORS[sl.occupied_by] || "#64748B";
+                      return (
+                        <View
+                          key={sl.slot_label}
+                          style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: isFree ? "#F8FAFC" : col + "18", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: isFree ? "#E2E8F0" : col + "55" }}
+                        >
+                          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: isFree ? "#CBD5E1" : col }} />
+                          <Text style={{ color: isFree ? "#94A3B8" : "#1E293B", fontSize: 11, fontWeight: "700" }}>{sl.slot_label}</Text>
+                          {!isFree && (
+                            <Text style={{ color: col, fontSize: 9, fontWeight: "800", textTransform: "uppercase" }}>{sl.occupied_by}</Text>
+                          )}
+                        </View>
+                      );
+                    })}
+                  </View>
+                )}
+              </View>
+            </ScrollView>
+          </Animated.View>
+        </View>
+      </Modal>
+
+      {/* Photo viewer modal */}
+      <Modal
+        visible={!!completedPhotoViewer}
+        transparent={false}
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => setCompletedPhotoViewer(null)}
+      >
+        <View style={{ flex: 1, backgroundColor: "#000" }}>
+          {completedPhotoViewer && (
+            <Image source={{ uri: completedPhotoViewer.uri }} style={StyleSheet.absoluteFillObject} resizeMode="contain" />
+          )}
+          <View style={{ position: "absolute", top: 54, left: 0, right: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 20 }}>
+            <View style={{ backgroundColor: "rgba(0,0,0,0.6)", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6 }}>
+              <Text style={{ color: "#FFF", fontSize: 13, fontWeight: "800" }}>{completedPhotoViewer?.label}</Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => setCompletedPhotoViewer(null)}
+              style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(0,0,0,0.6)", alignItems: "center", justifyContent: "center" }}
+            >
+              <X size={20} color="#FFF" />
             </TouchableOpacity>
           </View>
         </View>
@@ -1768,6 +2006,12 @@ export default function PolesScreen() {
                           return;
                         }
 
+                        // Completed poles → show info preview, never navigate or re-start
+                        if (poleInfo.skycable_status === "cleared") {
+                          setCompletedPole(np);
+                          return;
+                        }
+
                         const poleId = String(np.pole_id);
                         const nowMs = Date.now();
 
@@ -1775,7 +2019,9 @@ export default function PolesScreen() {
                         cacheSet(`pole_last_selected_${poleId}`, nowMs).catch(() => {});
                         setLastSelectedMap(prev => ({ ...prev, [poleId]: nowMs }));
 
-                        if (!isPoleReport) {
+                        // Only re-sync if the pole was already started — don't auto-start on card tap.
+                        // The user explicitly starts via "Start Pole Teardown" on the detail screen.
+                        if (!isPoleReport && np.date_start) {
                           handleStartPoleFromList(Number(np.pole_id), Number(np.id)).catch(() => {});
                         }
 
@@ -1790,6 +2036,8 @@ export default function PolesScreen() {
                             node_name: nodeName,
                             accent: "#0B7A5A",
                             report_type: resolvedReportType,
+                            sitemap_lat: poleInfo.lat ? String(poleInfo.lat) : "",
+                            sitemap_lng: poleInfo.lng ? String(poleInfo.lng) : "",
                           },
                         });
                       }}

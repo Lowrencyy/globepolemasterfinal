@@ -646,6 +646,7 @@ export default function SelectPairScreen() {
     pole_code,
     pole_name,
     node_id,
+    node_name,
     project_id,
     project_name,
     accent,
@@ -657,6 +658,7 @@ export default function SelectPairScreen() {
     pole_code: string;
     pole_name: string;
     node_id: string;
+    node_name?: string;
     project_id: string;
     project_name: string;
     accent: string;
@@ -671,17 +673,6 @@ export default function SelectPairScreen() {
   const [status, setStatus] = useState<"loading" | "ok" | "error" | "empty">("loading");
   const [allDone, setAllDone] = useState(false); // true = had spans but all completed
 
-  // Auto-navigate back to poles after 2 s when all spans are done
-  useEffect(() => {
-    if (!allDone) return;
-    const timer = setTimeout(() => {
-      router.replace({
-        pathname: "/teardowns/poles",
-        params: { nodeId: node_id, nodeName: pole_name, accent },
-      } as any);
-    }, 2000);
-    return () => clearTimeout(timer);
-  }, [allDone, accent, node_id, pole_name]);
   const [selectedSpan, setSelectedSpan] = useState<Span | null>(null);
   const [showVicinityModal, setShowVicinityModal] = useState(false);
   const mainMapRef = useRef<any>(null);
@@ -774,6 +765,7 @@ export default function SelectPairScreen() {
         pole_code: actualFromCode,
         pole_name: actualFromName,
         node_id,
+        node_name: node_name ?? "",
         project_id,
         project_name,
         accent,
@@ -797,7 +789,7 @@ export default function SelectPairScreen() {
         from_pole_gps_captured_at: from_pole_gps_captured_at ?? "",
       },
     });
-  }, [accent, from_pole_gps_captured_at, from_pole_latitude, from_pole_longitude, node_id, pole_code, pole_id, pole_name, project_id, project_name]);
+  }, [accent, from_pole_gps_captured_at, from_pole_latitude, from_pole_longitude, node_id, node_name, pole_code, pole_id, pole_name, project_id, project_name]);
 
   // Stable ref so the span-loading effect never re-runs just because navigateToKabila recreated
   const navigateToKabilaRef = React.useRef(navigateToKabila);
@@ -1175,7 +1167,7 @@ export default function SelectPairScreen() {
             </Text>
             <Text style={styles.centerSub}>
               {allDone
-                ? "All spans for this pole are completed. Returning to poles list…"
+                ? "All spans for this pole are completed."
                 : "This pole does not have any available span connections."}
             </Text>
 

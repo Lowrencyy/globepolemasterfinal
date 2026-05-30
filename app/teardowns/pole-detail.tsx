@@ -38,7 +38,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import { WebView } from "react-native-webview";
-import { buildPoleMapHtml, StaticTileMap } from "./components";
+import { buildPoleMapHtml, StaticTileMap, STAMP_HTML } from "./components";
 import { captureEvents } from "@/lib/capture-events";
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
@@ -384,156 +384,6 @@ window.addEventListener('message',function(e){run(e.data);});
 window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
 <\/script></body></html>`;
 
-const STAMP_HTML = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#000"><canvas id="c"></canvas><script>
-function rr(ctx,x,y,w,h,r){
-  ctx.beginPath();
-  ctx.moveTo(x+r,y);
-  ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
-  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
-  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
-  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);
-  ctx.closePath();
-}
-
-function drawStamp(ctx,img,lines,mapB64,mapDotX,mapDotY,mapTiles){
-  var W=img.width,H=img.height;
-  var gap=Math.round(W*0.012);          // ~6px on 500px wide, scales with resolution
-  var fSize=Math.min(
-    Math.max(14,Math.round(W*0.020)),
-    Math.floor((H*0.22)/(lines.length*1.55+1.5))
-  );
-  var lh=Math.round(fSize*1.55);
-  var vPad=Math.round(fSize*0.9);
-  var hPad=Math.round(fSize*0.75);
-  var panelH=lines.length*lh+vPad*2;
-  var r=Math.round(panelH*0.14);        // corner radius
-
-  // Map panel: square, same height as text panel — aligned flush
-  var mapSize=(mapB64||(mapTiles&&mapTiles.length))?panelH:0;
-  // Text panel width fills remaining space
-  var textW=W-gap*2-mapSize-(mapSize?gap:0);
-
-  // Panel Y position: align text panel bottom with map panel bottom
-  // Both panels same height — share the same Y position
-  var panelY=H-panelH-gap;
-  var mapY=panelY;
-
-  // Gradient fade behind both panels (same height)
-  var fadeH=panelH+gap*4;
-  var grad=ctx.createLinearGradient(0,H-fadeH,0,H);
-  grad.addColorStop(0,'rgba(0,0,0,0)');
-  grad.addColorStop(1,'rgba(0,0,0,0.38)');
-  ctx.fillStyle=grad;
-  ctx.fillRect(0,H-fadeH,W,fadeH);
-
-  function drawTextPanel(){
-    // Semi-transparent pill behind text
-    ctx.save();
-    rr(ctx,gap,panelY,textW,panelH,r);
-    ctx.fillStyle='rgba(0,0,0,0.52)';
-    ctx.fill();
-    ctx.restore();
-
-    // Text — vertically centered in panel
-    ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=3;
-    var textBlockH=lines.length*lh;
-    var startY=panelY+(panelH-textBlockH)/2;
-    lines.forEach(function(line,i){
-      var y=startY+(i+0.78)*lh;
-      var maxW=textW-hPad*2;
-      if(i===0){ctx.font='bold '+Math.round(fSize*1.05)+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
-      else if(i===lines.length-1){ctx.font=Math.round(fSize*0.84)+'px Arial,sans-serif';ctx.fillStyle='rgba(255,255,255,0.72)';}
-      else{ctx.font='bold '+fSize+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
-      var txt=line;
-      while(ctx.measureText(txt).width>maxW&&txt.length>4)txt=txt.slice(0,-2);
-      if(txt!==line)txt=txt.slice(0,-1)+'…';
-      ctx.fillText(txt,gap+hPad,y);
-    });
-    ctx.shadowBlur=0;
-  }
-
-  function drawMapPanel(mapImgs){
-    var mx=gap+textW+gap;
-    var my=mapY;
-    ctx.save();
-    rr(ctx,mx,my,mapSize,mapSize,r);
-    ctx.clip();
-    // Offset tile so captured GPS lands at CENTER of the panel
-    var dotFX=(mapDotX!=null&&!isNaN(mapDotX))?mapDotX:0.5;
-    var dotFY=(mapDotY!=null&&!isNaN(mapDotY))?mapDotY:0.5;
-    if(Array.isArray(mapImgs)){
-      mapImgs.forEach(function(t){
-        if(!t||!t.img)return;
-        var dx=Number(t.dx)||0,dy=Number(t.dy)||0;
-        ctx.drawImage(t.img,mx+(dx+0.5-dotFX)*mapSize,my+(dy+0.5-dotFY)*mapSize,mapSize,mapSize);
-      });
-    }else if(mapImgs){
-      ctx.drawImage(mapImgs, mx+(0.5-dotFX)*mapSize, my+(0.5-dotFY)*mapSize, mapSize, mapSize);
-    }
-    // subtle vignette
-    ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(mx,my,mapSize,mapSize);
-    // GPS dot always at center of the panel
-    var dotR=Math.round(mapSize*0.07);
-    var dX=mx+mapSize/2;
-    var dY=my+mapSize/2;
-    ctx.beginPath();ctx.arc(dX,dY,dotR,0,2*Math.PI);
-    ctx.fillStyle='#EF4444';ctx.fill();
-    ctx.strokeStyle='#FFFFFF';ctx.lineWidth=Math.max(2,Math.round(dotR*0.35));ctx.stroke();
-    ctx.restore();
-  }
-
-  function finish(){
-    var b64=document.getElementById('c').toDataURL('image/jpeg',0.93).split(',')[1];
-    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
-  }
-
-  function loadMapImages(cb){
-    var tilePayload=Array.isArray(mapTiles)?mapTiles.filter(function(t){return t&&t.b64;}):[];
-    if(tilePayload.length){
-      var loaded=[],pending=tilePayload.length;
-      tilePayload.forEach(function(t){
-        var im=new Image();
-        im.onload=function(){loaded.push({img:im,dx:Number(t.dx)||0,dy:Number(t.dy)||0});if(--pending===0)cb(loaded.length?loaded:null);};
-        im.onerror=function(){if(--pending===0)cb(loaded.length?loaded:null);};
-        im.src='data:image/png;base64,'+t.b64;
-      });
-      return;
-    }
-    if(mapB64){
-      var mapImg=new Image();
-      mapImg.onload=function(){cb(mapImg);};
-      mapImg.onerror=function(){cb(null);};
-      mapImg.src='data:image/png;base64,'+mapB64;
-      return;
-    }
-    cb(null);
-  }
-
-  if(mapSize>0&&(mapB64||(mapTiles&&mapTiles.length))){
-    loadMapImages(function(mapImgs){drawTextPanel();if(mapImgs)drawMapPanel(mapImgs);finish();});
-  }else{
-    drawTextPanel();finish();
-  }
-}
-
-function stamp(payload){
-  var data;try{data=JSON.parse(payload);}catch(ex){window.ReactNativeWebView.postMessage(JSON.stringify({error:'parse'}));return;}
-  var img=new Image();
-  img.onload=function(){
-    var c=document.getElementById('c');
-    c.width=img.width;c.height=img.height;
-    var ctx=c.getContext('2d');
-    ctx.drawImage(img,0,0);
-    drawStamp(ctx,img,data.lines,data.mapB64||null,data.mapDotX!=null?data.mapDotX:0.5,data.mapDotY!=null?data.mapDotY:0.5,data.mapTiles||null);
-  };
-  img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({error:'load'}));};
-  img.src='data:image/jpeg;base64,'+data.b64;
-}
-document.addEventListener('message',function(e){stamp(e.data);});
-window.addEventListener('message',function(e){stamp(e.data);});
-window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
-<\/script></body></html>`;
-
 type StreetTileInfo = {
   url: string;
   tileX: number;
@@ -603,6 +453,8 @@ export function PoleDetailScreen() {
     project_name,
     accent,
     report_type,
+    sitemap_lat,
+    sitemap_lng,
 	  } = useLocalSearchParams<{
 	    pole_id: string;
 	    pole_row_id?: string;
@@ -615,6 +467,8 @@ export function PoleDetailScreen() {
 	    project_name: string;
 	    accent: string;
 	    report_type: string;
+	    sitemap_lat: string;
+	    sitemap_lng: string;
 	  }>();
 
   const isPoleReport = report_type === "pole_report" || pathname.includes("/teardowns/pole-report");
@@ -832,26 +686,7 @@ export function PoleDetailScreen() {
             const delta = Math.floor((new Date(finishedTs).getTime() - baseMs) / 1000);
             setElapsedSecs(Math.max(0, delta));
 
-            // Auto-redirect to span selection — only for span teardown, not pole reports.
-            if (!isPoleReport && !autoNavigatedToSpanRef.current) {
-              autoNavigatedToSpanRef.current = true;
-              const gpsDraft = await cacheGet<{ lat: number; lng: number }>(`pole_gps_${pole_id}`).catch(() => null);
-              router.push({
-                pathname: "/teardowns/select-pair" as any,
-                params: {
-                  pole_id,
-                  pole_code,
-                  pole_name: pole_name || pole_code || "",
-                  node_id,
-                  project_id: project_id || "",
-                  project_name: project_name || "",
-                  accent: accentColor,
-                  from_pole_latitude: gpsDraft?.lat ? String(gpsDraft.lat) : "",
-                  from_pole_longitude: gpsDraft?.lng ? String(gpsDraft.lng) : "",
-                  from_pole_gps_captured_at: "",
-                },
-              });
-            }
+            // No auto-redirect — stay on pole detail so the user can review without being forced to span selection.
           } else {
             setElapsedSecs(Math.max(0, Math.floor((Date.now() - baseMs) / 1000)));
           }
@@ -1698,6 +1533,9 @@ export function PoleDetailScreen() {
         return;
       }
 
+      // No distance check on GPS capture — the purpose of recapturing is to
+      // replace the sitemap coordinates with the actual field coordinates.
+
       const capturedAt = await getDisplayTime();
       const draft: GpsDraft = {
         lat: coords.latitude,
@@ -1758,8 +1596,8 @@ export function PoleDetailScreen() {
 
   const hasGps = !!(lat && lng);
   const hasRecapturedGps = hasGps && !gpsFromSitemap && !!gpsCapturedAt;
-  const gpsDoneForUi = isPoleReport ? hasRecapturedGps : hasGps;
-  const infoComplete = teardownStarted && (isPoleReport ? hasRecapturedGps : hasGps && !!slot);
+  const gpsDoneForUi = hasRecapturedGps;
+  const infoComplete = teardownStarted && hasRecapturedGps && !!slot;
 
   const [showCameraModal, setShowCameraModal]   = useState(false);
   const [mapFullscreen, setMapFullscreen]       = useState(false);
@@ -1786,7 +1624,7 @@ export function PoleDetailScreen() {
 
 
   const canSelectPair =
-    (hasGps || poleLoading) &&
+    hasRecapturedGps &&
     !!photoBefore &&
     !!photoAfter &&
     !!photoTag &&
@@ -1855,6 +1693,8 @@ export function PoleDetailScreen() {
     const actualToId = String(destPole?.pole?.id ?? "");
     const actualToCode = destPole?.pole?.pole_code ?? "";
     const actualToName = destPole?.pole?.pole_code ?? "";
+    const destLat = (destPole?.pole as any)?.lat ?? null;
+    const destLng = (destPole?.pole as any)?.lng ?? null;
 
     router.push({
       pathname: "/teardowns/destination-pole" as any,
@@ -1884,6 +1724,8 @@ export function PoleDetailScreen() {
         from_pole_latitude: lat ? String(lat) : "",
         from_pole_longitude: lng ? String(lng) : "",
         from_pole_gps_captured_at: gpsCapturedAt,
+        to_pole_sitemap_lat: destLat ? String(destLat) : "",
+        to_pole_sitemap_lng: destLng ? String(destLng) : "",
       },
     });
   }
@@ -2005,6 +1847,7 @@ export function PoleDetailScreen() {
           pole_code,
           pole_name: editedPoleName || pole_name,
           node_id,
+          node_name,
           project_id,
           project_name,
           accent: accentColor,
@@ -2429,6 +2272,7 @@ export function PoleDetailScreen() {
                 style={styles.gpsMapBox}
               >
                 <WebView
+                  key={`map-${lat}-${lng}-${mapSatellite}`}
                   style={StyleSheet.absoluteFillObject}
                   scrollEnabled={false}
                   originWhitelist={["*"]}
@@ -2476,7 +2320,7 @@ export function PoleDetailScreen() {
             <Pressable
               style={({ pressed }) => [
                 styles.gpsCardButton,
-                hasGps
+                gpsDoneForUi
                   ? styles.gpsCardButtonSuccess
                   : styles.gpsCardButtonRequired,
                 pressed && !gpsCapturing && styles.pressedDown,
@@ -2487,7 +2331,7 @@ export function PoleDetailScreen() {
               <View
                 style={[
                   styles.gpsIconWrap,
-                  hasGps
+                  gpsDoneForUi
                     ? { backgroundColor: `${accentColor}16` }
                     : { backgroundColor: `${accentColor}10` },
                 ]}
@@ -2509,11 +2353,11 @@ export function PoleDetailScreen() {
                 <Text
                   style={[
                     styles.gpsCoordinateText,
-                    hasGps && { color: "#0F172A" },
+                    gpsDoneForUi && { color: "#0F172A" },
                   ]}
                   numberOfLines={1}
                 >
-                  {gpsTopLabel}
+                  {gpsDoneForUi ? gpsTopLabel : gpsFromSitemap ? "Tap to capture from device" : gpsTopLabel}
                 </Text>
 
                 <Text style={styles.gpsLocationText} numberOfLines={2}>
@@ -3316,6 +3160,7 @@ export function PoleDetailScreen() {
             {/* Full map */}
             {lat !== null && lng !== null && (
               <WebView
+                key={`mapfs-${lat}-${lng}-${mapSatellite}`}
                 style={{ flex: 1 }}
                 originWhitelist={["*"]}
                 javaScriptEnabled

@@ -2,7 +2,7 @@ import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { Stack, useFocusEffect, useRouter } from "expo-router";
 import { ChevronLeft, MessageSquare, Plus, RefreshCw } from "lucide-react-native";
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -34,6 +34,7 @@ export default function TicketsListScreen() {
   const router = useRouter();
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [loading, setLoading] = useState(true);
+  const lastFetchRef = useRef<number>(0);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -66,6 +67,9 @@ export default function TicketsListScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      const now = Date.now();
+      if (now - lastFetchRef.current < 2 * 60 * 1000 && tickets.length > 0) return;
+      lastFetchRef.current = now;
       fetchTickets(tickets.length > 0);
     }, [fetchTickets, tickets.length])
   );

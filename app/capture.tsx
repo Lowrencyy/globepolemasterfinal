@@ -141,8 +141,7 @@ export default function CaptureScreen() {
     try {
       // Use onPictureSaved so the shutter action is instant; we handle the saved URI in the callback.
       cameraRef.current.takePictureAsync({
-        quality: 0.92,
-        skipProcessing: true,
+        quality: 0.85,
         exif: false,
         onPictureSaved: async (picture) => {
           try {

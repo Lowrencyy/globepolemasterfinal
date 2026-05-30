@@ -35,7 +35,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { GestureDetector, Gesture } from "react-native-gesture-handler";
 import { WebView } from "react-native-webview";
-import { buildSpanMapHtml, buildPoleMapHtml, StaticTileMap } from "./components";
+import { buildSpanMapHtml, buildPoleMapHtml, StaticTileMap, STAMP_HTML } from "./components";
 
 const SLOTS = ["DA", "C1", "C2", "C3", "C4", "C5"] as const;
 const REQUIRED_GPS_ACCURACY_METERS = 10;
@@ -55,6 +55,16 @@ type GpsData = {
   accuracy: number | null;
   captured_at: string;
 };
+
+function computeDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371e3;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dp = ((lat2 - lat1) * Math.PI) / 180;
+  const dl = ((lng2 - lng1) * Math.PI) / 180;
+  const a = Math.sin(dp / 2) * Math.sin(dp / 2) + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+  return Math.round(6371e3 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
 
 function sanitize(s?: string) {
   return (s ?? "")
@@ -347,117 +357,6 @@ function PhotoTile({
   );
 }
 
-const STAMP_HTML = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#000"><canvas id="c"></canvas><script>
-function rr(ctx,x,y,w,h,r){
-  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
-  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
-  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
-  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
-}
-function drawStamp(ctx,img,lines,mapB64,mapDotX,mapDotY,mapTiles){
-  var W=img.width,H=img.height;
-  var gap=Math.round(W*0.012);
-  var fSize=Math.min(Math.max(14,Math.round(W*0.020)),Math.floor((H*0.22)/(lines.length*1.55+1.5)));
-  var lh=Math.round(fSize*1.55);
-  var vPad=Math.round(fSize*0.9);
-  var hPad=Math.round(fSize*0.75);
-  var panelH=lines.length*lh+vPad*2;
-  var r=Math.round(panelH*0.14);
-  var mapSize=(mapB64||(mapTiles&&mapTiles.length))?panelH:0;
-  var textW=W-gap*2-mapSize-(mapSize?gap:0);
-  var panelY=H-panelH-gap;
-  var mapY=panelY;
-  var fadeH=panelH+gap*4;
-  var grad=ctx.createLinearGradient(0,H-fadeH,0,H);
-  grad.addColorStop(0,'rgba(0,0,0,0)');grad.addColorStop(1,'rgba(0,0,0,0.38)');
-  ctx.fillStyle=grad;ctx.fillRect(0,H-fadeH,W,fadeH);
-  function drawTextPanel(){
-    ctx.save();rr(ctx,gap,panelY,textW,panelH,r);
-    ctx.fillStyle='rgba(0,0,0,0.52)';ctx.fill();ctx.restore();
-    ctx.shadowColor='rgba(0,0,0,0.9)';ctx.shadowBlur=3;
-    var startY=panelY+(panelH-lines.length*lh)/2;
-    lines.forEach(function(line,i){
-      var y=startY+(i+0.78)*lh;
-      var maxW=textW-hPad*2;
-      if(i===0){ctx.font='bold '+Math.round(fSize*1.05)+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
-      else if(i===lines.length-1){ctx.font=Math.round(fSize*0.84)+'px Arial,sans-serif';ctx.fillStyle='rgba(255,255,255,0.72)';}
-      else{ctx.font='bold '+fSize+'px Arial,sans-serif';ctx.fillStyle='#FFFFFF';}
-      var txt=line;while(ctx.measureText(txt).width>maxW&&txt.length>4)txt=txt.slice(0,-2);
-      if(txt!==line)txt=txt.slice(0,-1)+'…';
-      ctx.fillText(txt,gap+hPad,y);
-    });
-    ctx.shadowBlur=0;
-  }
-  function drawMapPanel(mapImgs){
-    var mx=gap+textW+gap,my=mapY;
-    ctx.save();rr(ctx,mx,my,mapSize,mapSize,r);ctx.clip();
-    // Offset tile so captured GPS lands at CENTER of the panel
-    var dotFX=(mapDotX!=null&&!isNaN(mapDotX))?mapDotX:0.5;
-    var dotFY=(mapDotY!=null&&!isNaN(mapDotY))?mapDotY:0.5;
-    if(Array.isArray(mapImgs)){
-      mapImgs.forEach(function(t){
-        if(!t||!t.img)return;
-        var dx=Number(t.dx)||0,dy=Number(t.dy)||0;
-        ctx.drawImage(t.img,mx+(dx+0.5-dotFX)*mapSize,my+(dy+0.5-dotFY)*mapSize,mapSize,mapSize);
-      });
-    }else if(mapImgs){
-      ctx.drawImage(mapImgs,mx+(0.5-dotFX)*mapSize,my+(0.5-dotFY)*mapSize,mapSize,mapSize);
-    }
-    ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(mx,my,mapSize,mapSize);
-    // GPS dot always at center
-    var dotR=Math.round(mapSize*0.07);
-    var dX=mx+mapSize/2;
-    var dY=my+mapSize/2;
-    ctx.beginPath();ctx.arc(dX,dY,dotR,0,2*Math.PI);
-    ctx.fillStyle='#EF4444';ctx.fill();
-    ctx.strokeStyle='#FFFFFF';ctx.lineWidth=Math.max(2,Math.round(dotR*0.35));ctx.stroke();
-    ctx.restore();
-  }
-  function finish(){
-    var b64=document.getElementById('c').toDataURL('image/jpeg',0.93).split(',')[1];
-    window.ReactNativeWebView.postMessage(JSON.stringify({stamped:b64}));
-  }
-  function loadMapImages(cb){
-    var tilePayload=Array.isArray(mapTiles)?mapTiles.filter(function(t){return t&&t.b64;}):[];
-    if(tilePayload.length){
-      var loaded=[],pending=tilePayload.length;
-      tilePayload.forEach(function(t){
-        var im=new Image();
-        im.onload=function(){loaded.push({img:im,dx:Number(t.dx)||0,dy:Number(t.dy)||0});if(--pending===0)cb(loaded.length?loaded:null);};
-        im.onerror=function(){if(--pending===0)cb(loaded.length?loaded:null);};
-        im.src='data:image/png;base64,'+t.b64;
-      });
-      return;
-    }
-    if(mapB64){
-      var mapImg=new Image();
-      mapImg.onload=function(){cb(mapImg);};
-      mapImg.onerror=function(){cb(null);};
-      mapImg.src='data:image/png;base64,'+mapB64;
-      return;
-    }
-    cb(null);
-  }
-  if(mapSize>0&&(mapB64||(mapTiles&&mapTiles.length))){
-    loadMapImages(function(mapImgs){drawTextPanel();if(mapImgs)drawMapPanel(mapImgs);finish();});
-  }else{drawTextPanel();finish();}
-}
-function stamp(payload){
-  var data;try{data=JSON.parse(payload);}catch(ex){window.ReactNativeWebView.postMessage(JSON.stringify({error:'parse'}));return;}
-  var img=new Image();
-  img.onload=function(){
-    var c=document.getElementById('c');c.width=img.width;c.height=img.height;
-    var ctx=c.getContext('2d');ctx.drawImage(img,0,0);
-    drawStamp(ctx,img,data.lines,data.mapB64||null,data.mapDotX!=null?data.mapDotX:0.5,data.mapDotY!=null?data.mapDotY:0.5,data.mapTiles||null);
-  };
-  img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({error:'load'}));};
-  img.src='data:image/jpeg;base64,'+data.b64;
-}
-document.addEventListener('message',function(e){stamp(e.data);});
-window.addEventListener('message',function(e){stamp(e.data);});
-window.ReactNativeWebView.postMessage(JSON.stringify({ready:1}));
-<\/script></body></html>`;
-
 type StreetTileInfo = {
   url: string;
   tileX: number;
@@ -540,6 +439,8 @@ export default function DestinationPoleScreen() {
     from_pole_gps_captured_at: string;
     from_pole_id: string;
     node_name?: string;
+    to_pole_sitemap_lat?: string;
+    to_pole_sitemap_lng?: string;
   }>();
 
   const accentColor = params.accent || "#0B7A5A";
@@ -751,8 +652,8 @@ export default function DestinationPoleScreen() {
   const gpsWarmPromiseRef = useRef<Promise<void> | null>(null);
   const captureMapPrefetchedRef = useRef(false);
 
-  const hasGps = !!capturedGps;
-  const infoComplete = hasGps && !!slot;
+  const hasGps = !!capturedGps && !gpsFromSitemap;
+  const infoComplete = !!poleStartedAt && hasGps && !!slot;
 
   // Always allow starting — don't block the user with "complete required fields first"
 
@@ -925,7 +826,6 @@ export default function DestinationPoleScreen() {
       //   → If Pole 1 was already a FROM pole (captured before/after/tag in pole-detail),
       //     all 3 are reused here when Pole 1 becomes a destination on a different span.
       //   → Copied into teardown_drafts so submission reads from one consistent place.
-      //   → When b+a+t are all found, auto-proceeds to components immediately.
       const load = async (
         tdFile: string,
         pdFile: string | null, // null = never fall back to pole_drafts
@@ -986,29 +886,6 @@ export default function DestinationPoleScreen() {
       if (b) setPhotoBefore(b);
       if (a) setPhotoAfter(a);
       if (t) setPhotoTag(t);
-
-      // If ALL 3 photos were already captured (pole was previously a FROM pole on another span),
-      // auto-proceed to components — no need to recapture the same pole's photos.
-      if (b && a && t) {
-        // Small delay so the UI renders the restored photos before navigating
-        setTimeout(() => {
-          const gps = toPoleGpsRef.current;
-          router.push({
-            pathname: "/teardowns/components" as any,
-            params: {
-              ...params,
-              to_pole_name: params.to_pole_name,
-              to_pole_latitude: gps ? String(gps.latitude) : "",
-              to_pole_longitude: gps ? String(gps.longitude) : "",
-              to_pole_gps_captured_at: gps?.captured_at ?? "",
-              to_pole_gps_accuracy: gps?.accuracy != null ? String(gps.accuracy) : "",
-              destination_slot: "",
-              destination_landmark: "",
-              teardown_started_at: new Date().toISOString(),
-            },
-          });
-        }, 400);
-      }
 
       const [qb, qa, qt] = await Promise.all([
         cacheGet<number>(`td_quality_before_${params.to_pole_id}`),
@@ -1261,6 +1138,9 @@ export default function DestinationPoleScreen() {
       Alert.alert("GPS not ready", "Still acquiring signal. Please wait.");
       return;
     }
+
+    // No distance check on GPS capture — the purpose of recapturing is to
+    // replace the sitemap coordinates with the actual field coordinates.
 
     setGpsCapturing(true);
     try {
@@ -1806,22 +1686,6 @@ export default function DestinationPoleScreen() {
                   </View>
                 </View>
 
-                {/* Start button — only when not yet started */}
-                {!poleStartedAt && (
-                  <TouchableOpacity
-                    style={[styles.heroPoleStartBtn, poleStarting && { opacity: 0.6 }]}
-                    activeOpacity={0.85}
-                    onPress={handleStartPoleTeardown}
-                    disabled={poleStarting}
-                  >
-                    {poleStarting
-                      ? <ActivityIndicator size="small" color="#FFFFFF" style={{ marginRight: 8 }} />
-                      : <Play size={14} color="#FFFFFF" fill="#FFFFFF" style={{ marginRight: 6 } as any} />}
-                    <Text style={styles.heroPoleStartBtnText}>
-                      {poleStarting ? "Starting…" : "Start Pole Teardown"}
-                    </Text>
-                  </TouchableOpacity>
-                )}
 
                 {/* Progress section */}
                 <View style={styles.heroFooterHeaderRow}>
@@ -1878,6 +1742,7 @@ export default function DestinationPoleScreen() {
                 style={styles.gpsMapBox}
               >
                 <WebView
+                  key={`map-${capturedGps.latitude}-${capturedGps.longitude}-${mapSatellite}`}
                   style={StyleSheet.absoluteFillObject}
                   scrollEnabled={false}
                   originWhitelist={["*"]}
@@ -1890,6 +1755,7 @@ export default function DestinationPoleScreen() {
                       capturedGps.longitude,
                       accentColor,
                       mapSatellite,
+                      editedToPoleName || params.to_pole_name || params.to_pole_code || "",
                     ),
                     baseUrl: "https://local.telcovantage/",
                   }}
@@ -1931,10 +1797,11 @@ export default function DestinationPoleScreen() {
                 hasGps
                   ? styles.gpsCardButtonSuccess
                   : styles.gpsCardButtonRequired,
-                pressed && !gpsCapturing && styles.pressedDown,
+                !poleStartedAt && { opacity: 0.4 },
+                pressed && poleStartedAt && !gpsCapturing && styles.pressedDown,
               ]}
               onPress={captureGps}
-              disabled={gpsCapturing}
+              disabled={!poleStartedAt || gpsCapturing}
             >
               <View
                 style={[
@@ -2004,16 +1871,16 @@ export default function DestinationPoleScreen() {
                 </View>
               }
             />
-            <View style={styles.slotRowStatic}>
+            <View style={[styles.slotRowStatic, !poleStartedAt && { opacity: 0.4 }]}>
               {SLOTS.map((s) => (
                 <Pressable
                   key={s}
                   style={({ pressed }) => [
                     styles.slotBtn,
                     slot === s && { backgroundColor: accentColor, borderColor: accentColor },
-                    pressed && styles.pressedDown,
+                    pressed && poleStartedAt && styles.pressedDown,
                   ]}
-                  onPress={() => setSlot(s)}
+                  onPress={() => poleStartedAt && setSlot(s)}
                 >
                   <Text style={[styles.slotText, slot === s && { color: "#FFFFFF" }]}>{s}</Text>
                 </Pressable>
@@ -2034,13 +1901,14 @@ export default function DestinationPoleScreen() {
               }
             />
             <TextInput
-              style={styles.textArea}
+              style={[styles.textArea, !poleStartedAt && { opacity: 0.4 }]}
               placeholder="e.g. Beside blue gate, near convenience store"
               placeholderTextColor="#9CA3AF"
               value={landmark}
               onChangeText={setLandmark}
               multiline
               numberOfLines={3}
+              editable={!!poleStartedAt}
             />
           </View>
 
@@ -2048,7 +1916,7 @@ export default function DestinationPoleScreen() {
           <View style={styles.sectionCard}>
             <SectionHeading
               title="Pole Photos"
-              subtitle={infoComplete ? "Click a card to capture · tap again to view" : "Fill GPS & Slot first"}
+              subtitle={!poleStartedAt ? "Start pole teardown first" : infoComplete ? "Click a card to capture · tap again to view" : "Fill GPS & Slot first"}
             />
             <View style={styles.photoTileRow}>
               <PhotoTile
@@ -2080,19 +1948,39 @@ export default function DestinationPoleScreen() {
         </ScrollView>
 
         <View style={styles.ctaBar}>
-          <Pressable
-            style={({ pressed }) => [
-              styles.submitBtn,
-              { backgroundColor: progress.percent >= 100 ? accentColor : "#C9CED6" },
-              pressed && progress.percent >= 100 && styles.pressedDown,
-            ]}
-            onPress={progress.percent >= 100 ? goToComponents : undefined}
-            disabled={progress.percent < 100}
-          >
-            <Text style={styles.submitText}>
-              {progress.percent >= 100 ? "Next  →" : "Complete required fields first"}
-            </Text>
-          </Pressable>
+          {!poleStartedAt ? (
+            <Pressable
+              style={({ pressed }) => [
+                styles.submitBtn,
+                { backgroundColor: accentColor, opacity: poleStarting ? 0.7 : pressed ? 0.85 : 1 },
+              ]}
+              onPress={handleStartPoleTeardown}
+              disabled={poleStarting}
+            >
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center" }}>
+                <Text style={styles.submitText}>
+                  {poleStarting ? "Starting…" : "Start Pole Teardown"}
+                </Text>
+                {poleStarting
+                  ? <ActivityIndicator size="small" color="#FFFFFF" style={{ marginLeft: 8 }} />
+                  : <Play size={15} color="#FFFFFF" fill="#FFFFFF" style={{ marginLeft: 8 } as any} />}
+              </View>
+            </Pressable>
+          ) : (
+            <Pressable
+              style={({ pressed }) => [
+                styles.submitBtn,
+                { backgroundColor: progress.percent >= 100 ? accentColor : "#C9CED6" },
+                pressed && progress.percent >= 100 && styles.pressedDown,
+              ]}
+              onPress={progress.percent >= 100 ? goToComponents : undefined}
+              disabled={progress.percent < 100}
+            >
+              <Text style={styles.submitText}>
+                {progress.percent >= 100 ? "Next  →" : "Complete required fields first"}
+              </Text>
+            </Pressable>
+          )}
         </View>
 
         {/* ── Edit Destination Pole Name Modal ── */}

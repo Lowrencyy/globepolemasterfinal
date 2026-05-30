@@ -542,7 +542,7 @@ export default function PoleMapScreen() {
   const { token, user } = useAuth();
   const insets = useSafeAreaInsets();
   const webRef = useRef<WebView>(null);
-  const didInitialFetch = useRef(false);
+  const lastPinFetchRef = useRef<number>(0);
 
   const [pins, setPins] = useState<PolePin[]>([]);
   const [loading, setLoading] = useState(true);
@@ -669,8 +669,11 @@ export default function PoleMapScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      const now = Date.now();
+      if (now - lastPinFetchRef.current < 5 * 60 * 1000 && pins.length > 0) return;
+      lastPinFetchRef.current = now;
       fetchPins();
-    }, [fetchPins]),
+    }, [fetchPins, pins.length]),
   );
 
   const sitesList = useMemo(() => {

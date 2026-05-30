@@ -7,10 +7,15 @@ import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
 import "react-native-reanimated";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { LogBox } from "react-native";
 
-// Suppress non-fatal "Unable to activate keep awake" errors thrown by
-// expo-camera's internal expo-keep-awake call on some Android devices.
-// The error appears as an unhandled rejection but does NOT affect functionality.
+// Suppress non-fatal "Unable to activate keep awake" — thrown by expo-camera's
+// internal expo-keep-awake call on some Android devices. Does not affect functionality.
+LogBox.ignoreLogs([
+  "Unable to activate keep awake",
+  "Uncaught (in promise",
+]);
+
 if (typeof global !== "undefined") {
   const _gu = (global as any).ErrorUtils;
   if (_gu) {

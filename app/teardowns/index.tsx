@@ -7,6 +7,7 @@ import { getAreas, SkycableArea, SkycableNode, SkycablePole } from "@/services/s
 import { useAuth } from "@/context/auth-context";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getTileUri, networkUrl } from "@/lib/tile-cache";
+import { shouldRefresh, markSynced, lockSync, unlockSync } from "@/lib/sync-guard";
 
 // Resolves to a file:// URI if the tile is cached on disk, else HTTPS.
 function TileImage({
@@ -200,14 +201,20 @@ export default function AreasScreen() {
       }
       setLoading(false); // Always unblock UI after cache check — don't block on network
 
-      // Always fetch — team filter must always be applied
+      const GUARD_KEY = `areas_${teamId ?? 0}`;
+      const stale = await shouldRefresh(GUARD_KEY, 5 * 60 * 1000);
+      if (!stale && cached?.length) return;
+      if (!lockSync(GUARD_KEY)) return;
       try {
         const data = await getAreas(token, teamId);
         setAreas(data);
         cacheSet(CACHE_KEY, data).catch(() => {});
+        await markSynced(GUARD_KEY);
         setOffline(false);
       } catch {
         if (!cached?.length) setOffline(true);
+      } finally {
+        unlockSync(GUARD_KEY);
       }
     }
     loadAreas();

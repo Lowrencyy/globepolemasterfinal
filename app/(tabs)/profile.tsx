@@ -400,20 +400,31 @@ export default function ProfileScreen() {
       updateStep("poles", { status: "success", detail: `${totalPoles} pole${totalPoles !== 1 ? "s" : ""} cached.` });
 
       // 6. Cache Philippines tiles
-      updateStep("ph_tiles", { status: "running", detail: "Caching Philippines overview (zoom 6–10)…" });
+      // Fast-path: if we've already done a full PH cache, skip the 2000+ file checks entirely.
+      updateStep("ph_tiles", { status: "running", detail: "Checking Philippines tile cache…" });
       try {
-        const phRes = await cachePhilippines((done, total) =>
-          updateStep("ph_tiles", { status: "running", detail: `${done}/${total} tiles…` })
-        );
-        updateStep("ph_tiles", {
-          status: "success",
-          detail: `${phRes.downloaded} new · ${phRes.skipped} already cached`,
-        });
+        const phDoneFlag = await AsyncStorage.getItem("tile_cache_ph_complete");
+        if (phDoneFlag === "1") {
+          updateStep("ph_tiles", { status: "success", detail: "Already cached — skipped ✓" });
+        } else {
+          const phRes = await cachePhilippines((done, total) =>
+            updateStep("ph_tiles", { status: "running", detail: `${done}/${total} tiles…` })
+          );
+          if (phRes.downloaded === 0 && phRes.failed === 0) {
+            // All tiles were already on disk — mark so future syncs skip immediately
+            await AsyncStorage.setItem("tile_cache_ph_complete", "1");
+          }
+          updateStep("ph_tiles", {
+            status: "success",
+            detail: `${phRes.downloaded} new · ${phRes.skipped} already cached`,
+          });
+        }
       } catch (e: any) {
         updateStep("ph_tiles", { status: "error", detail: e?.message ?? "Tile download failed." });
       }
 
       // 7. Cache high-zoom tiles for pole locations
+      // Fast-path: hash the pole GPS list. If unchanged since last successful cache, skip.
       updateStep("loc_tiles", { status: "running", detail: "Collecting pole GPS…" });
       try {
         const locSet: { lat: number; lng: number }[] = [];
@@ -428,13 +439,30 @@ export default function ProfileScreen() {
           }
         }
         if (locSet.length) {
-          const locRes = await cacheLocations(locSet, [11, 12, 13, 14, 15], (done, total) =>
-            updateStep("loc_tiles", { status: "running", detail: `${done}/${total} tiles…` })
-          );
-          updateStep("loc_tiles", {
-            status: "success",
-            detail: `${locRes?.downloaded ?? 0} new · ${locSet.length} GPS points`,
-          });
+          // Build a lightweight hash of all GPS points
+          const locHash = locSet.reduce(
+            (h, p) => ((h * 31 + Math.round(p.lat * 1e4)) * 31 + Math.round(p.lng * 1e4)) | 0,
+            0,
+          ).toString(16);
+
+          const savedHash = await AsyncStorage.getItem("tile_cache_loc_hash");
+          if (savedHash === locHash) {
+            updateStep("loc_tiles", {
+              status: "success",
+              detail: `Already cached — ${locSet.length} GPS points ✓`,
+            });
+          } else {
+            const locRes = await cacheLocations(locSet, [11, 12, 13, 14, 15], (done, total) =>
+              updateStep("loc_tiles", { status: "running", detail: `${done}/${total} tiles…` })
+            );
+            if ((locRes?.failed ?? 0) === 0) {
+              await AsyncStorage.setItem("tile_cache_loc_hash", locHash);
+            }
+            updateStep("loc_tiles", {
+              status: "success",
+              detail: `${locRes?.downloaded ?? 0} new · ${locSet.length} GPS points`,
+            });
+          }
         } else {
           updateStep("loc_tiles", { status: "success", detail: "No GPS data — skipped." });
         }

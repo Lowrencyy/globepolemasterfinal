@@ -48,10 +48,11 @@ function AuthGate() {
     const root = segments[0] as string | undefined;
     const onLogin = root === "login";
     const onChangePw = root === "change-password";
+    const onLoading = root === "loading";
 
     if (!isLoggedIn && !onLogin) {
       router.replace("/login");
-    } else if (isLoggedIn && mustChangePassword && !onChangePw) {
+    } else if (isLoggedIn && mustChangePassword && !onChangePw && !onLoading) {
       router.replace("/change-password");
     } else if (isLoggedIn && !mustChangePassword && (onLogin || onChangePw)) {
       router.replace("/(tabs)");
@@ -77,8 +78,10 @@ export default function RootLayout() {
         <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
           <Stack>
             <Stack.Screen name="login" options={{ headerShown: false }} />
+            <Stack.Screen name="loading" options={{ headerShown: false, animation: "none" }} />
             <Stack.Screen name="change-password" options={{ headerShown: false, gestureEnabled: false }} />
             <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+            <Stack.Screen name="admin" options={{ headerShown: false }} />
             <Stack.Screen name="teardowns" options={{ headerShown: false }} />
             <Stack.Screen name="naps" options={{ headerShown: false }} />
             <Stack.Screen name="delivery" options={{ headerShown: false }} />

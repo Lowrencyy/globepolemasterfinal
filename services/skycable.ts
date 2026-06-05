@@ -123,6 +123,7 @@ export interface TeardownLog {
   team_id?: number | null;
   captured_lat?: number | string | null;
   captured_lng?: number | string | null;
+  local_id?: string | null;
 }
 
 /** GET /skycable/teardowns — all teardown logs (filter by node_id, date etc.) */
@@ -215,11 +216,17 @@ export interface WarehouseReceipt {
   node_id?: number | null;
   received_by?: number | null;
   receipt_date: string;            // yyyy-mm-dd
-  status: "pending" | "arrived" | "approved" | "rejected";
+  status: "pending" | "arrived" | "unloading" | "approved" | "rejected";
   approved_by?: number | null;
   notes?: string | null;
   submitted_lat?: number | null;
   submitted_lng?: number | null;
+  live_location?: {
+    lat: number;
+    lng: number;
+    accuracy?: number | null;
+    pinged_at?: string | null;
+  } | null;
   items?: WarehouseReceiptItem[];
   node?: { id: number; name: string } | null;
   warehouse?: Warehouse | null;
@@ -254,6 +261,7 @@ export const createWarehouseReceipt = async (
     items: { item_type: string; quantity: number; unit: string }[];
     submitted_lat?: number | null;
     submitted_lng?: number | null;
+    teardown_local_ids?: string[];
   }
 ): Promise<WarehouseReceipt> => {
   return api.request<WarehouseReceipt>("/skycable/warehouse-receipts", {
@@ -281,6 +289,32 @@ export const markWarehouseReceiptArrived = async (
 ): Promise<WarehouseReceipt> => {
   return api.request<WarehouseReceipt>(`/skycable/warehouse-receipts/${receiptId}/arrive`, {
     method: "PUT",
+  }, token);
+};
+
+/** PUT /skycable/warehouse-receipts/{id}/start-unload — warehouse in-charge starts unloading */
+export const startWarehouseReceiptUnload = async (
+  token: string,
+  receiptId: number
+): Promise<WarehouseReceipt> => {
+  return api.request<WarehouseReceipt>(`/skycable/warehouse-receipts/${receiptId}/start-unload`, {
+    method: "PUT",
+  }, token);
+};
+
+/** POST /skycable/lineman/location — publish live lineman GPS for dashboard/receipt tracking */
+export const updateLinemanLocation = async (
+  token: string,
+  payload: {
+    latitude: number;
+    longitude: number;
+    accuracy?: number | null;
+    timestamp?: string;
+  }
+): Promise<{ ok: boolean; arrived_receipt_ids?: number[] }> => {
+  return api.request<{ ok: boolean; arrived_receipt_ids?: number[] }>("/skycable/lineman/location", {
+    method: "POST",
+    body: JSON.stringify(payload),
   }, token);
 };
 
@@ -362,6 +396,45 @@ export const getWarehouseStocks = async (token: string, warehouseId: number): Pr
   } catch { return []; }
 };
 
+// ─── In-app Notifications ────────────────────────────────────────────────────
+
+export interface AppNotification {
+  id: number;
+  type: string;
+  title: string;
+  body: string;
+  read_at: string | null;
+  created_at: string;
+  data?: Record<string, any> | null;
+}
+
+/** GET /notifications?per_page=15 */
+export const getNotifications = async (token: string): Promise<AppNotification[]> => {
+  try {
+    const res = await api.request<AppNotification[] | { data: AppNotification[] }>(
+      "/notifications?per_page=15", {}, token
+    );
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** POST /notifications/mark-read */
+export const markNotificationsRead = async (token: string): Promise<void> => {
+  try {
+    await api.request<void>("/notifications/mark-read", { method: "POST" }, token);
+  } catch {}
+};
+
+/** GET /notifications/unread-count */
+export const getUnreadNotificationCount = async (token: string): Promise<number> => {
+  try {
+    const res = await api.request<{ count: number } | number>(
+      "/notifications/unread-count", {}, token
+    );
+    return typeof res === "number" ? res : (res as any)?.count ?? 0;
+  } catch { return 0; }
+};
+
 /** Convert WarehouseStock array → CollectedTotals for display */
 export function stocksToTotals(stocks: WarehouseStock[]): CollectedTotals {
   const t: CollectedTotals = { cable: 0, node: 0, amplifier: 0, extender: 0, tsc: 0, psu: 0, psuCase: 0 };
@@ -439,13 +512,6 @@ export const getPickupRequests = async (token: string, status?: string): Promise
   } catch { return []; }
 };
 
-/** PUT /skycable/deliveries/{id}/accept — accept a warehouse-to-warehouse delivery */
-export const acceptDelivery = async (token: string, deliveryId: number): Promise<BackendDelivery> => {
-  return api.request<BackendDelivery>(`/skycable/deliveries/${deliveryId}/accept`, {
-    method: "PUT",
-  }, token);
-};
-
 /** POST /skycable/pickup-requests */
 export const createPickupRequest = async (
   token: string,
@@ -502,4 +568,210 @@ export const downloadSitemapData = async (token: string): Promise<boolean> => {
     console.error("Sitemap download failed:", err);
     throw err;
   }
+};
+
+// ── Warehouse Transfers (Pull-Out) ────────────────────────────────────────────
+
+export interface PullOutItem {
+  item_type: string;
+  quantity: number;
+  unit: string;
+}
+
+export interface PullOutRequest {
+  id: number;
+  warehouse_id: number;
+  to_warehouse_id: number | null;
+  driver_id?: number | null;
+  purpose: string;
+  status: "pending" | "approved" | "rejected" | "dispatched" | "delivered";
+  notes: string | null;
+  declared_by: number;
+  approved_by: number | null;
+  approved_at: string | null;
+  created_at: string;
+  warehouse?: { id: number; name: string; type: string };
+  toWarehouse?: { id: number; name: string; type: string };
+  declaredBy?: { id: number; name: string };
+  driver?: { id: number; name: string } | null;
+  items?: PullOutItem[];
+}
+
+export interface WarehouseDelivery {
+  id: number;
+  from_warehouse_id: number;
+  to_warehouse_id: number;
+  driver_id: number | null;
+  status: "pending" | "in_transit" | "arrived" | "accepted" | "rejected";
+  dispatched_at: string | null;
+  arrived_at: string | null;
+  accepted_at: string | null;
+  created_at: string;
+  fromWarehouse?: { id: number; name: string; type: string };
+  toWarehouse?:   { id: number; name: string; type: string };
+  driver?:        { id: number; name: string } | null;
+  dispatchedBy?:  { id: number; name: string } | null;
+  items?: PullOutItem[];
+}
+
+export interface DriverLocation {
+  id: number;
+  user_id: number;
+  latitude: number;
+  longitude: number;
+  accuracy: number | null;
+  pinged_at: string;
+}
+
+export interface DeliveryTracking {
+  delivery: WarehouseDelivery;
+  driver_location: DriverLocation | null;
+}
+
+/** POST /skycable/pull-out-requests — subcon requests transfer to main warehouse */
+export const createPullOutRequest = async (
+  token: string,
+  payload: {
+    warehouse_id: number;
+    to_warehouse_id?: number | null;
+    driver_id?: number | null;
+    items: { item_type: string; quantity: number; unit: string }[];
+    notes?: string;
+  }
+): Promise<PullOutRequest> => {
+  return api.request<PullOutRequest>("/skycable/pull-out-requests", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, token);
+};
+
+/** GET /skycable/pull-out-requests */
+export const getPullOutRequests = async (token: string): Promise<PullOutRequest[]> => {
+  try {
+    const res = await api.request<PullOutRequest[] | { data: PullOutRequest[] }>(
+      "/skycable/pull-out-requests", {}, token
+    );
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** GET /skycable/deliveries */
+export const getDeliveries = async (token: string): Promise<WarehouseDelivery[]> => {
+  try {
+    const res = await api.request<WarehouseDelivery[] | { data: WarehouseDelivery[] }>(
+      "/skycable/deliveries", {}, token
+    );
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** GET /skycable/pull-out-requests/{id}/delivery — the linked delivery for a pull-out */
+export const getPullOutDelivery = async (
+  token: string, pullOutId: number
+): Promise<WarehouseDelivery | null> => {
+  try {
+    return await api.request<WarehouseDelivery>(
+      `/skycable/pull-out-requests/${pullOutId}/delivery`, {}, token
+    );
+  } catch { return null; }
+};
+
+/** GET /skycable/deliveries/{id}/tracking — delivery + driver live location */
+export const getDeliveryTracking = async (
+  token: string, deliveryId: number
+): Promise<DeliveryTracking | null> => {
+  try {
+    return await api.request<DeliveryTracking>(
+      `/skycable/deliveries/${deliveryId}/tracking`, {}, token
+    );
+  } catch { return null; }
+};
+
+/** GET /skycable/driver/deliveries — deliveries assigned to the logged-in driver */
+export const getDriverDeliveries = async (token: string): Promise<WarehouseDelivery[]> => {
+  try {
+    const res = await api.request<WarehouseDelivery[]>(
+      "/skycable/driver/deliveries", {}, token
+    );
+    return Array.isArray(res) ? res : [];
+  } catch { return []; }
+};
+
+export interface DriverUser {
+  id: number;
+  name: string;
+  first_name: string;
+  last_name: string;
+  email: string;
+  is_driver: boolean;
+}
+
+/** GET /skycable/drivers — all users marked as driver */
+export const getDrivers = async (token: string): Promise<DriverUser[]> => {
+  try {
+    const res = await api.request<DriverUser[]>("/skycable/drivers", {}, token);
+    return Array.isArray(res) ? res : [];
+  } catch { return []; }
+};
+
+/** GET /api/v1/users — all users (admin only) */
+export const getUsers = async (token: string): Promise<DriverUser[]> => {
+  try {
+    const res = await api.request<DriverUser[] | { data: DriverUser[] }>("/users", {}, token);
+    return Array.isArray(res) ? res : (res as any)?.data ?? [];
+  } catch { return []; }
+};
+
+/** PUT /skycable/users/{id}/toggle-driver — toggle is_driver flag */
+export const toggleDriverRole = async (token: string, userId: number): Promise<DriverUser> => {
+  return api.request<DriverUser>(`/skycable/users/${userId}/toggle-driver`, { method: "PUT" }, token);
+};
+
+/** POST /skycable/deliveries/{id}/start — driver starts the delivery */
+export const startDelivery = async (token: string, deliveryId: number): Promise<WarehouseDelivery> => {
+  return api.request<WarehouseDelivery>(
+    `/skycable/deliveries/${deliveryId}/start`, { method: "POST" }, token
+  );
+};
+
+/** POST /skycable/deliveries/{id}/arrive — driver marks arrived at destination */
+export const arriveDelivery = async (token: string, deliveryId: number): Promise<WarehouseDelivery> => {
+  return api.request<WarehouseDelivery>(
+    `/skycable/deliveries/${deliveryId}/arrive`, { method: "POST" }, token
+  );
+};
+
+/** GET /skycable/deliveries/incoming/{warehouseId} — arrived deliveries for a warehouse */
+export const getIncomingDeliveries = async (token: string, warehouseId: number): Promise<WarehouseDelivery[]> => {
+  try {
+    const res = await api.request<WarehouseDelivery[]>(
+      `/skycable/deliveries/incoming/${warehouseId}`, {}, token
+    );
+    return Array.isArray(res) ? res : [];
+  } catch { return []; }
+};
+
+/** PUT /skycable/deliveries/{id}/accept — warehouse accepts the delivery */
+export const acceptDelivery = async (token: string, deliveryId: number): Promise<{ delivery: WarehouseDelivery; receipt: any }> => {
+  return api.request(
+    `/skycable/deliveries/${deliveryId}/accept`, { method: "PUT" }, token
+  );
+};
+
+/** PUT /skycable/pull-out-requests/{id}/approve */
+export const approvePullOut = async (
+  token: string,
+  pullOutId: number,
+  action: "approve" | "reject",
+  driverId?: number | null,
+  notes?: string
+): Promise<{ pull_out: PullOutRequest; delivery?: WarehouseDelivery }> => {
+  return api.request(
+    `/skycable/pull-out-requests/${pullOutId}/approve`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ action, driver_id: driverId ?? null, notes }),
+    },
+    token
+  );
 };

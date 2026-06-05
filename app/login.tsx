@@ -4,6 +4,7 @@ import { useAuth } from "@/context/auth-context";
 import OnboardingScreen, { isOnboardingDone } from "./onboarding";
 import {
   Alert,
+  Animated,
   Image,
   KeyboardAvoidingView,
   Modal,
@@ -16,16 +17,21 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useRef } from "react";
 
 const LOGO = require("@/assets/images/telcovantage-logo.png");
 
 export default function LoginScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
   const [checkingOnboarding, setCheckingOnboarding] = useState(true);
   const { login, isLoggedIn, mustChangePassword } = useAuth();
+  const screenOpacity = useRef(new Animated.Value(0)).current;
+  const screenTranslateY = useRef(new Animated.Value(16)).current;
+  const screenScale = useRef(new Animated.Value(0.985)).current;
 
   useEffect(() => {
     isOnboardingDone().then((done) => {
@@ -35,6 +41,26 @@ export default function LoginScreen() {
       setCheckingOnboarding(false);
     });
   }, []);
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(screenOpacity, {
+        toValue: 1,
+        duration: 420,
+        useNativeDriver: true,
+      }),
+      Animated.timing(screenTranslateY, {
+        toValue: 0,
+        duration: 420,
+        useNativeDriver: true,
+      }),
+      Animated.timing(screenScale, {
+        toValue: 1,
+        duration: 420,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [screenOpacity, screenTranslateY, screenScale]);
 
   if (isLoggedIn && mustChangePassword) return <Redirect href="/change-password" />;
   if (isLoggedIn) return <Redirect href="/(tabs)" />;
@@ -51,9 +77,28 @@ export default function LoginScreen() {
     setLoading(true);
     try {
       const result = await login(email.trim(), password);
-      if (result.mustChangePassword) {
-        router.replace("/change-password");
-      }
+      Animated.parallel([
+        Animated.timing(screenOpacity, {
+          toValue: 0,
+          duration: 320,
+          useNativeDriver: true,
+        }),
+        Animated.timing(screenTranslateY, {
+          toValue: -14,
+          duration: 320,
+          useNativeDriver: true,
+        }),
+        Animated.timing(screenScale, {
+          toValue: 0.985,
+          duration: 320,
+          useNativeDriver: true,
+        }),
+      ]).start(() => {
+        router.replace({
+          pathname: "/loading",
+          params: { next: result.mustChangePassword ? "/change-password" : "/(tabs)" },
+        } as any);
+      });
     } catch (err: any) {
       Alert.alert("Login Failed", err.message || "Something went wrong.");
     } finally {
@@ -62,6 +107,13 @@ export default function LoginScreen() {
   };
 
   return (
+    <Animated.View
+      style={{
+        flex: 1,
+        opacity: screenOpacity,
+        transform: [{ translateY: screenTranslateY }, { scale: screenScale }],
+      }}
+    >
     <SafeAreaView style={styles.safeArea}>
       <KeyboardAvoidingView
         style={styles.keyboardView}
@@ -103,13 +155,21 @@ export default function LoginScreen() {
               <View style={styles.inputWrapper}>
                 <Text style={styles.icon}>🔒</Text>
                 <TextInput
-                  style={styles.input}
+                  style={[styles.input, styles.passwordInput]}
                   placeholder="Password"
                   placeholderTextColor="#B8C1CC"
-                  secureTextEntry
+                  secureTextEntry={!showPassword}
                   value={password}
                   onChangeText={setPassword}
                 />
+                <Pressable
+                  onPress={() => setShowPassword((v) => !v)}
+                  style={styles.showPasswordBtn}
+                >
+                  <Text style={styles.showPasswordText}>
+                    {showPassword ? "HIDE" : "SHOW"}
+                  </Text>
+                </Pressable>
               </View>
 
               <Pressable style={styles.forgotWrapper}>
@@ -146,6 +206,7 @@ export default function LoginScreen() {
         <OnboardingScreen onFinish={() => setNeedsOnboarding(false)} />
       </Modal>
     </SafeAreaView>
+    </Animated.View>
   );
 }
 
@@ -246,6 +307,21 @@ const styles = StyleSheet.create({
     color: "#061B33",
     paddingVertical: 0,
     marginLeft: 8,
+  },
+  passwordInput: {
+    paddingRight: 8,
+  },
+  showPasswordBtn: {
+    height: 50,
+    justifyContent: "center",
+    paddingLeft: 8,
+    paddingRight: 4,
+  },
+  showPasswordText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#13B5EA",
+    letterSpacing: 0.4,
   },
   forgotWrapper: {
     alignSelf: "flex-end",

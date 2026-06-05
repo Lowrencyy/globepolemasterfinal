@@ -394,6 +394,10 @@ export default function NodeDeliveryDetail() {
           }
         } catch {}
 
+        const teardown_local_ids = pendingLogs
+          .map(l => l.local_id)
+          .filter((id): id is string => !!id);
+
         const rec = await createWarehouseReceipt(authToken, {
           warehouse_id: warehouseId,
           node_id:      Number(nodeId),
@@ -401,6 +405,7 @@ export default function NodeDeliveryDetail() {
           items,
           submitted_lat,
           submitted_lng,
+          teardown_local_ids: teardown_local_ids.length ? teardown_local_ids : undefined,
         });
         setReceipts(prev => {
           const next = [rec, ...prev];

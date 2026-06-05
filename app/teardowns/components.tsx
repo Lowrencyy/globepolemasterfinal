@@ -1387,6 +1387,8 @@ export default function TeardownComponentsScreen() {
     if (params.span_id) fields.pole_span_id = params.span_id;
     if (params.node_id && params.node_id !== "undefined")
       fields.node_id = params.node_id;
+    if (params.node_name && params.node_name !== "undefined")
+      fields.node_name = params.node_name;
 
     // Pole codes — stored in queue for display purposes
     if (params.pole_code) fields.from_pole_code = params.pole_code;

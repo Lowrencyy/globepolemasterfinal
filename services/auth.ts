@@ -17,6 +17,9 @@ export type GlobeUser = {
   subcontractor_name?: string | null;
   last_login: string | null;
   is_online: boolean;
+  is_admin?: boolean;
+  is_executive?: boolean;
+  is_driver?: boolean;
 };
 
 export type LoginResponse = {

@@ -27,15 +27,20 @@ import {
 } from "react-native-safe-area-context";
 
 import { saveDisplayTime, getWebTimeOffset } from "@/lib/display-time";
+import { subscribeUnreadCount, refreshUnreadCount } from "@/lib/notification-store";
 
 import {
+  Bell,
   Calendar,
   ChevronRight,
   Clock,
   Droplets,
   Map,
   MapPin,
+  ClipboardList,
   Sparkles,
+  Truck,
+  Warehouse,
   Wind,
 } from "lucide-react-native";
 
@@ -84,11 +89,24 @@ type WeatherState = {
   status: "loading" | "ready" | "error";
 };
 
+function useRoleFlags(user: any) {
+  const isAdmin     = !!(user?.is_admin || user?.is_executive || user?.role === "admin");
+  const isDriver    = !!user?.is_driver;
+  const isSubcon    = !!user?.subcontractor_id;
+  const showAdmin   = isAdmin;
+  const showDriver  = isDriver;
+  const showWarehouse = isAdmin || isSubcon || isDriver;
+  const showTeardown  = !isDriver || isAdmin;
+  return { isAdmin, isDriver, isSubcon, showAdmin, showDriver, showWarehouse, showTeardown };
+}
+
 export default function HomeScreen() {
   const { user } = useAuth();
   const router = useRouter();
   const firstName = user?.first_name ?? "User";
+  const role = useRoleFlags(user);
   const insets = useSafeAreaInsets();
+  const [unreadCount, setUnreadCount] = useState(0);
 
   const horizontalScrollRef = useRef<ScrollView>(null);
 
@@ -109,6 +127,12 @@ export default function HomeScreen() {
   useEffect(() => {
     const timer = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    refreshUnreadCount();
+    const unsub = subscribeUnreadCount(setUnreadCount);
+    return unsub;
   }, []);
 
   useEffect(() => {
@@ -296,6 +320,16 @@ export default function HomeScreen() {
             </View>
 
             <View style={styles.headerActions}>
+              <Pressable onPress={() => router.push("/notifications")} style={styles.bellBtn}>
+                <Bell size={19} color="#1E3A8A" />
+                {unreadCount > 0 && (
+                  <View style={styles.bellBadge}>
+                    <Text style={styles.bellBadgeTxt}>
+                      {unreadCount > 99 ? "99+" : unreadCount}
+                    </Text>
+                  </View>
+                )}
+              </Pressable>
               <Pressable onPress={() => router.push("/profile")}>
                 <LinearGradient
                   colors={["#0F172A", "#1E3A8A"]}
@@ -425,14 +459,46 @@ export default function HomeScreen() {
             </View>
           </View>
           <View style={styles.actionGridBig}>
-            <BigActionCard
-              icon={<Map size={24} color="#059669" />}
-              title="Teardown"
-              subtitle="Open teardown process"
-              iconBg="#ECFDF5"
-              accentColor="#059669"
-              onPress={() => router.push("/teardowns" as any)}
-            />
+            {role.showTeardown && (
+              <BigActionCard
+                icon={<Map size={24} color="#059669" />}
+                title="Teardown"
+                subtitle="Open teardown process"
+                iconBg="#ECFDF5"
+                accentColor="#059669"
+                onPress={() => router.push("/teardowns" as any)}
+              />
+            )}
+            {role.showWarehouse && (
+              <BigActionCard
+                icon={<Warehouse size={24} color="#0b6cff" />}
+                title="Warehouse"
+                subtitle="Inventory & receipts"
+                iconBg="#EFF6FF"
+                accentColor="#0b6cff"
+                onPress={() => router.push("/warehouse" as any)}
+              />
+            )}
+            {role.showDriver && (
+              <BigActionCard
+                icon={<Truck size={24} color="#8b5cf6" />}
+                title="Driver"
+                subtitle="My assigned deliveries"
+                iconBg="#F5F3FF"
+                accentColor="#8b5cf6"
+                onPress={() => router.push("/driver" as any)}
+              />
+            )}
+            {role.showAdmin && (
+              <BigActionCard
+                icon={<ClipboardList size={24} color="#f59e0b" />}
+                title="Pull-Out Mgmt"
+                subtitle="Approve transfer requests"
+                iconBg="#FFFBEB"
+                accentColor="#f59e0b"
+                onPress={() => router.push("/admin/pull-out-requests" as any)}
+              />
+            )}
           </View>
         </View>
 
@@ -732,6 +798,35 @@ const styles = StyleSheet.create({
   headerActions: {
     flexDirection: "row",
     alignItems: "center",
+    gap: 8,
+  },
+
+  bellBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#EFF6FF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  bellBadge: {
+    position: "absolute",
+    top: -2,
+    right: -2,
+    backgroundColor: "#EF4444",
+    borderRadius: 99,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    minWidth: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1.5,
+    borderColor: "#FFFFFF",
+  },
+  bellBadgeTxt: {
+    color: "#FFFFFF",
+    fontSize: 9,
+    fontWeight: "900",
   },
 
   avatarRight: {

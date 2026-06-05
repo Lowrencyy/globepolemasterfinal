@@ -5,23 +5,27 @@ import {
   TextInput, TouchableOpacity, View,
 } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import * as ImagePicker from "expo-image-picker";
+import { captureEvents } from "@/lib/capture-events";
 import * as Location from "expo-location";
 import { Camera, CheckCircle, ChevronLeft, MapPin } from "lucide-react-native";
 import { WebView } from "react-native-webview";
 import {
   getWarehouseReceiptById,
   markWarehouseReceiptArrived,
+  startWarehouseReceiptUnload,
+  updateLinemanLocation,
   verifyWarehouseReceipt,
   type WarehouseReceipt,
   type WarehouseReceiptItem,
 } from "@/services/skycable";
 import { getBridgeToken } from "@/lib/token-bridge";
+import { useAuth } from "@/context/auth-context";
 
 const DEVICE_H           = Dimensions.get("window").height;
 const SHEET_COLLAPSED = DEVICE_H * 0.82;    // peek at bottom
 const SHEET_EN_ROUTE  = DEVICE_H - 390;     // exact fit: drag handle + tracker + arrived btn
 const SHEET_EXPANDED  = DEVICE_H * 0.18;    // full form when at warehouse
+const ARRIVAL_RADIUS_M = 150;
 
 const G      = "#006241";
 const GDARK  = "#004d30";
@@ -91,10 +95,12 @@ const WAREHOUSE_ICON_URI = "data:image/svg+xml," + encodeURIComponent(WAREHOUSE_
 function buildLeafletHtml(
   fromLat: number | null, fromLng: number | null,
   toLat:   number | null, toLng:   number | null,
-  warehouseName: string
+  warehouseName: string,
+  locationLabel = "My Location"
 ): string {
   const hasFrom = fromLat != null && fromLng != null;
   const hasTo   = toLat   != null && toLng   != null;
+  const safeLocationLabel = locationLabel.replace(/"/g, "&quot;");
 
   const cLat = hasFrom ? fromLat : hasTo ? toLat : 12.8797;
   const cLng = hasFrom ? fromLng : hasTo ? toLng : 121.774;
@@ -111,7 +117,7 @@ var pinIcon = L.divIcon({
 });
 var myMarker = ${hasFrom
   ? `L.marker([${fromLat},${fromLng}],{icon:pinIcon,zIndexOffset:1000}).addTo(map)
-      .bindTooltip("My Location",{permanent:true,direction:"top",offset:[0,-14],className:"lbl"})`
+      .bindTooltip("${safeLocationLabel}",{permanent:true,direction:"top",offset:[0,-14],className:"lbl"})`
   : `null`};
 var routeLine = null;
 function drawRoute(fLat, fLng) {
@@ -128,7 +134,7 @@ function drawRoute(fLat, fLng) {
 window.updateMyLocation = function(lat, lng) {
   if(!myMarker){
     myMarker = L.marker([lat,lng],{icon:pinIcon,zIndexOffset:1000}).addTo(map)
-      .bindTooltip("My Location",{permanent:true,direction:"top",offset:[0,-14],className:"lbl"});
+      .bindTooltip("${safeLocationLabel}",{permanent:true,direction:"top",offset:[0,-14],className:"lbl"});
   } else {
     myMarker.setLatLng([lat,lng]);
   }
@@ -141,10 +147,10 @@ map.fitBounds(L.latLngBounds([[${fromLat},${fromLng}],[${toLat},${toLng}]]),{pad
   // Warehouse icon via data: URI — zero quoting/escaping issues
   const whJs = hasTo ? `
 L.circle([${toLat},${toLng}],{
-  radius:150, color:"#2563eb", weight:2,
+  radius:${ARRIVAL_RADIUS_M}, color:"#2563eb", weight:2,
   fillColor:"#3b82f6", fillOpacity:0.13, dashArray:"8,5"
 }).addTo(map)
-  .bindTooltip("Arrival zone (~150m)",{permanent:false,direction:"top",className:"lbl"});
+  .bindTooltip("Arrival zone (~${ARRIVAL_RADIUS_M}m)",{permanent:false,direction:"top",className:"lbl"});
 
 function whIconAt(sz) {
   return L.icon({ iconUrl:"${WAREHOUSE_ICON_URI}", iconSize:[sz,sz], iconAnchor:[sz/2,sz/2] });
@@ -187,10 +193,24 @@ ${routeJs}
 </script></body></html>`;
 }
 
+function distanceMeters(fromLat: number, fromLng: number, toLat: number, toLng: number): number {
+  const earthRadiusM = 6371000;
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const dLat = toRad(toLat - fromLat);
+  const dLng = toRad(toLng - fromLng);
+  const lat1 = toRad(fromLat);
+  const lat2 = toRad(toLat);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return earthRadiusM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function InventoryCheck() {
   const router = useRouter();
+  const { user } = useAuth();
   const { receiptId, nodeId, nodeName } = useLocalSearchParams<{
     receiptId: string;
     nodeId: string;
@@ -205,7 +225,51 @@ export default function InventoryCheck() {
   const [notes,       setNotes]      = useState("");
   const [quantities,  setQuantities] = useState<Record<string, string>>({});
   const [currentLoc,  setCurrentLoc] = useState<{ lat: number; lng: number } | null>(null);
+  const [autoArriving, setAutoArriving] = useState(false);
+  const [startingUnload, setStartingUnload] = useState(false);
   const webViewRef = useRef<WebView>(null);
+  const receiptRef = useRef<WarehouseReceipt | null>(null);
+  const autoArrivingRef = useRef(false);
+  const lastLocationPublishAt = useRef(0);
+
+  const receiptStatus = receipt?.status ?? "pending";
+  const receiptLoaded = !!receipt;
+  const role = String((user as any)?.role ?? "").toLowerCase();
+  const canManageDelivery =
+    role.includes("warehouse") ||
+    role.includes("admin") ||
+    role.includes("executive") ||
+    role.includes("project") ||
+    !!(user as any)?.can_approve_delivery;
+  const isReceiptOwner = Number(user?.id ?? 0) === Number(receipt?.received_by ?? -1);
+  const shouldUseDeviceLocation = !canManageDelivery || isReceiptOwner;
+  const backendLiveLocation =
+    receipt?.live_location?.lat != null && receipt?.live_location?.lng != null
+      ? { lat: Number(receipt.live_location.lat), lng: Number(receipt.live_location.lng) }
+      : null;
+  const backendLiveLat = backendLiveLocation?.lat ?? null;
+  const backendLiveLng = backendLiveLocation?.lng ?? null;
+  const displayedLocation = shouldUseDeviceLocation
+    ? currentLoc ?? backendLiveLocation ?? (
+        receipt?.submitted_lat != null && receipt?.submitted_lng != null
+          ? { lat: Number(receipt.submitted_lat), lng: Number(receipt.submitted_lng) }
+          : null
+      )
+    : backendLiveLocation ?? (
+        receipt?.submitted_lat != null && receipt?.submitted_lng != null
+          ? { lat: Number(receipt.submitted_lat), lng: Number(receipt.submitted_lng) }
+          : null
+      );
+  const mapLocationLabel = shouldUseDeviceLocation ? "My Location" : "Driver Location";
+  const arrivedAtWarehouse = receiptStatus === "arrived" || receiptStatus === "unloading" || receiptStatus === "approved";
+  const needsUnloadStart = receiptStatus === "arrived";
+  const readyToVerify = receiptStatus === "unloading" || receiptStatus === "approved";
+  const isApproved = receiptStatus === "approved";
+  const peekStatus =
+    isApproved ? "Approved" :
+    receiptStatus === "unloading" ? "Unloading" :
+    receiptStatus === "arrived" ? "At Warehouse" :
+    autoArriving ? "Arriving…" : "En Route";
 
   // ── Bottom sheet pan ──────────────────────────────────────────────────────
   const panY          = useRef(new Animated.Value(SHEET_COLLAPSED)).current;
@@ -231,15 +295,86 @@ export default function InventoryCheck() {
     })
   ).current;
 
-  async function markArrived() {
+  const expandSheet = useCallback(() => {
+    expandedLimit.current = SHEET_EXPANDED;
+    Animated.spring(panY, { toValue: SHEET_EXPANDED, useNativeDriver: false, tension: 50, friction: 11 }).start();
+  }, [panY]);
+
+  const markArrived = useCallback(async (options?: { automatic?: boolean }) => {
     const token = getBridgeToken() ?? "";
     try {
+      if (options?.automatic) setAutoArriving(true);
       const updated = await markWarehouseReceiptArrived(token, Number(receiptId));
       setReceipt(updated);
-      expandedLimit.current = SHEET_EXPANDED;
-      Animated.spring(panY, { toValue: SHEET_EXPANDED, useNativeDriver: false, tension: 50, friction: 11 }).start();
+      receiptRef.current = updated;
+      expandSheet();
     } catch (e: any) {
-      Alert.alert("Error", e?.message ?? "Could not mark as arrived.");
+      if (!options?.automatic) {
+        Alert.alert("Error", e?.message ?? "Could not mark as arrived.");
+      }
+    } finally {
+      if (options?.automatic) setAutoArriving(false);
+    }
+  }, [expandSheet, receiptId]);
+
+  const publishLiveLocation = useCallback(async (lat: number, lng: number, accuracy?: number | null) => {
+    const currentReceipt = receiptRef.current;
+    if (!shouldUseDeviceLocation || !currentReceipt) return;
+    if (currentReceipt.status === "approved" || currentReceipt.status === "rejected") return;
+
+    const now = Date.now();
+    if (now - lastLocationPublishAt.current < 5000) return;
+    lastLocationPublishAt.current = now;
+
+    try {
+      const token = getBridgeToken() ?? "";
+      const result = await updateLinemanLocation(token, {
+        latitude: lat,
+        longitude: lng,
+        accuracy: accuracy ?? null,
+        timestamp: new Date().toISOString(),
+      });
+      if (result.arrived_receipt_ids?.includes(currentReceipt.id)) {
+        const refreshed = await getWarehouseReceiptById(token, currentReceipt.id);
+        setReceipt(refreshed);
+        receiptRef.current = refreshed;
+        expandSheet();
+      }
+    } catch {}
+  }, [expandSheet, shouldUseDeviceLocation]);
+
+  const maybeAutoMarkArrived = useCallback(async (lat: number, lng: number) => {
+    const currentReceipt = receiptRef.current;
+    if (!shouldUseDeviceLocation || !currentReceipt || autoArrivingRef.current || currentReceipt.status !== "pending") return;
+
+    const warehouseLat = Number(currentReceipt.warehouse?.lat);
+    const warehouseLng = Number(currentReceipt.warehouse?.lng);
+    if (!Number.isFinite(warehouseLat) || !Number.isFinite(warehouseLng)) return;
+
+    const distance = distanceMeters(lat, lng, warehouseLat, warehouseLng);
+    if (distance > ARRIVAL_RADIUS_M) return;
+
+    autoArrivingRef.current = true;
+    try {
+      await markArrived({ automatic: true });
+    } finally {
+      autoArrivingRef.current = false;
+    }
+  }, [markArrived, shouldUseDeviceLocation]);
+
+  async function handleStartUnload() {
+    if (!receipt) return;
+    setStartingUnload(true);
+    try {
+      const token = getBridgeToken() ?? "";
+      const updated = await startWarehouseReceiptUnload(token, receipt.id);
+      setReceipt(updated);
+      receiptRef.current = updated;
+      expandSheet();
+    } catch (e: any) {
+      Alert.alert("Error", e?.message ?? "Could not start unloading.");
+    } finally {
+      setStartingUnload(false);
     }
   }
 
@@ -249,12 +384,13 @@ export default function InventoryCheck() {
     try {
       const r = await getWarehouseReceiptById(token, Number(receiptId));
       setReceipt(r);
+      receiptRef.current = r;
       const init: Record<string, string> = {};
       (r.items ?? []).forEach(it => { init[it.item_type] = String(it.quantity); });
       setQuantities(init);
 
       // Sync sheet limit to status — also re-applies updated constants after hot reload
-      expandedLimit.current = (r.status === "arrived" || r.status === "approved")
+      expandedLimit.current = (r.status === "arrived" || r.status === "unloading" || r.status === "approved")
         ? SHEET_EXPANDED
         : SHEET_EN_ROUTE;
     } catch {
@@ -263,65 +399,120 @@ export default function InventoryCheck() {
     } finally {
       setLoading(false);
     }
-  }, [receiptId]);
+  }, [receiptId, router]);
 
   useEffect(() => { loadReceipt(); }, [loadReceipt]);
 
   // ── Live GPS ──────────────────────────────────────────────────────────────
   useEffect(() => {
+    if (!shouldUseDeviceLocation) return;
     let sub: Location.LocationSubscription | null = null;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") return;
       const initial = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      const { latitude: lat0, longitude: lng0 } = initial.coords;
+      const { latitude: lat0, longitude: lng0, accuracy: acc0 } = initial.coords;
       setCurrentLoc({ lat: lat0, lng: lng0 });
       webViewRef.current?.injectJavaScript(
         `if(window.updateMyLocation){window.updateMyLocation(${lat0},${lng0});}true;`
       );
+      publishLiveLocation(lat0, lng0, acc0);
+      maybeAutoMarkArrived(lat0, lng0);
       sub = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.Balanced, distanceInterval: 15, timeInterval: 6000 },
         (loc) => {
-          const { latitude: lat, longitude: lng } = loc.coords;
+          const { latitude: lat, longitude: lng, accuracy } = loc.coords;
           setCurrentLoc({ lat, lng });
           webViewRef.current?.injectJavaScript(
             `if(window.updateMyLocation){window.updateMyLocation(${lat},${lng});}true;`
           );
+          publishLiveLocation(lat, lng, accuracy);
+          maybeAutoMarkArrived(lat, lng);
         }
       );
     })();
     return () => { sub?.remove(); };
-  }, []);
+  }, [maybeAutoMarkArrived, publishLiveLocation, shouldUseDeviceLocation]);
+
+  useEffect(() => {
+    receiptRef.current = receipt;
+    if (receipt && currentLoc) {
+      maybeAutoMarkArrived(currentLoc.lat, currentLoc.lng);
+    }
+  }, [currentLoc, maybeAutoMarkArrived, receipt]);
+
+  useEffect(() => {
+    if (shouldUseDeviceLocation || backendLiveLat == null || backendLiveLng == null) return;
+    webViewRef.current?.injectJavaScript(
+      `if(window.updateMyLocation){window.updateMyLocation(${backendLiveLat},${backendLiveLng});}true;`
+    );
+  }, [backendLiveLat, backendLiveLng, shouldUseDeviceLocation]);
+
+  useEffect(() => {
+    if (shouldUseDeviceLocation || !receiptLoaded || receiptStatus === "approved" || receiptStatus === "rejected") return;
+
+    let stopped = false;
+    const refreshTrackedReceipt = async () => {
+      try {
+        const token = getBridgeToken() ?? "";
+        const updated = await getWarehouseReceiptById(token, Number(receiptId));
+        if (stopped) return;
+
+        const previousStatus = receiptRef.current?.status;
+        setReceipt(updated);
+        receiptRef.current = updated;
+
+        if (
+          previousStatus !== updated.status &&
+          (updated.status === "arrived" || updated.status === "unloading" || updated.status === "approved")
+        ) {
+          expandSheet();
+        }
+
+        const liveLat = Number(updated.live_location?.lat);
+        const liveLng = Number(updated.live_location?.lng);
+        if (Number.isFinite(liveLat) && Number.isFinite(liveLng)) {
+          webViewRef.current?.injectJavaScript(
+            `if(window.updateMyLocation){window.updateMyLocation(${liveLat},${liveLng});}true;`
+          );
+        }
+      } catch {}
+    };
+
+    refreshTrackedReceipt();
+    const timer = setInterval(refreshTrackedReceipt, 5000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [expandSheet, receiptId, receiptLoaded, receiptStatus, shouldUseDeviceLocation]);
 
   // ── Photo helpers ─────────────────────────────────────────────────────────
-  async function pickPhoto() {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== "granted") { Alert.alert("Permission required", "Allow camera access."); return; }
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.8, allowsEditing: false });
-    if (!result.canceled && result.assets[0]) {
-      const a = result.assets[0];
-      const ext = a.uri.split(".").pop() ?? "jpg";
-      setPhoto({ uri: a.uri, name: `proof_${Date.now()}.${ext}`, type: `image/${ext}` });
-    }
-  }
-
-  async function pickFromLibrary() {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== "granted") { Alert.alert("Permission required", "Allow photo library access."); return; }
-    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.8 });
-    if (!result.canceled && result.assets[0]) {
-      const a = result.assets[0];
-      const ext = a.uri.split(".").pop() ?? "jpg";
-      setPhoto({ uri: a.uri, name: `proof_${Date.now()}.${ext}`, type: `image/${ext}` });
-    }
-  }
+  useEffect(() => {
+    return captureEvents.on((result) => {
+      if (result.ownerType !== "warehouse_proof") return;
+      const ext = result.uri.split(".").pop() ?? "jpg";
+      setPhoto({ uri: result.uri, name: `proof_${Date.now()}.${ext}`, type: `image/${ext}` });
+    });
+  }, []);
 
   function handlePhotoPress() {
-    Alert.alert("Proof Photo", "Choose source", [
-      { text: "Camera",  onPress: pickPhoto },
-      { text: "Library", onPress: pickFromLibrary },
-      { text: "Cancel",  style: "cancel" },
-    ]);
+    const warehouseName = receipt?.warehouse?.name ?? "Warehouse";
+    const submittedBy   = (user as any)?.name ?? (user as any)?.full_name ?? "";
+    router.push({
+      pathname: "/capture",
+      params: {
+        mode:          "warehouse",
+        warehouseName,
+        submittedBy,
+        lat:           String(receipt?.warehouse?.lat ?? ""),
+        lng:           String(receipt?.warehouse?.lng ?? ""),
+        ownerType:     "warehouse_proof",
+        ownerPoleId:   String(receipt?.id ?? ""),
+        tab:           "before",
+        returnKey:     `warehouse_proof_${receipt?.id ?? ""}`,
+      },
+    });
   }
 
   // ── Approve ───────────────────────────────────────────────────────────────
@@ -370,14 +561,13 @@ export default function InventoryCheck() {
   }
 
   const items: WarehouseReceiptItem[] = receipt?.items ?? [];
-  const arrivedAtWarehouse = receipt?.status === "arrived" || receipt?.status === "approved";
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <View style={{ flex: 1 }}>
       <Stack.Screen options={{ headerShown: false }} />
 
-      {/* Full-screen map — built once with submitted coords; live GPS updates via injectJavaScript */}
+      {/* Full-screen map — driver publishes GPS, warehouse views backend-tracked GPS */}
       <WebView
         ref={webViewRef}
         style={StyleSheet.absoluteFill}
@@ -385,11 +575,12 @@ export default function InventoryCheck() {
         scrollEnabled={false}
         javaScriptEnabled
         source={{ html: buildLeafletHtml(
-          receipt?.submitted_lat ?? null,
-          receipt?.submitted_lng ?? null,
+          displayedLocation?.lat ?? null,
+          displayedLocation?.lng ?? null,
           receipt?.warehouse?.lat ?? null,
           receipt?.warehouse?.lng ?? null,
-          receipt?.warehouse?.name ?? "Warehouse"
+          receipt?.warehouse?.name ?? "Warehouse",
+          mapLocationLabel
         ) }}
       />
 
@@ -402,11 +593,11 @@ export default function InventoryCheck() {
           <Text style={s.headerTitle}>Inventory Check</Text>
           <Text style={s.headerSub} numberOfLines={1}>{decodedName}</Text>
         </View>
-        {currentLoc != null && (
+        {displayedLocation != null && (
           <View style={s.coordsBadge}>
             <MapPin size={10} color={WHITE} />
             <Text style={s.coordsTxt}>
-              {currentLoc.lat.toFixed(4)}, {currentLoc.lng.toFixed(4)}
+              {shouldUseDeviceLocation ? "Me" : "Driver"} · {displayedLocation.lat.toFixed(4)}, {displayedLocation.lng.toFixed(4)}
             </Text>
           </View>
         )}
@@ -426,13 +617,13 @@ export default function InventoryCheck() {
                 <View style={s.peekLeft}>
                   <View style={[s.statusDot, !arrivedAtWarehouse && { backgroundColor: AMBER }]} />
                   <Text style={s.peekStatus}>
-                    {arrivedAtWarehouse ? "At Warehouse" : "En Route"}
+                    {peekStatus}
                   </Text>
                 </View>
                 <View style={s.peekRight}>
                   <Text style={s.peekCount}>{items.length} item{items.length !== 1 ? "s" : ""}</Text>
                   <Text style={s.peekHint}>
-                    {arrivedAtWarehouse ? "swipe up to verify ↑" : "swipe up to mark arrived ↑"}
+                    {readyToVerify ? "swipe up to verify ↑" : needsUnloadStart ? "swipe up to start unload ↑" : "auto-arrives inside warehouse zone ↑"}
                   </Text>
                 </View>
               </View>
@@ -446,10 +637,11 @@ export default function InventoryCheck() {
               {/* ── Tracker ── */}
               <View style={s.trackerCard}>
                 {([
-                  { label: "Submitted",    emoji: "📦", done: true,               current: false                },
-                  { label: "En Route",     emoji: "🚛", done: true,               current: !arrivedAtWarehouse  },
-                  { label: "At Warehouse", emoji: "🏭", done: arrivedAtWarehouse, current: arrivedAtWarehouse   },
-                  { label: "Approved",     emoji: "✅", done: false,              current: false                },
+                  { label: "Submitted",    emoji: "📦", done: true,               current: false                           },
+                  { label: "En Route",     emoji: "🚛", done: true,               current: !arrivedAtWarehouse             },
+                  { label: "At Warehouse", emoji: "🏭", done: arrivedAtWarehouse, current: receiptStatus === "arrived"     },
+                  { label: "Unloading",    emoji: "📥", done: readyToVerify,      current: receiptStatus === "unloading"   },
+                  { label: "Approved",     emoji: "✅", done: isApproved,         current: isApproved                      },
                 ] as const).map((step, i, arr) => (
                   <View key={step.label} style={s.trackStep}>
                     {i > 0 && (
@@ -470,21 +662,59 @@ export default function InventoryCheck() {
               </View>
 
               {!arrivedAtWarehouse ? (
-                /* ── EN ROUTE: only show arrived button ── */
-                <TouchableOpacity style={s.arrivedBtn} onPress={markArrived} activeOpacity={0.85}>
-                  <Text style={s.arrivedEmoji}>🏭</Text>
-                  <View>
-                    <Text style={s.arrivedBtnTxt}>Mark as Arrived at Warehouse</Text>
-                    <Text style={s.arrivedBtnSub}>Tap when the delivery reaches the warehouse</Text>
+                shouldUseDeviceLocation ? (
+                  /* ── LINEMAN: publish GPS and auto-arrive ── */
+                  <View style={[s.arrivedBtn, autoArriving && { opacity: 0.7 }]}>
+                    {autoArriving
+                      ? <ActivityIndicator size="small" color="#7c5c00" />
+                      : <Text style={s.arrivedEmoji}>📍</Text>}
+                    <View>
+                      <Text style={s.arrivedBtnTxt}>{autoArriving ? "Confirming arrival…" : "Waiting for warehouse zone"}</Text>
+                      <Text style={s.arrivedBtnSub}>Arrived status is automatic only inside the blue {ARRIVAL_RADIUS_M}m circle</Text>
+                    </View>
                   </View>
-                </TouchableOpacity>
+                ) : (
+                  /* ── WAREHOUSE: read driver GPS from backend ── */
+                  <View style={s.infoBanner}>
+                    <Text style={s.infoEmoji}>📡</Text>
+                    <Text style={s.infoTxt}>
+                      Live tracking from backend. Start Unload will appear when the driver enters the {ARRIVAL_RADIUS_M}m warehouse circle.
+                    </Text>
+                  </View>
+                )
+              ) : needsUnloadStart ? (
+                <>
+                  <View style={s.infoBanner}>
+                    <Text style={s.infoEmoji}>🏭</Text>
+                    <Text style={s.infoTxt}>
+                      Lineman is already within the warehouse zone. Start unloading to continue warehouse receiving.
+                    </Text>
+                  </View>
+
+                  <TouchableOpacity
+                    style={[s.unloadBtn, startingUnload && s.approveBtnDisabled]}
+                    onPress={handleStartUnload}
+                    disabled={startingUnload}
+                    activeOpacity={0.85}
+                  >
+                    {startingUnload
+                      ? <ActivityIndicator size="small" color={WHITE} />
+                      : <Text style={s.unloadEmoji}>📥</Text>}
+                    <View>
+                      <Text style={s.unloadBtnTxt}>{startingUnload ? "Starting unload…" : "Start Unload"}</Text>
+                      <Text style={s.unloadBtnSub}>Sets receipt status to unloading</Text>
+                    </View>
+                  </TouchableOpacity>
+                </>
               ) : (
                 <>
                   {/* ── Info banner ── */}
                   <View style={s.infoBanner}>
                     <Text style={s.infoEmoji}>📋</Text>
                     <Text style={s.infoTxt}>
-                      Verify quantities below. Adjust if needed, attach a proof photo, then approve.
+                      {isApproved
+                        ? "Receipt is already approved and warehouse stock has been incremented."
+                        : "Unloading started. Verify quantities below, attach a proof photo, then approve."}
                     </Text>
                   </View>
 
@@ -539,7 +769,7 @@ export default function InventoryCheck() {
                       ) : (
                         <View style={s.photoPlaceholder}>
                           <Camera size={32} color={G + "99"} />
-                          <Text style={s.photoHint}>Tap to capture or pick a photo</Text>
+                          <Text style={s.photoHint}>Tap to capture proof photo</Text>
                         </View>
                       )}
                     </TouchableOpacity>
@@ -552,15 +782,15 @@ export default function InventoryCheck() {
 
                   {/* ── Approve button ── */}
                   <TouchableOpacity
-                    style={[s.approveBtn, (saving || !photo) && s.approveBtnDisabled]}
+                    style={[s.approveBtn, (saving || !photo || isApproved) && s.approveBtnDisabled]}
                     onPress={handleApprove}
-                    disabled={saving || !photo}
+                    disabled={saving || !photo || isApproved}
                     activeOpacity={0.85}
                   >
                     {saving
                       ? <ActivityIndicator size="small" color={WHITE} />
                       : <CheckCircle size={18} color={WHITE} />}
-                    <Text style={s.approveTxt}>{saving ? "Approving…" : "Approve & Increment Stock"}</Text>
+                    <Text style={s.approveTxt}>{isApproved ? "Approved" : saving ? "Approving…" : "Approve & Increment Stock"}</Text>
                   </TouchableOpacity>
                 </>
               )}
@@ -659,6 +889,12 @@ const s = StyleSheet.create({
   arrivedEmoji:  { fontSize: 32 },
   arrivedBtnTxt: { fontSize: 15, fontWeight: "800", color: "#7c5c00" },
   arrivedBtnSub: { fontSize: 11, fontWeight: "500", color: MUTED, marginTop: 2 },
+
+  // ── Unload button ──
+  unloadBtn:    { flexDirection: "row", alignItems: "center", gap: 14, backgroundColor: G + "14", borderRadius: 18, borderWidth: 1.5, borderColor: G + "45", padding: 18 },
+  unloadEmoji:  { fontSize: 32 },
+  unloadBtnTxt: { fontSize: 15, fontWeight: "900", color: GDARK },
+  unloadBtnSub: { fontSize: 11, fontWeight: "600", color: MUTED, marginTop: 2 },
 
   // ── Approve ──
   approveBtn:         { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 9, backgroundColor: GDARK, borderRadius: 18, paddingVertical: 16, shadowColor: G, shadowOpacity: 0.35, shadowRadius: 10, elevation: 6 },

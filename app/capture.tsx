@@ -16,14 +16,18 @@ import { getPHTNow } from "@/lib/display-time";
 import { captureEvents } from "@/lib/capture-events";
 import { LiveMapTile } from "@/lib/live-map-tile";
 
+const PLUS_CODE_RE = /^[23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,}/i;
+function isPlusCode(v: string) { return PLUS_CODE_RE.test(v.trim()); }
+
 function parseGpsAddress(raw: any): { road: string | undefined; city: string | undefined; province: string | undefined } {
   const city     = String(raw?.city ?? raw?.district ?? raw?.subregion ?? raw?.region ?? "").trim();
-  const province = String(raw?.region ?? raw?.country ?? "").trim();
-  const core     = String(raw?.street ?? raw?.road ?? raw?.pedestrian ?? "").trim();
-  const num      = String(raw?.streetNumber ?? "").trim();
-  const combined = [num, core].filter(Boolean).join(" ").trim();
+  const province = String(raw?.subregion ?? raw?.region ?? raw?.country ?? "").trim();
+  const street   = String(raw?.street ?? raw?.road ?? raw?.thoroughfare ?? raw?.pedestrian ?? "").trim();
+  const num      = String(raw?.streetNumber ?? raw?.houseNumber ?? "").trim();
+  const combined = [num, street].filter(Boolean).join(" ").trim();
   const blocked  = new Set([city, province].map(v => v.toLowerCase()).filter(Boolean));
-  const road     = [combined, core, String(raw?.name ?? "").trim()].filter(Boolean).find(v => !blocked.has(v.toLowerCase()));
+  const candidates = [combined, street, String(raw?.name ?? "").trim(), String(raw?.district ?? "").trim()];
+  const road = candidates.find(v => !!v && !blocked.has(v.toLowerCase()) && !isPlusCode(v));
   return { road: road || undefined, city: city || undefined, province: province || undefined };
 }
 
@@ -41,7 +45,9 @@ export default function CaptureScreen() {
     lat?: string; lng?: string; road?: string; city?: string; province?: string;
     tab?: "before" | "after" | "tag"; ownerType?: string; ownerPoleId?: string;
     returnKey: string;
+    mode?: string; warehouseName?: string; submittedBy?: string;
   }>();
+  const isWarehouseMode = params.mode === "warehouse";
 
   const [permission, requestPermission] = useCameraPermissions();
   const [deviceCoords, setDeviceCoords] = useState<{ latitude: number; longitude: number } | null>(null);
@@ -97,25 +103,50 @@ export default function CaptureScreen() {
   useEffect(() => {
     let mounted = true;
     let sub: Location.LocationSubscription | null = null;
+
+    async function geocode(coords: { latitude: number; longitude: number }) {
+      try {
+        const geo = await Location.reverseGeocodeAsync(coords);
+        if (geo[0] && mounted) {
+          const r = parseGpsAddress(geo[0]);
+          setAddress(prev => {
+            // Only update if we get something better (don't overwrite real data with empty)
+            const nextRoad = r.road ?? prev.road;
+            const nextCity = r.city ?? prev.city;
+            const nextProv = r.province ?? prev.province;
+            return { road: nextRoad, city: nextCity, province: nextProv };
+          });
+        }
+      } catch {}
+    }
+
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") return;
+
+      // Step 1 — cached position for instant map dot (may be stale, don't geocode yet)
       const last = await Location.getLastKnownPositionAsync({ maxAge: 60_000 });
       if (last && mounted) setDeviceCoords(last.coords);
-      sub = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.Balanced, distanceInterval: 2, timeInterval: 2000 },
-        pos => { if (mounted) setDeviceCoords(pos.coords); },
-      );
+
+      // Step 2 — fast fresh fix via cell/wifi (~1-2 s), geocode as soon as it arrives
+      const fast = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low });
+      if (!mounted) return;
+      setDeviceCoords(fast.coords);
+      geocode(fast.coords);
+
+      // Step 3 — precise GPS in background to refine address (may take 5-10 s)
+      if (!isWarehouseMode) {
+        sub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.Balanced, distanceInterval: 2, timeInterval: 2000 },
+          pos => { if (mounted) setDeviceCoords(pos.coords); },
+        );
+      }
       const fresh = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      if (mounted) setDeviceCoords(fresh.coords);
-      if (address.road || address.city || address.province) return;
-      const lookup = targetLat != null && targetLng != null
-        ? { latitude: targetLat, longitude: targetLng } : fresh.coords;
-      try {
-        const geo = await Location.reverseGeocodeAsync(lookup);
-        if (geo[0] && mounted) { const r = parseGpsAddress(geo[0]); setAddress({ road: r.road, city: r.city, province: r.province }); }
-      } catch {}
+      if (!mounted) return;
+      setDeviceCoords(fresh.coords);
+      geocode(fresh.coords);
     })();
+
     return () => { mounted = false; sub?.remove(); };
   }, []);
 
@@ -210,8 +241,8 @@ export default function CaptureScreen() {
         <Text style={s.zoomBadgeTxt}>{zoomLabel}</Text>
       </Animated.View>
 
-      {/* Target coordinates — safe area top */}
-      {targetLat != null && targetLng != null && (
+      {/* Target coordinates — safe area top (pole mode only) */}
+      {!isWarehouseMode && targetLat != null && targetLng != null && (
         <View style={[s.targetCard, { top: insets.top + 8 }]} pointerEvents="none">
           <View style={s.targetLeft}>
             <Text style={{ fontSize: 14, marginRight: 8 }}>📍</Text>
@@ -233,16 +264,27 @@ export default function CaptureScreen() {
       <View style={s.overlay} pointerEvents="none">
         <View style={s.metaBox}>
           <Text style={s.metaTime}>{displayTime}</Text>
-          {address.road    && <Text style={s.metaLine}>{address.road}</Text>}
-          {!!cityProvince  && <Text style={s.metaLine}>{cityProvince}</Text>}
-          {targetLat != null && targetLng != null && (
-            <Text style={s.metaCoords}>
-              {Math.abs(targetLat).toFixed(6)}° {targetLat >= 0 ? "N" : "S"}{"  "}
-              {Math.abs(targetLng).toFixed(6)}° {targetLng >= 0 ? "E" : "W"}
-            </Text>
+          {isWarehouseMode ? (
+            <>
+              {!!cityProvince && <Text style={s.metaLine}>{cityProvince}</Text>}
+              {address.road   && <Text style={s.metaLine}>{address.road}</Text>}
+              <Text style={s.metaLabel}>{params.warehouseName || "Warehouse"}</Text>
+              <Text style={s.metaNode}>Submitted By: {params.submittedBy || "-"}</Text>
+            </>
+          ) : (
+            <>
+              {address.road    && <Text style={s.metaLine}>{address.road}</Text>}
+              {!!cityProvince  && <Text style={s.metaLine}>{cityProvince}</Text>}
+              {targetLat != null && targetLng != null && (
+                <Text style={s.metaCoords}>
+                  {Math.abs(targetLat).toFixed(6)}° {targetLat >= 0 ? "N" : "S"}{"  "}
+                  {Math.abs(targetLng).toFixed(6)}° {targetLng >= 0 ? "E" : "W"}
+                </Text>
+              )}
+              <Text style={s.metaLabel}>{params.poleCode || "Pole"}  ({params.label || "BEFORE"})</Text>
+              <Text style={s.metaNode}>Node: {params.nodeName || "-"}</Text>
+            </>
           )}
-          <Text style={s.metaLabel}>{params.poleCode || "Pole"}  ({params.label || "BEFORE"})</Text>
-          <Text style={s.metaNode}>Node: {params.nodeName || "-"}</Text>
         </View>
         <View style={s.mapWrap}>
           <LiveMapTile fallbackLat={targetLat} fallbackLng={targetLng} size={96} borderRadius={10} />

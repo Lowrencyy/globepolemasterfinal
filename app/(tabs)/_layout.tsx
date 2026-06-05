@@ -1,5 +1,6 @@
 import { useAuth } from "@/context/auth-context";
 import { refreshPendingCount, subscribePendingCount } from "@/lib/pending-store";
+import { refreshUnreadCount } from "@/lib/notification-store";
 import * as NavigationBar from "expo-navigation-bar";
 import { Redirect, Tabs } from "expo-router";
 import { Clock, FileText, Home, Map, User } from "lucide-react-native";
@@ -119,6 +120,7 @@ export default function TabLayout() {
 
   useEffect(() => {
     refreshPendingCount().catch(() => { });
+    refreshUnreadCount().catch(() => { });
     const unsub = subscribePendingCount(setPendingCount);
     return unsub;
   }, []);

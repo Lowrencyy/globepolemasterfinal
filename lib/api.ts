@@ -1,6 +1,3 @@
-import { getBridgeToken } from "@/lib/token-bridge";
-import { tokenStore } from "@/lib/token";
-import { cacheWebTime } from "@/lib/display-time";
 import {
   buildCacheKey,
   getCacheStale,
@@ -8,13 +5,14 @@ import {
   TTL,
   type CacheEntry,
 } from "@/lib/api-cache";
+import { cacheWebTime } from "@/lib/display-time";
 import { deduplicate } from "@/lib/request-dedup";
+import { tokenStore } from "@/lib/token";
+import { getBridgeToken } from "@/lib/token-bridge";
 
-export const BASE_URL =
-  "http://192.168.1.9:8080/api/v1";
+export const BASE_URL = "https://telcovantage.com/api/v1";
 
-export const ASSET_BASE =
-  "http://192.168.1.9:8080/";
+export const ASSET_BASE = "https://telcovantage.com/";
 
 /** Converts a stored path like "project-logos/abc.png" to a full URL */
 export function assetUrl(path: string | null | undefined): string | null {
@@ -32,7 +30,8 @@ export function setAuthToken(_token: string) {}
 // More specific patterns must come before catch-alls.
 
 function ttlForUrl(url: string): number {
-  if (/\/locations\/(regions|provinces|cities|barangays)/.test(url)) return TTL.PSGC;
+  if (/\/locations\/(regions|provinces|cities|barangays)/.test(url))
+    return TTL.PSGC;
   if (/\/auth\/me/.test(url)) return TTL.ME;
   if (/\/map-pins|\/map$|\/poles\/map/.test(url)) return TTL.MAP_PINS;
   if (/\/poles/.test(url)) return TTL.POLES;
@@ -53,7 +52,6 @@ async function buildHeaders(
   return {
     ...(isFormData ? {} : { "Content-Type": "application/json" }),
     Accept: "application/json",
-    "ngrok-skip-browser-warning": "true",
     "X-App-Version": "1.0.0",
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...extra,
@@ -161,7 +159,11 @@ async function cachedGet(url: string): Promise<{ data: any }> {
         }
         const text = await response.text();
         let errData: any = {};
-        try { errData = JSON.parse(text); } catch { errData = { message: text }; }
+        try {
+          errData = JSON.parse(text);
+        } catch {
+          errData = { message: text };
+        }
         const err: any = new Error(errData?.message ?? "Request failed");
         err.response = { status: response.status, data: errData };
         throw err;
@@ -170,7 +172,11 @@ async function cachedGet(url: string): Promise<{ data: any }> {
       // Step 5b: 200 OK → parse, cache, return fresh data
       const text = await response.text();
       let data: any = {};
-      try { data = JSON.parse(text); } catch { data = { message: text }; }
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { message: text };
+      }
 
       const newEtag = response.headers.get("ETag");
       await setCache(cacheKey, data, newEtag, url, ttlMs, userId);
@@ -196,11 +202,15 @@ const api = {
     const finalUrl = `${BASE_URL}${url}`;
     const timeout = isFormData ? UPLOAD_TIMEOUT_MS : TIMEOUT_MS;
 
-    const response = await fetchWithTimeout(finalUrl, {
-      method: "POST",
-      headers,
-      body: isFormData ? body : JSON.stringify(body),
-    }, timeout);
+    const response = await fetchWithTimeout(
+      finalUrl,
+      {
+        method: "POST",
+        headers,
+        body: isFormData ? body : JSON.stringify(body),
+      },
+      timeout,
+    );
     return handleResponse(response);
   },
 

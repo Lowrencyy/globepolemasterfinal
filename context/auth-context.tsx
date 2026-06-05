@@ -7,6 +7,7 @@ import { startLocationTracking, stopLocationTracking } from "@/lib/location-trac
 import { clearAllCache, cacheSet } from "@/lib/cache";
 import { clearAllQueues } from "@/lib/sync-queue";
 import { getAreas, getNodes, getNodePoles } from "@/services/skycable";
+import { DEV_BYPASS_AUTH, DEV_BYPASS_USER } from "@/lib/dev-auth";
 
 // Prefetch all teardown data right after login/rehydration so the app works
 // offline immediately: areas → nodes → poles for active/pending nodes.
@@ -85,6 +86,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // always starts at the login + onboarding flow on a new install.
   useEffect(() => {
     (async () => {
+      if (DEV_BYPASS_AUTH) {
+        const devToken = "dev-ui-token";
+        setToken(devToken);
+        setUser(DEV_BYPASS_USER as GlobeUser);
+        setMustChangePassword(false);
+        setBridgeToken(devToken);
+        setNetSyncToken(devToken);
+        setIsReady(true);
+        return;
+      }
+
       const isNew = await tokenStore.isNewInstall();
       if (isNew) {
         await tokenStore.clear();

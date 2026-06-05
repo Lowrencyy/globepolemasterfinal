@@ -2,6 +2,7 @@ import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
 import { simpleQueuePush } from "@/lib/simple-queue";
+import { imageQueuePush, persistImage } from "@/lib/sync-queue";
 import { pingNow } from "@/lib/location-tracker";
 import { gpsQueueGet } from "@/lib/gps-queue";
 import * as FileSystem from "expo-file-system/legacy";
@@ -199,6 +200,8 @@ function staticMapUrl(lat: number, lng: number) {
 }
 
 function TrackerMini({ done, label }: { done: boolean; label: string }) {
+
+
   return (
     <View style={styles.trackerMini}>
       <View style={[styles.trackerMiniDot, done && styles.trackerMiniDotDone]}>
@@ -308,6 +311,7 @@ function PhotoTile({
   onCapture,
   onView,
   disabled,
+  locked,
 }: {
   label: string;
   photo: PhotoField;
@@ -315,12 +319,18 @@ function PhotoTile({
   onCapture: () => void;
   onView: () => void;
   disabled?: boolean;
+  locked?: boolean;
 }) {
+  const isDisabled = disabled || locked;
   return (
     <Pressable
-      style={[styles.photoTileCard, photo ? { borderColor: accentColor } : {}, disabled && { opacity: 0.45 }]}
-      onPress={disabled ? undefined : photo ? onView : onCapture}
-      disabled={disabled}
+      style={[
+        styles.photoTileCard,
+        photo ? { borderColor: locked ? "#DC2626" : accentColor } : {},
+        isDisabled && !locked && { opacity: 0.45 },
+      ]}
+      onPress={locked ? (photo ? onView : undefined) : isDisabled ? undefined : photo ? onView : onCapture}
+      disabled={!locked && isDisabled}
     >
       <View style={styles.photoTileImgWrap}>
         {photo ? (
@@ -333,10 +343,22 @@ function PhotoTile({
               cachePolicy="none"
               transition={100}
             />
-            <View style={styles.photoViewHint}>
-              <Text style={styles.photoViewHintText}>VIEW</Text>
-            </View>
+            {/* Lock overlay — view only, no retake */}
+            {locked ? (
+              <View style={{ position: "absolute", inset: 0, backgroundColor: "rgba(220,38,38,0.18)", alignItems: "center", justifyContent: "center" }}>
+                <Text style={{ fontSize: 20 }}>🔒</Text>
+              </View>
+            ) : (
+              <View style={styles.photoViewHint}>
+                <Text style={styles.photoViewHintText}>VIEW</Text>
+              </View>
+            )}
           </>
+        ) : locked ? (
+          <View style={[styles.photoTilePlaceholder, { backgroundColor: "#FEF2F2" }]}>
+            <Text style={{ fontSize: 20 }}>🔒</Text>
+            <Text style={[styles.photoTileTapText, { color: "#DC2626", fontSize: 9 }]}>LOCKED</Text>
+          </View>
         ) : (
           <View style={styles.photoTilePlaceholder}>
             <Text style={styles.photoTileCameraIcon}>📷</Text>
@@ -344,16 +366,20 @@ function PhotoTile({
           </View>
         )}
       </View>
-      {/* Label + checkmark row */}
+      {/* Label + status row */}
       <View style={styles.photoTileLabelRow}>
-        <Text style={[styles.photoTileLabel, photo ? { color: accentColor } : {}]}>
+        <Text style={[styles.photoTileLabel, photo ? { color: locked ? "#DC2626" : accentColor } : {}]}>
           {label.toUpperCase()}
         </Text>
-        {photo && (
+        {locked ? (
+          <View style={{ backgroundColor: "#DC2626", borderRadius: 99, paddingHorizontal: 5, paddingVertical: 2 }}>
+            <Text style={{ color: "#fff", fontSize: 7, fontWeight: "900" }}>LOCKED</Text>
+          </View>
+        ) : photo ? (
           <View style={[styles.photoTileCheck, { backgroundColor: accentColor }]}>
             <Text style={styles.photoTileCheckText}>✓</Text>
           </View>
-        )}
+        ) : null}
       </View>
     </Pressable>
   );
@@ -455,6 +481,9 @@ export function PoleDetailScreen() {
     report_type,
     sitemap_lat,
     sitemap_lng,
+    batch_before_capture,
+    auto_capture_tab,
+    return_to_map,
 	  } = useLocalSearchParams<{
 	    pole_id: string;
 	    pole_row_id?: string;
@@ -469,15 +498,33 @@ export function PoleDetailScreen() {
 	    report_type: string;
 	    sitemap_lat: string;
 	    sitemap_lng: string;
+    batch_before_capture?: string;
+    auto_capture_tab?: string;
+    return_to_map?: string;
 	  }>();
 
   const isPoleReport = report_type === "pole_report" || pathname.includes("/teardowns/pole-report");
+  const isBatchBeforeCaptureMode = batch_before_capture === "1";
+  const shouldReturnToMapAfterCapture = return_to_map === "1";
 
   const accentColor = accent || "#0B7A5A";
 
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
   const [gpsCapturedAt, setGpsCapturedAt] = useState("");
+  // Before photo lock — set from backend when GET /skycable/poles/:id/photos returns locked:true
+  // Backend team controls this flag to allow/disallow re-capture of before photo
+  // Lock immediately if this pole was batch-before captured before (cache key check)
+  const [beforeLocked, setBeforeLocked] = useState(false);
+  // Upload feedback: "uploaded" | "queued" | null
+  const [batchUploadStatus, setBatchUploadStatus] = useState<"uploaded" | "queued" | null>(null);
+  useEffect(() => {
+    if (!pole_id) return;
+    cacheGet<string>(`photo_captured_at_${pole_id}_before`).then(hit => {
+      if (hit) setBeforeLocked(true);
+    }).catch(() => {});
+  }, [pole_id]);
+
   // true = GPS came from sitemap APK (valid, no re-capture needed)
   const [gpsFromSitemap, setGpsFromSitemap] = useState(false);
   const [gpsConfirmModal, setGpsConfirmModal] = useState(false);
@@ -858,7 +905,51 @@ export function PoleDetailScreen() {
       if (pb) setPhotoBefore(pb);
       if (pa) setPhotoAfter(pa);
       if (pt) setPhotoTag(pt);
-      
+
+      // Fetch backend photos — fills in photos from other linesmen + applies lock
+      // GET /teardown/pole-images/:pole_id?inventory_type=skycable
+      api.get(`/teardown/pole-images/${pole_id}?inventory_type=skycable`).then((res: any) => {
+        const backendPhotos: { image_type: string; image_url: string; locked?: boolean }[] =
+          Array.isArray(res?.data) ? res.data : (res?.data?.data ?? []);
+
+        const bBefore = backendPhotos.find(p => p.image_type === "before");
+        const bAfter  = backendPhotos.find(p => p.image_type === "after");
+        const bTag    = backendPhotos.find(p => p.image_type === "pole_tag");
+
+        // Backend is authoritative — overrides the cache check on mount.
+        // locked=true  → lineman cannot retake (batch before upload, default)
+        // locked=false → backend admin explicitly unlocked via PATCH /unlock
+        if (bBefore) setBeforeLocked(bBefore.locked !== false);
+        else setBeforeLocked(false); // backend has no before photo → not locked
+
+        // Download backend photos to local pole_drafts so components.tsx can re-upload
+        // them with a report_id during full teardown submission (prevents dead links in logs)
+        const downloadToDraft = async (
+          img: { image_url: string },
+          fileName: string,
+          setter: (fn: (prev: PhotoField) => PhotoField) => void,
+        ) => {
+          if (!img.image_url) return;
+          try {
+            await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true }).catch(() => {});
+            const dest = draftDir + fileName;
+            const existing = await FileSystem.getInfoAsync(dest);
+            if (!existing.exists) {
+              await FileSystem.downloadAsync(img.image_url, dest);
+            }
+            const version = Date.now();
+            setter(prev => prev ?? { uri: `${dest}?v=${version}`, fileUri: dest, name: fileName, type: "image/jpeg", version });
+          } catch {
+            // Fallback: display-only from backend URL (won't be re-uploadable)
+            setter(prev => prev ?? createPhotoField(img.image_url, fileName));
+          }
+        };
+
+        if (bBefore) downloadToDraft(bBefore, F.before, setPhotoBefore as any);
+        if (bAfter)  downloadToDraft(bAfter,  F.after,  setPhotoAfter  as any);
+        if (bTag)    downloadToDraft(bTag,    F.tag,    setPhotoTag    as any);
+      }).catch(() => {});
+
       const [qb, qa, qt] = await Promise.all([
         cacheGet<number>(`pole_quality_before_${pole_id}`),
         cacheGet<number>(`pole_quality_after_${pole_id}`),
@@ -1237,6 +1328,8 @@ export function PoleDetailScreen() {
       // the user taps "Retake" before processing finishes.
       const thisGen = ++captureGenRef.current;
       setter(createPhotoField(photo.uri, file));
+      // Set cache key immediately so poles.tsx fast-pass detects it before IIFE finishes
+      cacheSet(`photo_captured_at_${pole_id}_${tab}`, capturedAt).catch(() => {});
       // Release the capture lock now — user can interact again
       setTimeout(() => {
         isCapturingRef.current = false;
@@ -1250,6 +1343,7 @@ export function PoleDetailScreen() {
           // Abort if user already retook or cleared the photo
           if (captureGenRef.current !== thisGen) return;
           setter(saved);
+          // Cache key already set above — no-op here but keep for completeness
           cacheSet(`photo_captured_at_${pole_id}_${tab}`, capturedAt).catch(() => {});
 
           if (tab === "after") {
@@ -1257,6 +1351,46 @@ export function PoleDetailScreen() {
             api.put(`/skycable/nodes/${node_id}/poles/${pole_id}`, {
               cleared_at: capturedAt,
             }).catch(() => {});
+          }
+
+          // Batch before mode — push status + upload photo to backend immediately
+          if (tab === "before" && isBatchBeforeCaptureMode) {
+            api.put(`/skycable/nodes/${node_id}/poles/${pole_row_id}`, {
+              date_start: capturedAt,
+            }).catch(() => {});
+            api.put(`/skycable/poles/${pole_id}`, {
+              skycable_status: "in_progress",
+            }).catch(() => {});
+            // Upload to backend — queue for retry if offline
+            const batchBeforeUpload = async () => {
+              const form = new FormData();
+              form.append("pole_id",        String(pole_id));
+              form.append("pole_code",      String(pole_code));
+              form.append("node_id",        String(node_id));
+              form.append("image_type",     "before");
+              form.append("inventory_type", "skycable");
+              form.append("lock",           "1");
+              form.append("image", { uri: saved.fileUri, name: "before.jpg", type: "image/jpeg" } as any);
+              try {
+                await api.post("/teardown/upload-image", form);
+                setBatchUploadStatus("uploaded");
+                setTimeout(() => setBatchUploadStatus(null), 3000);
+              } catch (err: any) {
+                const httpStatus = (err as any)?.response?.status;
+                if (!httpStatus || httpStatus >= 500) {
+                  const persistedUri = await persistImage(saved.fileUri, `batch_before_${pole_id}.jpg`).catch(() => saved.fileUri);
+                  await imageQueuePush([{
+                    reportLocalId: `batch_before_${pole_id}`,
+                    fieldName: "before",
+                    uri: persistedUri,
+                    meta: { pole_id: String(pole_id), pole_code: String(pole_code), node_id: String(node_id), image_type: "before", lock: "1" },
+                  }]).catch(() => {});
+                  setBatchUploadStatus("queued");
+                  setTimeout(() => setBatchUploadStatus(null), 3000);
+                }
+              }
+            };
+            batchBeforeUpload();
           }
 
           const variance = await checkPhotoQuality(saved.fileUri);
@@ -1448,6 +1582,42 @@ export function PoleDetailScreen() {
             }).catch(() => {});
           }
 
+          // Batch before mode — push status + upload photo to backend immediately
+          if (tab === "before" && isBatchBeforeCaptureMode) {
+            api.put(`/skycable/nodes/${node_id}/poles/${pole_row_id}`, {
+              date_start: capturedAt,
+            }).catch(() => {});
+            api.put(`/skycable/poles/${pole_id}`, {
+              skycable_status: "in_progress",
+            }).catch(() => {});
+            // Upload to backend — queue for retry if offline
+            const batchBeforeUpload2 = async () => {
+              const form = new FormData();
+              form.append("pole_id",        String(pole_id));
+              form.append("pole_code",      String(pole_code));
+              form.append("node_id",        String(node_id));
+              form.append("image_type",     "before");
+              form.append("inventory_type", "skycable");
+              form.append("lock",           "1");
+              form.append("image", { uri: saved.fileUri, name: "before.jpg", type: "image/jpeg" } as any);
+              try {
+                await api.post("/teardown/upload-image", form);
+              } catch (err: any) {
+                const httpStatus = (err as any)?.response?.status;
+                if (!httpStatus || httpStatus >= 500) {
+                  const persistedUri = await persistImage(saved.fileUri, `batch_before_${pole_id}.jpg`).catch(() => saved.fileUri);
+                  await imageQueuePush([{
+                    reportLocalId: `batch_before_${pole_id}`,
+                    fieldName: "before",
+                    uri: persistedUri,
+                    meta: { pole_id: String(pole_id), pole_code: String(pole_code), node_id: String(node_id), image_type: "before", lock: "1" },
+                  }]).catch(() => {});
+                }
+              }
+            };
+            batchBeforeUpload2();
+          }
+
           const variance = await checkPhotoQuality(saved.fileUri);
           if (cancelled || captureGenRef.current !== thisGen) return;
           const pct = varianceToPercent(variance);
@@ -1474,12 +1644,24 @@ export function PoleDetailScreen() {
   );
 
   async function handleOpenCapture(tab: "before" | "after" | "tag") {
-    if (!teardownStarted) {
+    // Before photo is locked by backend — view only, no re-capture allowed
+    if (tab === "before" && beforeLocked) {
+      setGateAlertModal({ title: "Before Photo Locked", message: "The before photo has been locked by the backend team. Contact your supervisor to request an edit." });
+      return;
+    }
+
+    const batchBeforeAllowed = isBatchBeforeCaptureMode && tab === "before";
+
+    if (!batchBeforeAllowed && !teardownStarted) {
       setGateAlertModal({ title: "Teardown Not Started", message: "Please tap 'Start Pole Teardown' below to start recording site progress." });
       return;
     }
-    if (!infoComplete) {
+    if (!batchBeforeAllowed && !infoComplete) {
       setGateAlertModal({ title: "Requirement Missing", message: isPoleReport ? "Please capture GPS coordinates first." : "Please capture GPS coordinates and set the Slot first." });
+      return;
+    }
+    if (batchBeforeAllowed && (lat === null || lng === null)) {
+      setGateAlertModal({ title: "GPS Required", message: "This pole needs saved map coordinates before batch before-photo capture can start." });
       return;
     }
 
@@ -1499,7 +1681,7 @@ export function PoleDetailScreen() {
   }
 
   async function captureGps() {
-    if (!teardownStarted) {
+    if (!teardownStarted && !isBatchBeforeCaptureMode) {
       setGateAlertModal({ title: "Teardown Not Started", message: "Please tap 'Start Pole Teardown' below to start recording site progress." });
       return;
     }
@@ -1629,6 +1811,9 @@ export function PoleDetailScreen() {
     !!photoAfter &&
     !!photoTag &&
     !!slot;
+  const batchBeforeReadyForSpans = isBatchBeforeCaptureMode && hasRecapturedGps && !!photoBefore;
+  const canBatchBeforeSave = batchBeforeReadyForSpans;
+  const canProceedToSpans = canSelectPair;
 
   const gpsTopLabel = hasGps
     ? `${lat?.toFixed(6)}, ${lng?.toFixed(6)}`
@@ -1825,13 +2010,18 @@ export function PoleDetailScreen() {
     setStartingPole(false);
   }
 
+  function handleBatchBeforeSave() {
+    if (!isBatchBeforeCaptureMode || !shouldReturnToMapAfterCapture || !canBatchBeforeSave) return;
+    router.back();
+  }
+
   function handleNext() {
-    if (isPoleReport || !canSelectPair) return;
+    if (isPoleReport || !canProceedToSpans) return;
 
     // Record that photos are done so auto-redirect works when pole is re-clicked.
     // Do NOT mark as completed here — the pole may have multiple spans.
     // Status changes to "completed" only after the teardown log is submitted in components.tsx.
-    if (!poleFinishedAt) {
+    if (!isBatchBeforeCaptureMode && !poleFinishedAt) {
       const nowFinished = getPHTNow();
       setPoleFinishedAt(nowFinished);
       cacheSet(`teardown_finished_${pole_id}`, nowFinished).catch(() => {});
@@ -2069,6 +2259,10 @@ export function PoleDetailScreen() {
 
       setSubmitSuccessTime(nowFinished);
       setSubmitSuccessOpen(true);
+      setTimeout(() => {
+        setSubmitSuccessOpen(false);
+        router.navigate({ pathname: "/teardowns/poles" as any, params: { nodeId: node_id, nodeName: node_name || "" } });
+      }, 1200);
     } catch (e: any) {
       Alert.alert("Submit Failed", e?.message ?? "Please try again.");
     } finally {
@@ -2472,14 +2666,15 @@ export function PoleDetailScreen() {
           <View style={styles.sectionCard}>
             <SectionHeading
               title="Pole Photos"
-              subtitle={!teardownStarted ? "Start teardown first" : !infoComplete ? (isPoleReport ? "Capture GPS first" : "Fill GPS & Slot first") : "Click a card to capture · tap again to view"}
+              subtitle={isBatchBeforeCaptureMode ? "Batch before mode: capture GPS and the before photo, then tap save to return to the map." : !teardownStarted ? "Start teardown first" : !infoComplete ? (isPoleReport ? "Capture GPS first" : "Fill GPS & Slot first") : "Click a card to capture · tap again to view"}
             />
             <View style={styles.photoTileRow}>
               <PhotoTile
                 label="Before"
                 photo={photoBefore}
                 accentColor={accentColor}
-                disabled={!infoComplete}
+                disabled={!(infoComplete || isBatchBeforeCaptureMode)}
+                locked={beforeLocked}
                 onCapture={() => handleOpenCapture("before")}
                 onView={() => openViewer("before", () => handleOpenCapture("before"))}
               />
@@ -2839,11 +3034,55 @@ export function PoleDetailScreen() {
 	                </Text>
 	              </Pressable>
 	            )
-	          ) : !teardownStarted ? (
-	            <Pressable
-	              style={({ pressed }) => [
-	                styles.submitBtn,
-	                { backgroundColor: startingPole ? "#6B7280" : accentColor },
+	          ) : isBatchBeforeCaptureMode ? (
+            <>
+              {batchUploadStatus && (
+                <View style={{
+                  marginBottom: 8,
+                  borderRadius: 12,
+                  paddingHorizontal: 14,
+                  paddingVertical: 8,
+                  backgroundColor: batchUploadStatus === "uploaded" ? "#ECFDF5" : "#FFF7E8",
+                  borderWidth: 1,
+                  borderColor: batchUploadStatus === "uploaded" ? "#A7F3D0" : "#FDE68A",
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 6,
+                }}>
+                  <Text style={{ fontSize: 13 }}>
+                    {batchUploadStatus === "uploaded" ? "✅" : "📶"}
+                  </Text>
+                  <Text style={{
+                    fontSize: 11,
+                    fontWeight: "700",
+                    color: batchUploadStatus === "uploaded" ? "#059669" : "#B45309",
+                    flex: 1,
+                  }}>
+                    {batchUploadStatus === "uploaded"
+                      ? "Before photo uploaded to server"
+                      : "Offline — queued for Sync All"}
+                  </Text>
+                </View>
+              )}
+              <Pressable
+                style={({ pressed }) => [
+                  styles.submitBtn,
+                  { backgroundColor: canBatchBeforeSave ? accentColor : "#C9CED6" },
+                  pressed && canBatchBeforeSave && styles.pressedDown,
+                ]}
+                onPress={handleBatchBeforeSave}
+                disabled={!canBatchBeforeSave}
+              >
+                <Text style={styles.submitText}>
+                  {canBatchBeforeSave ? "Save Before & Back to Map  →" : "Capture GPS and Before first"}
+                </Text>
+              </Pressable>
+            </>
+          ) : !teardownStarted ? (
+            <Pressable
+              style={({ pressed }) => [
+                styles.submitBtn,
+                { backgroundColor: startingPole ? "#6B7280" : accentColor },
                 pressed && !startingPole && styles.pressedDown,
               ]}
               onPress={handleStartPole}
@@ -2860,19 +3099,18 @@ export function PoleDetailScreen() {
             <Pressable
               style={({ pressed }) => [
                 styles.submitBtn,
-                { backgroundColor: canSelectPair ? accentColor : "#C9CED6" },
-                pressed && canSelectPair && styles.pressedDown,
+                { backgroundColor: canProceedToSpans ? accentColor : "#C9CED6" },
+                pressed && canProceedToSpans && styles.pressedDown,
               ]}
               onPress={handleNext}
-              disabled={!canSelectPair}
+              disabled={!canProceedToSpans}
             >
               <Text style={styles.submitText}>
-                {canSelectPair ? "Select Pair  →" : "Complete required fields first"}
+                {canProceedToSpans ? "Select Pair  →" : "Complete required fields first"}
               </Text>
             </Pressable>
           )}
         </View>
-
         {/* ── Pole Report Success Modal ─────────────────────────────── */}
         <Modal
           visible={submitSuccessOpen}
@@ -2998,7 +3236,9 @@ export function PoleDetailScreen() {
               <View style={styles.modalHeader}>
                 <View>
                   <Text style={styles.modalTitle}>{viewerLabel}</Text>
-                  <Text style={styles.modalSubtitle}>Preview photo</Text>
+                  <Text style={styles.modalSubtitle}>
+                    {viewerTab === "before" && beforeLocked ? "🔒 Locked · view only" : "Preview photo"}
+                  </Text>
                 </View>
 
                 <Pressable
@@ -3028,27 +3268,32 @@ export function PoleDetailScreen() {
               <View style={styles.modalFooter}>
                 <Pressable
                   style={({ pressed }) => [
-                    styles.modalGhostBtn,
+                    viewerTab === "before" && beforeLocked ? styles.modalPrimaryBtn : styles.modalGhostBtn,
+                    viewerTab === "before" && beforeLocked && { backgroundColor: "#6B7280" },
                     pressed && styles.pressedDown,
                   ]}
                   onPress={() => setViewerOpen(false)}
                 >
-                  <Text style={styles.modalGhostBtnText}>Close</Text>
+                  <Text style={viewerTab === "before" && beforeLocked ? styles.modalPrimaryBtnText : styles.modalGhostBtnText}>
+                    Close
+                  </Text>
                 </Pressable>
 
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.modalPrimaryBtn,
-                    { backgroundColor: accentColor },
-                    pressed && styles.pressedDown,
-                  ]}
-                  onPress={() => {
-                    setViewerOpen(false);
-                    viewerRetake?.();
-                  }}
-                >
-                  <Text style={styles.modalPrimaryBtnText}>Retake</Text>
-                </Pressable>
+                {!(viewerTab === "before" && beforeLocked) && (
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.modalPrimaryBtn,
+                      { backgroundColor: accentColor },
+                      pressed && styles.pressedDown,
+                    ]}
+                    onPress={() => {
+                      setViewerOpen(false);
+                      viewerRetake?.();
+                    }}
+                  >
+                    <Text style={styles.modalPrimaryBtnText}>Retake</Text>
+                  </Pressable>
+                )}
               </View>
             </View>
           </View>
@@ -3357,6 +3602,7 @@ export function PoleDetailScreen() {
                     </GestureDetector>
                   );
                 }
+
                 return (
                   <Pressable style={styles.cameraEmptyPreview} onPress={requestCameraPermission}>
                     <Text style={styles.cameraEmptyIcon}>📷</Text>
@@ -5676,3 +5922,14 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
   },
 });
+
+
+
+
+
+
+
+
+
+
+

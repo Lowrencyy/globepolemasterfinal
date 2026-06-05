@@ -62,6 +62,7 @@ export type ImageQueueEntry = {
     pole_code?: string;
     image_type?: string;
     to_pole_id?: string;
+    lock?: string; // "1" for batch-before captures — permanently locked on upload
   };
   status: SyncStatus;
   retryCount: number;
@@ -381,6 +382,7 @@ export async function processImageQueue(): Promise<void> {
       if (img.meta.image_type === "bunching" && img.meta.to_pole_id) {
         form.append("to_pole_id", img.meta.to_pole_id);
       }
+      if (img.meta.lock) form.append("lock", img.meta.lock);
       form.append("inventory_type", "skycable");
       form.append("idempotency_key", `${img.reportLocalId}_${img.fieldName}`);
       form.append("image", { uri: img.uri, name: `${img.fieldName}.jpg`, type: "image/jpeg" } as any);

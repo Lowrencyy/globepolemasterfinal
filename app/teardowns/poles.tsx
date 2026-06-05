@@ -306,9 +306,11 @@ html,body,#map{
   var _store = {};
   window._tap = function(i){
     var p = _store[i];
-    if(p) post({type:'start', pole_id:p.pole_id, id:p.id, code:p.code});
+    if(!p) return;
+    if(!!p.has_before && !!p.image_mode) return;
+    var action = p.status==='in_progress' ? 'start' : 'open';
+    post({type:action, pole_id:p.pole_id, id:p.id, code:p.code});
   };
-
   window.setPoles = function(poles){
     if(!map || !markerGroup) return;
     markerGroup.clearLayers();
@@ -317,23 +319,39 @@ html,body,#map{
     poles.forEach(function(p, i){
       if(!validLatLng(p.lat, p.lng)) return;
       _store[i] = p;
-      var c = p.status==='cleared' ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
+      // hasBefore: always red when before photo exists, regardless of image captured mode
+      var hasBefore = !!p.has_before;
+      var c = hasBefore ? '#DC2626' : p.status==='cleared' ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
       var lbl = p.status==='cleared' ? 'Completed' : p.status==='in_progress' ? 'Ongoing' : 'Pending';
+      var statusColor = p.status==='cleared' ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
       var icon = L.divIcon({
         className: "",
         html: '<div class="pp-wrap"><div class="pp" style="background:'+c+'"></div></div>',
         iconSize: [48,48],
         iconAnchor: [24,24]
       });
-      var btnLabel = ${opts?.isPoleReport ? '"Open Pole Report"' : 'p.status==="in_progress"?"Continue Teardown":"Start Teardown"'};
+      var btnLabel = ${opts?.isPoleReport ? '"Open Pole Report"' : 'p.status==="in_progress"?"Continue Teardown":"Go to Pole"'};
       var btn = p.status!=='cleared'
         ? '<button class="pstart" onclick="window._tap('+i+')">'+btnLabel+'</button>'
         : '';
-      var pop = '<div class="pw"><div class="pt">'+p.code+'</div><div class="pb" style="background:'+c+'22;color:'+c+'"><span style="width:6px;height:6px;border-radius:50%;background:'+c+';display:inline-block;margin-right:4px"></span>'+lbl+'</div>'+btn+'</div>';
+      // Before badge — only shown in image captured mode when before photo exists
+      var beforeBadge = hasBefore
+        ? '<div style="display:inline-flex;align-items:center;gap:4px;background:#FEE2E2;border-radius:999px;padding:2px 8px;margin-top:4px;">'
+          +'<span style="width:6px;height:6px;border-radius:50%;background:#DC2626;display:inline-block;"></span>'
+          +'<span style="font-size:9px;font-weight:900;color:#DC2626;text-transform:uppercase;letter-spacing:0.08em;">Before ✓</span>'
+          +'</div>'
+        : '';
+      var pop = '<div class="pw">'
+        +'<div class="pt">'+p.code+'</div>'
+        +'<div class="pb" style="background:'+statusColor+'22;color:'+statusColor+'">'
+          +'<span style="width:6px;height:6px;border-radius:50%;background:'+statusColor+';display:inline-block;margin-right:4px"></span>'
+          +lbl
+        +'</div>'
+        +beforeBadge
+        +btn
+        +'</div>';
       L.marker([p.lat, p.lng], {icon: icon, zIndexOffset: 1000}).addTo(markerGroup).bindPopup(pop);
       bounds.push([p.lat, p.lng]);
-    });
-    setTimeout(function(){
       map.invalidateSize(true);
       if(bounds.length > 1) map.fitBounds(bounds, {padding:[50,50], maxZoom:18});
       else if(bounds.length === 1) map.setView(bounds[0], 17);
@@ -448,6 +466,33 @@ const mp = StyleSheet.create({
     fontWeight: "700",
     color: "#64748B",
     marginTop: 2,
+  },
+  headerActionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  captureModeBtn: {
+    minHeight: 36,
+    paddingHorizontal: 12,
+    borderRadius: 18,
+    backgroundColor: "#EFF6FF",
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  captureModeBtnActive: {
+    backgroundColor: "#10B981",
+    borderColor: "#10B981",
+  },
+  captureModeBtnText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#1D4ED8",
+  },
+  captureModeBtnTextActive: {
+    color: "#FFFFFF",
   },
   closeBtn: {
     width: 36,
@@ -761,6 +806,8 @@ export default function PolesScreen() {
 
   const [mapPreviewVisible, setMapPreviewVisible] = useState(false);
   const [mapTileView, setMapTileView] = useState<"street" | "satellite" | "dark">("street");
+  const [imageCapturedMode, setImageCapturedMode] = useState(false);
+  const [beforeCapturedMap, setBeforeCapturedMap] = useState<Record<string, boolean>>({});
   const [completedPole, setCompletedPole] = useState<SkycablePole | null>(null);
   const [completedPhotos, setCompletedPhotos] = useState<{ before: string | null; after: string | null; tag: string | null }>({ before: null, after: null, tag: null });
   const [completedPhotoViewer, setCompletedPhotoViewer] = useState<{ uri: string; label: string } | null>(null);
@@ -1001,7 +1048,7 @@ export default function PolesScreen() {
           lng: parseFloat(p.pole.lng),
           cleared: p.pole.skycable_status === "cleared",
         })),
-    [poles]
+    [beforeCapturedMap, imageCapturedMode, poles]
   );
 
   const mapPolePins = useMemo(
@@ -1015,8 +1062,10 @@ export default function PolesScreen() {
           code: p.pole.pole_code ?? "",
           id: p.id,
           pole_id: p.pole.id,
+          has_before: !!beforeCapturedMap[String(p.pole.id)],
+          image_mode: imageCapturedMode, // still needed for block-navigation logic
         })),
-    [poles]
+    [beforeCapturedMap, imageCapturedMode, poles]
   );
   // Keep ref in sync so MAP_READY handler always uses the latest poles
   mapPolePinsRef.current = mapPolePins;
@@ -1027,6 +1076,25 @@ export default function PolesScreen() {
     const j = JSON.stringify(mapPolePins);
     mapWvRef.current?.injectJavaScript(`if(window.setPoles)window.setPoles(${j});true;`);
   }, [mapReady, mapPolePins, mapPreviewVisible]);
+
+  // Re-fetch backend before-captured state whenever map becomes visible
+  // (covers Sync All completing while the map is already open)
+  useEffect(() => {
+    if (!mapPreviewVisible || !nodeId) return;
+    api.get(`/teardown/node-images/${nodeId}?inventory_type=skycable&image_type=before`)
+      .then((res: any) => {
+        const imgs: { pole_id: number }[] = Array.isArray((res as any)?.data)
+          ? (res as any).data : ((res as any)?.data?.data ?? []);
+        if (imgs.length) {
+          setBeforeCapturedMap(prev => {
+            const next = { ...prev };
+            imgs.forEach(img => { next[String(img.pole_id)] = true; });
+            return next;
+          });
+        }
+      })
+      .catch(() => {});
+  }, [mapPreviewVisible, nodeId]);
 
   // ── Sync progress to backend ─────────────────────────────────────────────
   const lastSyncedPct = useRef<number | null>(null);
@@ -1135,6 +1203,74 @@ export default function PolesScreen() {
       setCompletedPhotos(result);
     })();
   }, [completedPole?.pole_id]);
+
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+
+      const refreshBeforeCapturedMap = async () => {
+        if (!nodeId || poles.length === 0) {
+          if (!cancelled) setBeforeCapturedMap({});
+          return;
+        }
+
+        // ── Fast pass: check photo_captured_at cache keys (set instantly in pole-detail) ──
+        // This runs synchronously from memory and updates the map immediately on return.
+        const fast: Record<string, boolean> = {};
+        await Promise.all(
+          poles.map(async poleRow => {
+            const poleId = String(poleRow.pole?.id ?? poleRow.pole_id ?? "");
+            if (!poleId) return;
+            const hit = await cacheGet<string>(`photo_captured_at_${poleId}_before`);
+            if (hit) fast[poleId] = true;
+          })
+        );
+        if (!cancelled && Object.keys(fast).length > 0) setBeforeCapturedMap(fast);
+
+        // ── Slow pass: full filesystem scan as fallback (catches older captures) ──
+        const base = `${FileSystem.documentDirectory}pole_drafts/`;
+        const projects = await FileSystem.readDirectoryAsync(base).catch(() => [] as string[]);
+        const next: Record<string, boolean> = { ...fast };
+
+        for (const poleRow of poles) {
+          const poleId = String(poleRow.pole?.id ?? poleRow.pole_id ?? "");
+          if (!poleId || next[poleId]) continue; // already found via cache
+
+          for (const proj of projects) {
+            const dir = `${base}${proj}/${String(nodeId)}/${poleId}/`;
+            const dirInfo = await FileSystem.getInfoAsync(dir).catch(() => ({ exists: false }));
+            if (!(dirInfo as any).exists) continue;
+
+            const beforeView = await FileSystem.getInfoAsync(`${dir}pole_${poleId}_before_view.jpg`).catch(() => ({ exists: false }));
+            const beforeRaw  = await FileSystem.getInfoAsync(`${dir}pole_${poleId}_before.jpg`).catch(() => ({ exists: false }));
+            if ((beforeView as any).exists || (beforeRaw as any).exists) {
+              next[poleId] = true;
+              break;
+            }
+          }
+        }
+
+        if (!cancelled) setBeforeCapturedMap(next);
+
+        // ── Backend pass: fetch which poles have before photos in the server ──
+        // Covers new devices or reinstalls with no local cache/files.
+        try {
+          const res = await api.get(`/teardown/node-images/${nodeId}?inventory_type=skycable&image_type=before`);
+          const imgs: { pole_id: number }[] = Array.isArray((res as any)?.data)
+            ? (res as any).data
+            : ((res as any)?.data?.data ?? []);
+          if (!cancelled && imgs.length > 0) {
+            const fromBackend: Record<string, boolean> = { ...next };
+            imgs.forEach(img => { fromBackend[String(img.pole_id)] = true; });
+            setBeforeCapturedMap(fromBackend);
+          }
+        } catch {}
+      };
+
+      void refreshBeforeCapturedMap();
+      return () => { cancelled = true; };
+    }, [nodeId, poles])
+  );
 
   // Zoom-in animation when completed pole modal opens
   useEffect(() => {
@@ -1377,7 +1513,37 @@ export default function PolesScreen() {
                   }
                   return;
                 }
-                if (msg.type === "start") {
+                if (msg.type === "start" || msg.type === "open") {
+                  const tappedPin = mapPolePinsRef.current.find(p => String(p.pole_id) === String(msg.pole_id));
+
+                  if (imageCapturedMode && !tappedPin?.has_before) {
+                    // No before photo yet — do batch before capture
+                    if (!tappedPin?.lat || !tappedPin?.lng) {
+                      Alert.alert("GPS Required", "This pole has no saved map coordinates yet, so Image Captured Mode cannot open for it.");
+                      return;
+                    }
+                    router.push({
+                      pathname: poleDetailPath,
+                      params: {
+                        pole_id: String(msg.pole_id),
+                        pole_row_id: String(msg.id),
+                        pole_code: String(msg.code ?? ""),
+                        pole_name: String(msg.code ?? ""),
+                        node_id: nodeId ?? "",
+                        node_name: nodeName,
+                        accent: "#0B7A5A",
+                        report_type: resolvedReportType,
+                        sitemap_lat: String(tappedPin.lat),
+                        sitemap_lng: String(tappedPin.lng),
+                        batch_before_capture: "1",
+                        auto_capture_tab: "before",
+                        return_to_map: "1",
+                      },
+                    } as any);
+                    return;
+                  }
+
+                  // has_before OR not in imageCapturedMode — normal navigation
                   setMapPreviewVisible(false);
 
                   if (!isStarted) {
@@ -1390,28 +1556,28 @@ export default function PolesScreen() {
                     return;
                   }
 
-                  // Full report: start pole immediately so status becomes ongoing right away.
-                  // Pole report: let the user land first, then start inside pole-report screen.
-                  if (!isPoleReport) {
+                  const shouldAutoStartPole = msg.type === "start" && !isPoleReport;
+
+                  // Only ongoing poles should auto-continue teardown here.
+                  // Pending poles should open the pole screen without changing status.
+                  if (shouldAutoStartPole) {
                     handleStartPoleFromList(Number(msg.pole_id), Number(msg.id)).catch(() => {});
                   }
-
-                    const tappedPin = mapPolePinsRef.current.find(p => String(p.pole_id) === String(msg.pole_id));
-                    router.push({
-                      pathname: poleDetailPath,
-                      params: {
-                        pole_id: String(msg.pole_id),
-                        pole_row_id: String(msg.id),
-                        pole_code: String(msg.code ?? ""),
-                        pole_name: String(msg.code ?? ""),
-                        node_id: nodeId ?? "",
-                        node_name: nodeName,
-                        accent: "#0B7A5A",
-                        report_type: resolvedReportType,
-                        sitemap_lat: tappedPin?.lat ? String(tappedPin.lat) : "",
-                        sitemap_lng: tappedPin?.lng ? String(tappedPin.lng) : "",
-                      },
-                    } as any);
+                  router.push({
+                    pathname: poleDetailPath,
+                    params: {
+                      pole_id: String(msg.pole_id),
+                      pole_row_id: String(msg.id),
+                      pole_code: String(msg.code ?? ""),
+                      pole_name: String(msg.code ?? ""),
+                      node_id: nodeId ?? "",
+                      node_name: nodeName,
+                      accent: "#0B7A5A",
+                      report_type: resolvedReportType,
+                      sitemap_lat: tappedPin?.lat ? String(tappedPin.lat) : "",
+                      sitemap_lng: tappedPin?.lng ? String(tappedPin.lng) : "",
+                    },
+                  } as any);
                 }
               } catch {}
             }}
@@ -1425,27 +1591,64 @@ export default function PolesScreen() {
               <Text style={mp.title}>{nodeName || "Node"}</Text>
               <Text style={mp.subtitle}>{mapPolePins.length} poles · {mapPolePins.filter(p => p.status === "cleared").length} completed ↻</Text>
             </View>
-            <TouchableOpacity style={mp.closeBtn} onPress={() => setMapPreviewVisible(false)} activeOpacity={0.7}>
-              <X size={18} color="#64748B" />
-            </TouchableOpacity>
-          </View>
-          <View style={mp.dropdownRow}>
-            <View style={mp.dropdown}>
-              <View style={[mp.legendDot, { backgroundColor: "#10b981" }]} />
-              <Text style={mp.dropdownLabel}>DONE</Text>
-              <Text style={[mp.dropdownValue, { color: "#10b981" }]}>{mapPolePins.filter(p => p.status === "cleared").length}</Text>
-            </View>
-            <View style={mp.dropdown}>
-              <View style={[mp.legendDot, { backgroundColor: "#6366f1" }]} />
-              <Text style={mp.dropdownLabel}>ONGOING</Text>
-              <Text style={[mp.dropdownValue, { color: "#6366f1" }]}>{mapPolePins.filter(p => p.status === "in_progress").length}</Text>
-            </View>
-            <View style={mp.dropdown}>
-              <View style={[mp.legendDot, { backgroundColor: "#f59e0b" }]} />
-              <Text style={mp.dropdownLabel}>PENDING</Text>
-              <Text style={[mp.dropdownValue, { color: "#f59e0b" }]}>{mapPolePins.filter(p => p.status !== "cleared" && p.status !== "in_progress").length}</Text>
+            <View style={mp.headerActionsRow}>
+              <TouchableOpacity
+                style={[mp.captureModeBtn, imageCapturedMode && mp.captureModeBtnActive]}
+                onPress={() => setImageCapturedMode(v => !v)}
+                activeOpacity={0.8}
+              >
+                <Text style={[mp.captureModeBtnText, imageCapturedMode && mp.captureModeBtnTextActive]}>Image Captured Mode</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={mp.closeBtn} onPress={() => setMapPreviewVisible(false)} activeOpacity={0.7}>
+                <X size={18} color="#64748B" />
+              </TouchableOpacity>
             </View>
           </View>
+          {imageCapturedMode ? (
+            // Image Captured Mode — show before capture progress
+            (() => {
+              const withGps   = mapPolePins.length;
+              const captured  = mapPolePins.filter(p => p.has_before).length;
+              const remaining = withGps - captured;
+              const allDone   = remaining === 0 && withGps > 0;
+              return (
+                <View style={[mp.dropdownRow, { gap: 8 }]}>
+                  <View style={[mp.dropdown, { flex: 1.4, backgroundColor: "#FEE2E2", borderColor: "#FECACA" }]}>
+                    <View style={[mp.legendDot, { backgroundColor: "#DC2626" }]} />
+                    <Text style={[mp.dropdownLabel, { color: "#DC2626" }]}>CAPTURED</Text>
+                    <Text style={[mp.dropdownValue, { color: "#DC2626" }]}>{captured}/{withGps}</Text>
+                  </View>
+                  <View style={[mp.dropdown, { flex: 1.4, backgroundColor: allDone ? "#ECFDF5" : "#FFF7E8", borderColor: allDone ? "#A7F3D0" : "#FDE68A" }]}>
+                    <View style={[mp.legendDot, { backgroundColor: allDone ? "#10b981" : "#f59e0b" }]} />
+                    <Text style={[mp.dropdownLabel, { color: allDone ? "#059669" : "#B45309" }]}>
+                      {allDone ? "ALL DONE ✓" : "REMAINING"}
+                    </Text>
+                    <Text style={[mp.dropdownValue, { color: allDone ? "#059669" : "#B45309" }]}>
+                      {allDone ? "✓" : remaining}
+                    </Text>
+                  </View>
+                </View>
+              );
+            })()
+          ) : (
+            <View style={mp.dropdownRow}>
+              <View style={mp.dropdown}>
+                <View style={[mp.legendDot, { backgroundColor: "#10b981" }]} />
+                <Text style={mp.dropdownLabel}>DONE</Text>
+                <Text style={[mp.dropdownValue, { color: "#10b981" }]}>{mapPolePins.filter(p => p.status === "cleared").length}</Text>
+              </View>
+              <View style={mp.dropdown}>
+                <View style={[mp.legendDot, { backgroundColor: "#6366f1" }]} />
+                <Text style={mp.dropdownLabel}>ONGOING</Text>
+                <Text style={[mp.dropdownValue, { color: "#6366f1" }]}>{mapPolePins.filter(p => p.status === "in_progress").length}</Text>
+              </View>
+              <View style={mp.dropdown}>
+                <View style={[mp.legendDot, { backgroundColor: "#f59e0b" }]} />
+                <Text style={mp.dropdownLabel}>PENDING</Text>
+                <Text style={[mp.dropdownValue, { color: "#f59e0b" }]}>{mapPolePins.filter(p => p.status !== "cleared" && p.status !== "in_progress").length}</Text>
+              </View>
+            </View>
+          )}
 
           {/* Tile view toggle */}
           <View style={mp.tileToggleRow}>
@@ -1990,11 +2193,13 @@ export default function PolesScreen() {
                   const sc = SC[poleInfo.skycable_status] || SC.pending;
                   const slots = poleInfo.cableSlots || [];
                   const usedSlots = slots.filter(sl => sl.occupied_by !== "free").length;
+                  const isCaptured = imageCapturedMode && !!beforeCapturedMap[String(poleInfo.id ?? np.pole_id)];
 
                   return (
                     <TouchableOpacity
-                      style={s.cardContainer}
-                      activeOpacity={isStarted ? 0.8 : 1}
+                      style={[s.cardContainer, isCaptured && { opacity: 0.6 }]}
+                      activeOpacity={isCaptured ? 1 : isStarted ? 0.8 : 1}
+                      disabled={isCaptured}
                       onPress={() => {
                         if (!isStarted) {
                           setPendingOpenPole({
@@ -2057,6 +2262,12 @@ export default function PolesScreen() {
                       )}
 
                       <View style={s.cardBody}>
+                        {isCaptured && (
+                          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingTop: 8, paddingBottom: 2 }}>
+                            <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: "#DC2626" }} />
+                            <Text style={{ fontSize: 9, fontWeight: "800", color: "#DC2626", letterSpacing: 1.2, textTransform: "uppercase" }}>Before Captured · Locked</Text>
+                          </View>
+                        )}
                         <View style={s.info}>
                           <Text style={s.poleCode}>{poleInfo.pole_code}</Text>
 
@@ -3097,3 +3308,11 @@ const s = StyleSheet.create({
     color: "#94A3B8",
   },
 });
+
+
+
+
+
+
+
+

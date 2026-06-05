@@ -1,4 +1,4 @@
-const BASE_URL = "http://192.168.1.9:8080/api/v1";
+const BASE_URL = "https://telcovantage.com/api/v1";
 
 const TIMEOUT_MS = 15_000; // 15 s — normal requests
 const UPLOAD_TIMEOUT_MS = 120_000; // 2 min — multipart uploads
@@ -50,7 +50,6 @@ async function request<T>(
   const headers: Record<string, string> = {
     ...(!isFormData ? { "Content-Type": "application/json" } : {}),
     Accept: "application/json",
-    "ngrok-skip-browser-warning": "true",
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(options.headers as Record<string, string>),
   };

@@ -7,9 +7,13 @@
  * Backend consumes POST /skycable/lineman/location → displayed at /field/live.
  */
 import * as Location from "expo-location";
-import { AppState, AppStateStatus } from "react-native";
+import { AppState, AppStateStatus, DeviceEventEmitter } from "react-native";
 import api from "./api";
 import { getPHTNow } from "./display-time";
+
+/** Emitted when the backend detects the lineman has arrived at a warehouse.
+ *  Payload: number[] of arrived receipt IDs. */
+export const WAREHOUSE_ARRIVED_EVENT = "warehouse:arrived";
 
 const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const THROTTLE_MS =  5 * 60 * 1000; // AppState pings: min 5 min apart
@@ -49,7 +53,7 @@ async function ping(): Promise<void> {
       }
     } catch (geoErr: any) {}
 
-    await api.post("/skycable/lineman/location", {
+    const result = await api.post("/skycable/lineman/location", {
       latitude,
       longitude,
       accuracy:    accuracy ?? null,
@@ -59,6 +63,10 @@ async function ping(): Promise<void> {
       province,
       region_name,
     });
+
+    if (result?.arrived_receipt_ids?.length) {
+      DeviceEventEmitter.emit(WAREHOUSE_ARRIVED_EVENT, result.arrived_receipt_ids as number[]);
+    }
 
     console.log(`[LOCATION_TRACKER] Pinged ${latitude.toFixed(6)}, ${longitude.toFixed(6)} · ${city ?? "?"}, ${province ?? "?"}`);
   } catch (e: any) {

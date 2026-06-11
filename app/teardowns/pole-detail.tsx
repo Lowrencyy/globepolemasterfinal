@@ -24,6 +24,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  BackHandler,
   Dimensions,
   Easing,
   Image,
@@ -80,6 +81,8 @@ function getExpected(span: Span, type: string) {
 
 const SLOTS = ["DA", "C1", "C2", "C3", "C4", "C5"] as const;
 const REQUIRED_GPS_ACCURACY_METERS = 10;
+// TEMP: GPS capture + 50m proximity requirements disabled for testing — re-enable before production
+const DEV_SKIP_GPS_CHECKS = true;
 
 // ── Pole Report constants ────────────────────────────────────────────────────
 const POLE_CONDITIONS = ["good", "fair", "poor", "critical", "replaced"] as const;
@@ -484,6 +487,7 @@ export function PoleDetailScreen() {
     batch_before_capture,
     auto_capture_tab,
     return_to_map,
+    return_to_poles,
 	  } = useLocalSearchParams<{
 	    pole_id: string;
 	    pole_row_id?: string;
@@ -501,11 +505,13 @@ export function PoleDetailScreen() {
     batch_before_capture?: string;
     auto_capture_tab?: string;
     return_to_map?: string;
+    return_to_poles?: string;
 	  }>();
 
   const isPoleReport = report_type === "pole_report" || pathname.includes("/teardowns/pole-report");
   const isBatchBeforeCaptureMode = batch_before_capture === "1";
   const shouldReturnToMapAfterCapture = return_to_map === "1";
+  const shouldReturnToPoles = return_to_poles === "1";
 
   const accentColor = accent || "#0B7A5A";
 
@@ -1295,7 +1301,7 @@ export function PoleDetailScreen() {
       const live = prewarmedGps.current;
       setLiveCoords({ lat: live.latitude, lng: live.longitude });
       const dist = computeDistanceMeters(lat, lng, live.latitude, live.longitude);
-      if (dist > 50) {
+      if (!DEV_SKIP_GPS_CHECKS && dist > 50) {
         setOutOfAreaAlert({ visible: true, distance: dist });
         isCapturingRef.current = false;
         setPhotoCapturing(false);
@@ -1778,8 +1784,8 @@ export function PoleDetailScreen() {
 
   const hasGps = !!(lat && lng);
   const hasRecapturedGps = hasGps && !gpsFromSitemap && !!gpsCapturedAt;
-  const gpsDoneForUi = hasRecapturedGps;
-  const infoComplete = teardownStarted && hasRecapturedGps && !!slot;
+  const gpsDoneForUi = DEV_SKIP_GPS_CHECKS ? hasGps : hasRecapturedGps;
+  const infoComplete = teardownStarted && (DEV_SKIP_GPS_CHECKS || hasRecapturedGps) && !!slot;
 
   const [showCameraModal, setShowCameraModal]   = useState(false);
   const [mapFullscreen, setMapFullscreen]       = useState(false);
@@ -1806,12 +1812,12 @@ export function PoleDetailScreen() {
 
 
   const canSelectPair =
-    hasRecapturedGps &&
+    (DEV_SKIP_GPS_CHECKS || hasRecapturedGps) &&
     !!photoBefore &&
     !!photoAfter &&
     !!photoTag &&
     !!slot;
-  const batchBeforeReadyForSpans = isBatchBeforeCaptureMode && hasRecapturedGps && !!photoBefore;
+  const batchBeforeReadyForSpans = isBatchBeforeCaptureMode && (DEV_SKIP_GPS_CHECKS || hasRecapturedGps) && !!photoBefore;
   const canBatchBeforeSave = batchBeforeReadyForSpans;
   const canProceedToSpans = canSelectPair;
 
@@ -1840,36 +1846,58 @@ export function PoleDetailScreen() {
 
     // 1. Update local state immediately (works offline too)
     setEditedPoleName(trimmed);
-    await cacheSet(`draft_pole_name_${pole_id}`, trimmed).catch(() => {});
 
-    // 2. Patch the poles list cache so the list screen shows the new name without a sync
+    // 2. Patch local pole caches in the background so the edited pole code
+    // replaces the old NPT — doesn't block the save when online.
+    cacheSet(`draft_pole_name_${pole_id}`, trimmed).catch(() => {});
     if (node_id) {
-      const polesCacheKey = `poles_node_${node_id}`;
-      const cachedPoles = await cacheGet<any[]>(polesCacheKey).catch(() => null);
-      if (cachedPoles) {
-        const updated = cachedPoles.map((p) =>
-          String(p.id) === String(pole_id) ? { ...p, pole_name: trimmed } : p,
-        );
-        await cacheSet(polesCacheKey, updated).catch(() => {});
-      }
-    }
+      const patchPoleList = async (cacheKey: string) => {
+        const cachedPoles = await cacheGet<any[]>(cacheKey).catch(() => null);
+        if (!cachedPoles) return;
+        const updated = cachedPoles.map((p) => {
+          const matchId =
+            String(p.id) === String(pole_id) ||
+            String(p.pole_id) === String(pole_id) ||
+            String(p.pole?.id) === String(pole_id);
+          if (!matchId) return p;
+          return {
+            ...p,
+            pole_name: trimmed,
+            pole_code: trimmed,
+            pole: p.pole ? { ...p.pole, pole_code: trimmed } : p.pole,
+          };
+        });
+        await cacheSet(cacheKey, updated).catch(() => {});
+      };
 
-    // 3. Post to backend immediately; queue with priority if offline
-    try {
-      await api.put(`/skycable/poles/${pole_id}`, { pole_code: trimmed });
-    } catch (e: any) {
-      const status = e?.response?.status;
-      if (!status) {
-        await simpleQueuePush({
-          method: "put",
-          url: `/skycable/poles/${pole_id}`,
-          body: { pole_code: trimmed },
-        }, true).catch(() => {});
-      }
+      patchPoleList(`poles_node_${node_id}`).catch(() => {});
+      patchPoleList(`sitemap_poles_${node_id}`).catch(() => {});
     }
 
     setSavingName(false);
     setEditNameModalOpen(false);
+
+    // 3. Sync in the background — don't block the user.
+    (async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await api.put(`/skycable/poles/${pole_id}`, { pole_code: trimmed });
+          return;
+        } catch (e: any) {
+          const status = e?.response?.status;
+          if (status && status < 500) return;
+          if (attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            continue;
+          }
+          await simpleQueuePush({
+            method: "put",
+            url: `/skycable/poles/${pole_id}`,
+            body: { pole_code: trimmed },
+          }, true).catch(() => {});
+        }
+      }
+    })().catch(() => {});
   }
 
   function goToDestination(span: Span) {
@@ -1884,7 +1912,7 @@ export function PoleDetailScreen() {
     router.push({
       pathname: "/teardowns/destination-pole" as any,
       params: {
-        pole_code,
+        pole_code: editedPoleName || pole_name || pole_code,
         pole_name: editedPoleName || pole_name,
         node_id,
         node_name: node_name || "",
@@ -2015,6 +2043,31 @@ export function PoleDetailScreen() {
     router.back();
   }
 
+  function handleBackNavigation() {
+    if (shouldReturnToPoles) {
+      router.replace({
+        pathname: "/teardowns/poles" as any,
+        params: { nodeId: node_id, nodeName: node_name || "" },
+      });
+      return;
+    }
+
+    router.back();
+  }
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!shouldReturnToPoles) return undefined;
+
+      const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+        handleBackNavigation();
+        return true;
+      });
+
+      return () => sub.remove();
+    }, [shouldReturnToPoles, node_id, node_name]),
+  );
+
   function handleNext() {
     if (isPoleReport || !canProceedToSpans) return;
 
@@ -2052,7 +2105,7 @@ export function PoleDetailScreen() {
   const progress = useMemo(() => {
     if (isPoleReport) {
       const completed = [
-        hasRecapturedGps,
+        gpsDoneForUi,
         !!photoBefore,
         !!photoAfter,
         !!photoTag,
@@ -2074,6 +2127,7 @@ export function PoleDetailScreen() {
     });
   }, [
     isPoleReport,
+    gpsDoneForUi,
     hasRecapturedGps,
     hasGps,
     photoBefore,
@@ -2276,7 +2330,7 @@ export function PoleDetailScreen() {
 
       <SafeAreaView style={styles.root} edges={["top"]}>
         <View style={styles.floatingHeader}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+          <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}>
             <ChevronLeft size={22} color="#0F172A" />
           </TouchableOpacity>
           <View style={styles.floatingHeaderText}>
@@ -3344,7 +3398,11 @@ export function PoleDetailScreen() {
                   onPress={handleSavePoleNameEdit}
                   disabled={savingName || !editNameDraft.trim()}
                 >
-                  <Text style={styles.editNameSaveText}>Save</Text>
+                  {savingName ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.editNameSaveText}>Save</Text>
+                  )}
                 </Pressable>
               </View>
             </View>

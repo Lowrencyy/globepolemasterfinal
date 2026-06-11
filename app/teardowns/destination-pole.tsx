@@ -39,6 +39,8 @@ import { buildSpanMapHtml, buildPoleMapHtml, StaticTileMap, STAMP_HTML } from ".
 
 const SLOTS = ["DA", "C1", "C2", "C3", "C4", "C5"] as const;
 const REQUIRED_GPS_ACCURACY_METERS = 10;
+// TEMP: GPS capture + 50m proximity requirements disabled for testing — re-enable before production
+const DEV_SKIP_GPS_CHECKS = true;
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 
 type PhotoField = {
@@ -652,8 +654,8 @@ export default function DestinationPoleScreen() {
   const gpsWarmPromiseRef = useRef<Promise<void> | null>(null);
   const captureMapPrefetchedRef = useRef(false);
 
-  const hasGps = !!capturedGps && !gpsFromSitemap;
-  const infoComplete = !!poleStartedAt && hasGps && !!slot;
+  const hasGps = DEV_SKIP_GPS_CHECKS ? !!capturedGps : !!capturedGps && !gpsFromSitemap;
+  const infoComplete = !!poleStartedAt && (DEV_SKIP_GPS_CHECKS || hasGps) && !!slot;
 
   // Always allow starting — don't block the user with "complete required fields first"
 
@@ -815,6 +817,16 @@ export default function DestinationPoleScreen() {
       })
       .catch(() => {});
 
+    if (!poleStartedAt) {
+      setPhotoBefore(null);
+      setPhotoAfter(null);
+      setPhotoTag(null);
+      setQualityBefore(null);
+      setQualityAfter(null);
+      setQualityTag(null);
+      return;
+    }
+
     (async () => {
       await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true });
 
@@ -912,6 +924,7 @@ export default function DestinationPoleScreen() {
     params.pole_code,
     params.to_pole_code,
     params.to_pole_id,
+    poleStartedAt,
   ]);
 
   useEffect(() => {
@@ -1223,9 +1236,16 @@ export default function DestinationPoleScreen() {
         .catch(() => {});
     }
 
-    // Cross-copy clean + stamped view to pole_drafts for before/tag (reused on future spans)
-    if (fileName === F.before || fileName === F.tag) {
-      const suffix = fileName === F.before ? "_before" : "_poletag";
+    // Cross-copy clean + stamped view to pole_drafts for before/after/tag so
+    // components.tsx can always recover the destination set even if the pole
+    // code/name changed mid-flow and the teardown_drafts filename no longer matches.
+    if (fileName === F.before || fileName === F.after || fileName === F.tag) {
+      const suffix =
+        fileName === F.before
+          ? "_before"
+          : fileName === F.after
+          ? "_after"
+          : "_poletag";
       const poleDir = `${FileSystem.documentDirectory}pole_drafts/${projFolder}/${params.node_id}/${params.to_pole_id}/`;
       const poleCleanDest = `${poleDir}pole_${params.to_pole_id}${suffix}.jpg`;
       const poleViewDest = `${poleDir}pole_${params.to_pole_id}${suffix}_view.jpg`;
@@ -1445,7 +1465,7 @@ export default function DestinationPoleScreen() {
         capturedGps.latitude, capturedGps.longitude,
         prewarmedGps.current.latitude, prewarmedGps.current.longitude,
       );
-      if (dist > 50) {
+      if (!DEV_SKIP_GPS_CHECKS && dist > 50) {
         isCapturingRef.current = false;
         setOutOfAreaAlert({ visible: true, distance: dist });
         return;
@@ -1511,37 +1531,58 @@ export default function DestinationPoleScreen() {
 
     // 1. Update local state immediately (works offline too)
     setEditedToPoleName(trimmed);
-    await cacheSet(`draft_to_pole_name_${params.to_pole_id}`, trimmed).catch(() => {});
 
-    // 2. Patch the poles list cache so the list screen shows the new name without a sync
+    // 2. Patch local pole caches in the background so the edited destination
+    // code replaces NPT — doesn't block the save when online.
+    cacheSet(`draft_to_pole_name_${params.to_pole_id}`, trimmed).catch(() => {});
     if (params.node_id) {
-      const polesCacheKey = `poles_node_${params.node_id}`;
-      const cachedPoles = await cacheGet<any[]>(polesCacheKey).catch(() => null);
-      if (cachedPoles) {
-        const updated = cachedPoles.map((p) =>
-          String(p.id) === String(params.to_pole_id) ? { ...p, pole_name: trimmed } : p,
-        );
-        await cacheSet(polesCacheKey, updated).catch(() => {});
-      }
-    }
+      const patchPoleList = async (cacheKey: string) => {
+        const cachedPoles = await cacheGet<any[]>(cacheKey).catch(() => null);
+        if (!cachedPoles) return;
+        const updated = cachedPoles.map((p) => {
+          const matchId =
+            String(p.id) === String(params.to_pole_id) ||
+            String(p.pole_id) === String(params.to_pole_id) ||
+            String(p.pole?.id) === String(params.to_pole_id);
+          if (!matchId) return p;
+          return {
+            ...p,
+            pole_name: trimmed,
+            pole_code: trimmed,
+            pole: p.pole ? { ...p.pole, pole_code: trimmed } : p.pole,
+          };
+        });
+        await cacheSet(cacheKey, updated).catch(() => {});
+      };
 
-    // 3. Try to save to backend immediately; queue if offline
-    try {
-      await api.put(`/poles/${params.to_pole_id}`, { pole_name: trimmed });
-    } catch (e: any) {
-      const status = e?.response?.status;
-      if (!status) {
-        // Network error — queue for later
-        await simpleQueuePush({
-          method: "put",
-          url: `/poles/${params.to_pole_id}`,
-          body: { pole_name: trimmed },
-        }).catch(() => {});
-      }
+      patchPoleList(`poles_node_${params.node_id}`).catch(() => {});
+      patchPoleList(`sitemap_poles_${params.node_id}`).catch(() => {});
     }
 
     setSavingToName(false);
     setEditToNameModalOpen(false);
+
+    // 3. Sync in the background — don't block the user.
+    (async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await api.put(`/skycable/poles/${params.to_pole_id}`, { pole_code: trimmed });
+          return;
+        } catch (e: any) {
+          const status = e?.response?.status;
+          if (status && status < 500) return;
+          if (attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            continue;
+          }
+          await simpleQueuePush({
+            method: "put",
+            url: `/skycable/poles/${params.to_pole_id}`,
+            body: { pole_code: trimmed },
+          }, true).catch(() => {});
+        }
+      }
+    })().catch(() => {});
   }
 
   function goToComponents() {
@@ -1556,6 +1597,7 @@ export default function DestinationPoleScreen() {
       pathname: "/teardowns/components" as any,
       params: {
         ...params,
+        to_pole_code: editedToPoleName || params.to_pole_name || params.to_pole_code,
         to_pole_name: editedToPoleName || params.to_pole_name,
         to_pole_latitude: gps ? String(gps.latitude) : "",
         to_pole_longitude: gps ? String(gps.longitude) : "",
@@ -2027,7 +2069,11 @@ export default function DestinationPoleScreen() {
                   onPress={handleSaveToPoleName}
                   disabled={savingToName || !editToNameDraft.trim()}
                 >
-                  <Text style={styles.editNameSaveText}>Save</Text>
+                  {savingToName ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.editNameSaveText}>Save</Text>
+                  )}
                 </Pressable>
               </View>
             </View>

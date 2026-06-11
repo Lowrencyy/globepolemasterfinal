@@ -1,4 +1,5 @@
 import { useAuth } from "@/context/auth-context";
+import OfflineSyncBanner from "@/components/OfflineSyncBanner";
 import { refreshPendingCount, subscribePendingCount } from "@/lib/pending-store";
 import { refreshUnreadCount } from "@/lib/notification-store";
 import * as NavigationBar from "expo-navigation-bar";
@@ -151,24 +152,30 @@ export default function TabLayout() {
   if (mustChangePassword) return <Redirect href="/change-password" />;
 
   return (
-    <Tabs
-      screenOptions={{
-        headerShown: false,
-      }}
-      tabBar={(props) => (
-        <CustomTabBar {...props} pendingCount={pendingCount} />
-      )}
-    >
-      <Tabs.Screen name="index" options={{ title: "Home" }} />
-      <Tabs.Screen name="explore" options={{ title: "Explore" }} />
-      <Tabs.Screen name="logs" options={{ title: "Logs" }} />
-      <Tabs.Screen name="queue" options={{ title: "Queue" }} />
-      <Tabs.Screen name="profile" options={{ title: "Profile" }} />
-    </Tabs>
+    <View style={styles.root}>
+      <OfflineSyncBanner />
+      <Tabs
+        screenOptions={{
+          headerShown: false,
+        }}
+        tabBar={(props) => (
+          <CustomTabBar {...props} pendingCount={pendingCount} />
+        )}
+      >
+        <Tabs.Screen name="index" options={{ title: "Home" }} />
+        <Tabs.Screen name="explore" options={{ title: "Explore" }} />
+        <Tabs.Screen name="logs" options={{ title: "Logs" }} />
+        <Tabs.Screen name="queue" options={{ title: "Queue" }} />
+        <Tabs.Screen name="profile" options={{ title: "Profile" }} />
+      </Tabs>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
   tabBarContainer: {
     position: "absolute",
     left: 16,

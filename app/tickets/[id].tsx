@@ -10,11 +10,24 @@ import {
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
+  Image,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Stack, useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
-import { ChevronLeft, Send, CheckCircle2, Phone } from "lucide-react-native";
-import { getTicketById, addMessageToTicket, updateTicketStatus, Ticket } from "@/lib/ticket-store";
+import { ChevronLeft, ImagePlus, Send, Video, X, XCircle } from "lucide-react-native";
+import * as WebBrowser from "expo-web-browser";
+import * as ImagePicker from "expo-image-picker";
+import { assetUrl } from "@/lib/api";
+import {
+  endSupportTicketSession,
+  getSupportTicket,
+  getSupportTicketSession,
+  replySupportTicket,
+  startOrJoinSupportTicketSession,
+  type SupportTicketAttachmentInput,
+  type SupportTicketDetail,
+  type SupportTicketSession,
+} from "@/lib/support-tickets";
 
 const GREEN = "#0B7A5A";
 const SLATE = "#111827";
@@ -25,17 +38,27 @@ export default function TicketConversationScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
 
-  const [ticket, setTicket] = useState<Ticket | null>(null);
+  const [ticket, setTicket] = useState<SupportTicketDetail | null>(null);
+  const [session, setSession] = useState<SupportTicketSession | null>(null);
   const [loading, setLoading] = useState(true);
   const [inputText, setInputText] = useState("");
+  const [attachments, setAttachments] = useState<SupportTicketAttachmentInput[]>([]);
   const [sending, setSending] = useState(false);
+  const [sessionBusy, setSessionBusy] = useState(false);
 
-  const loadTicket = useCallback(() => {
+  const loadTicket = useCallback(async () => {
     if (!id) return;
-    getTicketById(id).then((t) => {
-      setTicket(t);
+    setLoading(true);
+    try {
+      const [ticketData, sessionData] = await Promise.all([
+        getSupportTicket(id),
+        getSupportTicketSession(id).catch(() => null),
+      ]);
+      setTicket(ticketData);
+      setSession(sessionData);
+    } finally {
       setLoading(false);
-    });
+    }
   }, [id]);
 
   useFocusEffect(
@@ -44,51 +67,120 @@ export default function TicketConversationScreen() {
     }, [loadTicket])
   );
 
+  async function pickAttachments() {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== "granted") return;
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.7,
+      allowsMultipleSelection: true,
+      selectionLimit: 4,
+    });
+
+    if (result.canceled) return;
+
+    setAttachments(result.assets.map((asset, index) => ({
+      uri: asset.uri,
+      name: asset.fileName || `reply-${Date.now()}-${index}.jpg`,
+      type: asset.mimeType || "image/jpeg",
+    })));
+  }
+
   async function handleSend() {
-    if (!inputText.trim() || !ticket || sending) return;
+    if ((!inputText.trim() && attachments.length === 0) || !ticket || sending) return;
 
     setSending(true);
-    const sentText = inputText;
+    const sentText = inputText.trim();
     setInputText("");
 
-    const updated = await addMessageToTicket(ticket.id, sentText, "user");
-    if (updated) {
-      setTicket(updated);
-      // Simulate automatic support bot reply after 1.5 seconds if ticket is open/in progress
-      if (updated.status !== "Closed") {
-        setTimeout(async () => {
-          const autoReply = await addMessageToTicket(
-            updated.id,
-            "Admin: We have logged your latest update. Support engineers are cross-verifying the concern parameters.",
-            "admin"
-          );
-          if (autoReply) setTicket(autoReply);
-        }, 1500);
+    try {
+      await replySupportTicket(ticket.id, sentText || "Attached screenshot(s).", attachments);
+      setAttachments([]);
+      const refreshed = await getSupportTicket(ticket.id);
+      setTicket(refreshed);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function handleJoinSession() {
+    if (!ticket || sessionBusy) return;
+    setSessionBusy(true);
+    try {
+      const nextSession = await startOrJoinSupportTicketSession(ticket.id);
+      setSession(nextSession);
+      if (nextSession.launch_url) {
+        await WebBrowser.openBrowserAsync(nextSession.launch_url);
       }
-    }
-    setSending(false);
-  }
-
-  async function handleCloseTicket() {
-    if (!ticket || ticket.status === "Closed") return;
-
-    const updated = await updateTicketStatus(ticket.id, "Closed");
-    if (updated) {
-      setTicket(updated);
+      const refreshed = await getSupportTicket(ticket.id);
+      setTicket(refreshed);
+    } finally {
+      setSessionBusy(false);
     }
   }
 
-  function getStatusBadge(status?: Ticket["status"]) {
-    switch (status) {
-      case "Open":
+  async function handleEndSession() {
+    if (!session || sessionBusy) return;
+    setSessionBusy(true);
+    try {
+      const nextSession = await endSupportTicketSession(session.id);
+      setSession(nextSession);
+      if (ticket) {
+        const refreshed = await getSupportTicket(ticket.id);
+        setTicket(refreshed);
+      }
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  function getStatusBadge(status?: string) {
+    switch (String(status ?? "").toLowerCase()) {
+      case "open":
         return { bg: "#ECFDF5", text: "#059669", label: "Open" };
-      case "In Progress":
-        return { bg: "#EFF6FF", text: "#2563EB", label: "In Progress" };
-      case "Closed":
+      case "in_progress":
+        return { bg: "#EEF2FF", text: "#4F46E5", label: "Active" };
+      case "resolved":
+        return { bg: "#FEF3C7", text: "#B45309", label: "Resolved" };
+      case "closed":
       default:
         return { bg: "#F3F4F6", text: "#6B7280", label: "Closed" };
     }
   }
+
+  function formatTimestamp(value?: string | null) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString();
+  }
+
+  function isUserMessage(message: SupportTicketDetail["messages"][number]) {
+    const senderCompany = String(message.sender?.company ?? "").toLowerCase();
+    return senderCompany !== "telcovantage";
+  }
+
+  function userInitial(name?: string | null) {
+    return (name || ticket?.subject || "S").trim().charAt(0).toUpperCase();
+  }
+
+  function renderAttachmentStrip(items?: Array<{ id: number; file_url?: string | null; file_path: string; file_name: string }>) {
+    if (!items?.length) return null;
+    return (
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.threadAttachmentsRow}>
+        {items.map((file) => {
+          const uri = file.file_url || assetUrl(file.file_path) || undefined;
+          if (!uri) return null;
+          return (
+            <Image key={file.id} source={{ uri }} style={styles.threadAttachmentImage} />
+          );
+        })}
+      </ScrollView>
+    );
+  }
+
+  const badge = getStatusBadge(ticket?.status);
 
   if (loading) {
     return (
@@ -109,7 +201,7 @@ export default function TicketConversationScreen() {
     );
   }
 
-  const badge = getStatusBadge(ticket.status);
+  const ticketClosed = ["closed", "resolved"].includes(String(ticket.status).toLowerCase());
 
   return (
     <>
@@ -121,65 +213,102 @@ export default function TicketConversationScreen() {
           style={{ flex: 1 }}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
-          {/* Main Top Header */}
           <View style={styles.header}>
             <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
               <ChevronLeft size={22} color={SLATE} />
             </TouchableOpacity>
 
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>{userInitial(ticket.subject)}</Text>
+            </View>
+
             <View style={styles.headerTitleWrap}>
-              <View style={styles.headerTopRow}>
-                <Text style={styles.ticketId}>{ticket.id}</Text>
+              <Text style={styles.concernTitle} numberOfLines={1}>
+                {ticket.subject}
+              </Text>
+              <View style={styles.headerMetaRow}>
+                <Text style={styles.ticketId}>{ticket.ticket_number || `#${ticket.id}`}</Text>
                 <View style={[styles.statusBadge, { backgroundColor: badge.bg }]}>
                   <Text style={[styles.statusBadgeText, { color: badge.text }]}>
                     {badge.label}
                   </Text>
                 </View>
               </View>
-              <Text style={styles.concernTitle} numberOfLines={1}>
-                {ticket.concern}
-              </Text>
             </View>
 
-            <View style={styles.headerActions}>
-              {ticket.status !== "Closed" && (
-                <TouchableOpacity
-                  onPress={() =>
-                    router.push(
-                      `/tickets/call?id=${ticket.id}&concern=${encodeURIComponent(
-                        ticket.concern
-                      )}` as any
-                    )
-                  }
-                  style={styles.callActionBtn}
-                  activeOpacity={0.7}
-                >
-                  <Phone size={16} color="#FFFFFF" />
-                </TouchableOpacity>
-              )}
-
-              {ticket.status !== "Closed" && (
-                <TouchableOpacity
-                  onPress={handleCloseTicket}
-                  style={styles.closeActionBtn}
-                  activeOpacity={0.7}
-                >
-                  <CheckCircle2 size={16} color={GREEN} />
-                  <Text style={styles.closeActionText}>Close</Text>
-                </TouchableOpacity>
-              )}
-            </View>
+            {!ticketClosed ? (
+              <TouchableOpacity
+                onPress={handleJoinSession}
+                style={styles.videoActionBtn}
+                activeOpacity={0.8}
+                disabled={sessionBusy}
+              >
+                <Video size={17} color="#FFFFFF" />
+              </TouchableOpacity>
+            ) : null}
           </View>
 
-          {/* Conversation Chat Scroll Area */}
+          {!ticketClosed ? (
+            <View style={styles.sessionBanner}>
+              <View style={styles.sessionBannerCopy}>
+                <Text style={styles.sessionBannerTitle}>
+                  {session?.status === "active" ? "Video support room is active" : "Start a live video support call"}
+                </Text>
+                <Text style={styles.sessionBannerText}>
+                  Daily room only runs when a real session is started.
+                </Text>
+              </View>
+              <View style={styles.sessionBannerActions}>
+                <TouchableOpacity
+                  style={[styles.sessionPillBtn, sessionBusy && { opacity: 0.6 }]}
+                  onPress={handleJoinSession}
+                  disabled={sessionBusy}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.sessionPillBtnText}>
+                    {sessionBusy ? "Opening..." : session?.status === "active" ? "Join" : "Start"}
+                  </Text>
+                </TouchableOpacity>
+                {session?.status === "active" ? (
+                  <TouchableOpacity
+                    style={[styles.sessionPillEndBtn, sessionBusy && { opacity: 0.6 }]}
+                    onPress={handleEndSession}
+                    disabled={sessionBusy}
+                    activeOpacity={0.85}
+                  >
+                    <XCircle size={14} color="#B91C1C" />
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            </View>
+          ) : null}
+
           <ScrollView
             contentContainerStyle={styles.chatScroll}
             showsVerticalScrollIndicator={false}
           >
-            <Text style={styles.dateStamp}>{ticket.createdAt}</Text>
+            <Text style={styles.dateStamp}>{formatTimestamp(ticket.created_at)}</Text>
+
+            <View style={[styles.messageRow, styles.rowLeft]}>
+              <View style={styles.senderAvatarSmall}>
+                <Text style={styles.senderAvatarText}>S</Text>
+              </View>
+              <View style={styles.leftMessageWrap}>
+                <Text style={styles.senderName}>Support Ticket</Text>
+                <View style={[styles.bubble, styles.bubbleAdmin]}>
+                  <Text style={[styles.bubbleText, styles.textAdmin]}>
+                    {ticket.description}
+                  </Text>
+                  {renderAttachmentStrip(ticket.attachments)}
+                  <Text style={[styles.timeText, styles.timeAdmin]}>
+                    Original ticket details
+                  </Text>
+                </View>
+              </View>
+            </View>
 
             {ticket.messages.map((msg) => {
-              const isUser = msg.sender === "user";
+              const isUser = isUserMessage(msg);
               return (
                 <View
                   key={msg.id}
@@ -188,64 +317,98 @@ export default function TicketConversationScreen() {
                     isUser ? styles.rowRight : styles.rowLeft,
                   ]}
                 >
-                  <View
-                    style={[
-                      styles.bubble,
-                      isUser ? styles.bubbleUser : styles.bubbleAdmin,
-                    ]}
-                  >
-                    <Text
+                  {!isUser ? (
+                    <View style={styles.senderAvatarSmall}>
+                      <Text style={styles.senderAvatarText}>A</Text>
+                    </View>
+                  ) : null}
+
+                  <View style={isUser ? styles.rightMessageWrap : styles.leftMessageWrap}>
+                    {!isUser ? (
+                      <Text style={styles.senderName}>
+                        {msg.sender?.full_name || msg.sender?.first_name || "Admin Support"}
+                      </Text>
+                    ) : null}
+                    <View
                       style={[
-                        styles.bubbleText,
-                        isUser ? styles.textUser : styles.textAdmin,
+                        styles.bubble,
+                        isUser ? styles.bubbleUser : styles.bubbleAdmin,
                       ]}
                     >
-                      {msg.text}
-                    </Text>
-                    <Text
-                      style={[
-                        styles.timeText,
-                        isUser ? styles.timeUser : styles.timeAdmin,
-                      ]}
-                    >
-                      {msg.timestamp}
-                    </Text>
+                      <Text
+                        style={[
+                          styles.bubbleText,
+                          isUser ? styles.textUser : styles.textAdmin,
+                        ]}
+                      >
+                        {msg.message}
+                      </Text>
+                      {renderAttachmentStrip(msg.attachments)}
+                      <Text
+                        style={[
+                          styles.timeText,
+                          isUser ? styles.timeUser : styles.timeAdmin,
+                        ]}
+                      >
+                        {formatTimestamp(msg.created_at)}
+                      </Text>
+                    </View>
                   </View>
                 </View>
               );
             })}
 
-            {ticket.status === "Closed" && (
+            {ticketClosed && (
               <View style={styles.systemNotice}>
                 <Text style={styles.systemNoticeText}>
-                  🔒 This support concern ticket is marked as Closed.
+                  This conversation is locked because the ticket is {badge.label.toLowerCase()}.
                 </Text>
               </View>
             )}
           </ScrollView>
 
-          {/* Chat Input Dock */}
-          {ticket.status !== "Closed" ? (
+          {!ticketClosed ? (
             <View style={styles.inputDock}>
-              <TextInput
-                style={styles.input}
-                placeholder="Type your message reply..."
-                placeholderTextColor="#94A3B8"
-                value={inputText}
-                onChangeText={setInputText}
-                multiline
-                maxLength={400}
-              />
+              {attachments.length > 0 ? (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.composerAttachmentsRow}>
+                  {attachments.map((file, index) => (
+                    <View key={`${file.uri}-${index}`} style={styles.composerAttachmentCard}>
+                      <Image source={{ uri: file.uri }} style={styles.composerAttachmentImage} />
+                      <TouchableOpacity
+                        style={styles.removeAttachmentBtn}
+                        onPress={() => setAttachments((prev) => prev.filter((_, i) => i !== index))}
+                      >
+                        <X size={12} color="#FFFFFF" />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </ScrollView>
+              ) : null}
+
+              <TouchableOpacity style={styles.attachComposerBtn} onPress={pickAttachments}>
+                <ImagePlus size={18} color="#475569" />
+              </TouchableOpacity>
+              <View style={styles.inputShell}>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Write a message..."
+                  placeholderTextColor="#94A3B8"
+                  value={inputText}
+                  onChangeText={setInputText}
+                  multiline
+                  maxLength={400}
+                />
+              </View>
               <TouchableOpacity
                 style={[
                   styles.sendBtn,
-                  (!inputText.trim() || sending) && { opacity: 0.5 },
+                  ((!inputText.trim() && attachments.length === 0) || sending) && { opacity: 0.5 },
                 ]}
-                activeOpacity={0.8}
+                activeOpacity={0.85}
                 onPress={handleSend}
-                disabled={!inputText.trim() || sending}
+                disabled={(!inputText.trim() && attachments.length === 0) || sending}
               >
-                <Send size={16} color="#FFFFFF" />
+                <Send size={17} color="#FFFFFF" />
               </TouchableOpacity>
             </View>
           ) : null}
@@ -278,7 +441,6 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: GREEN,
   },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -287,7 +449,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     borderBottomWidth: 1,
     borderBottomColor: BORDER,
-    elevation: 3,
   },
   backBtn: {
     width: 40,
@@ -295,69 +456,115 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     alignItems: "center",
     justifyContent: "center",
-    marginRight: 4,
+    marginRight: 6,
+  },
+  avatar: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: "#DBEAFE",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  avatarText: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#1D4ED8",
   },
   headerTitleWrap: {
     flex: 1,
     paddingRight: 8,
   },
-  headerTopRow: {
+  concernTitle: {
+    fontSize: 15,
+    fontWeight: "900",
+    color: SLATE,
+  },
+  headerMetaRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+    marginTop: 2,
   },
   ticketId: {
     fontSize: 11,
-    fontWeight: "900",
-    color: GREEN,
+    fontWeight: "800",
+    color: MUTED,
   },
   statusBadge: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 999,
   },
   statusBadgeText: {
     fontSize: 9,
     fontWeight: "900",
     textTransform: "uppercase",
   },
-  concernTitle: {
-    fontSize: 14,
-    fontWeight: "900",
-    color: SLATE,
-    marginTop: 2,
-  },
-
-  headerActions: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
-  callActionBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+  videoActionBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
     backgroundColor: GREEN,
     alignItems: "center",
     justifyContent: "center",
   },
-  closeActionBtn: {
+  sessionBanner: {
+    marginHorizontal: 12,
+    marginTop: 10,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 18,
+    padding: 14,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F1F5F9",
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 12,
-    gap: 4,
+    justifyContent: "space-between",
+    gap: 12,
   },
-  closeActionText: {
+  sessionBannerCopy: {
+    flex: 1,
+  },
+  sessionBannerTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: SLATE,
+  },
+  sessionBannerText: {
+    marginTop: 4,
     fontSize: 11,
-    fontWeight: "800",
-    color: GREEN,
+    lineHeight: 17,
+    color: MUTED,
+    fontWeight: "600",
   },
-
+  sessionBannerActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  sessionPillBtn: {
+    backgroundColor: GREEN,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  sessionPillBtnText: {
+    color: "#FFFFFF",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  sessionPillEndBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#FEE2E2",
+    alignItems: "center",
+    justifyContent: "center",
+  },
   chatScroll: {
-    padding: 16,
+    paddingHorizontal: 12,
+    paddingTop: 14,
     paddingBottom: 24,
   },
   dateStamp: {
@@ -367,10 +574,10 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginBottom: 16,
   },
-
   messageRow: {
     flexDirection: "row",
-    marginBottom: 12,
+    marginBottom: 14,
+    alignItems: "flex-end",
   },
   rowRight: {
     justifyContent: "flex-end",
@@ -378,29 +585,60 @@ const styles = StyleSheet.create({
   rowLeft: {
     justifyContent: "flex-start",
   },
-
+  senderAvatarSmall: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: "#E2E8F0",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+    marginBottom: 4,
+  },
+  senderAvatarText: {
+    color: "#475569",
+    fontSize: 11,
+    fontWeight: "900",
+  },
+  leftMessageWrap: {
+    maxWidth: "78%",
+  },
+  rightMessageWrap: {
+    maxWidth: "78%",
+    alignItems: "flex-end",
+  },
+  senderName: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: MUTED,
+    marginBottom: 4,
+    marginLeft: 4,
+  },
   bubble: {
-    maxWidth: "80%",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderRadius: 20,
+    paddingHorizontal: 15,
+    paddingVertical: 11,
+    borderRadius: 22,
   },
   bubbleUser: {
-    backgroundColor: GREEN,
-    borderBottomRightRadius: 4,
+    backgroundColor: "#1D4ED8",
+    borderBottomRightRadius: 8,
   },
   bubbleAdmin: {
     backgroundColor: "#FFFFFF",
-    borderBottomLeftRadius: 4,
+    borderBottomLeftRadius: 8,
     borderWidth: 1,
     borderColor: BORDER,
-    elevation: 1,
-    shadowColor: "#000",
-    shadowOpacity: 0.03,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 1 },
   },
-
+  threadAttachmentsRow: {
+    gap: 8,
+    marginTop: 10,
+  },
+  threadAttachmentImage: {
+    width: 110,
+    height: 110,
+    borderRadius: 14,
+    backgroundColor: "#E5E7EB",
+  },
   bubbleText: {
     fontSize: 14,
     fontWeight: "600",
@@ -412,58 +650,98 @@ const styles = StyleSheet.create({
   textAdmin: {
     color: SLATE,
   },
-
   timeText: {
     fontSize: 9,
     fontWeight: "700",
     marginTop: 6,
-    textAlign: "right",
   },
   timeUser: {
-    color: "rgba(255, 255, 255, 0.75)",
+    color: "rgba(255,255,255,0.75)",
+    textAlign: "right",
   },
   timeAdmin: {
     color: "#94A3B8",
   },
-
   systemNotice: {
-    marginTop: 16,
+    marginTop: 12,
+    alignSelf: "center",
     paddingVertical: 10,
-    paddingHorizontal: 16,
+    paddingHorizontal: 14,
     backgroundColor: "#F1F5F9",
-    borderRadius: 12,
-    alignItems: "center",
+    borderRadius: 999,
   },
   systemNoticeText: {
     fontSize: 11,
     fontWeight: "700",
     color: MUTED,
   },
-
   inputDock: {
     flexDirection: "row",
-    alignItems: "flex-end",
-    padding: 12,
+    alignItems: "center",
+    flexWrap: "wrap",
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 12,
     backgroundColor: "#FFFFFF",
     borderTopWidth: 1,
     borderTopColor: BORDER,
     gap: 8,
   },
-  input: {
+  composerAttachmentsRow: {
+    width: "100%",
+    gap: 8,
+    paddingBottom: 4,
+  },
+  composerAttachmentCard: {
+    width: 68,
+    height: 68,
+    borderRadius: 14,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#F1F5F9",
+  },
+  composerAttachmentImage: {
+    width: "100%",
+    height: "100%",
+  },
+  removeAttachmentBtn: {
+    position: "absolute",
+    top: 4,
+    right: 4,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: "rgba(15, 23, 42, 0.8)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  attachComposerBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#E2E8F0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  inputShell: {
     flex: 1,
     backgroundColor: "#F1F5F9",
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    borderRadius: 24,
+    paddingHorizontal: 14,
+    paddingVertical: 2,
+  },
+  input: {
     maxHeight: 100,
     fontSize: 14,
     fontWeight: "600",
     color: SLATE,
+    paddingVertical: 10,
   },
   sendBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     backgroundColor: GREEN,
     alignItems: "center",
     justifyContent: "center",

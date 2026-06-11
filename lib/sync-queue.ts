@@ -196,7 +196,6 @@ function resolveFieldName(key: string): string {
 }
 
 // Metadata-only form — photos are uploaded separately after the record is created.
-// Bundling 6 photos (~18 MB) in one POST over ngrok reliably causes timeout.
 async function buildMetadataForm(entry: QueueEntry): Promise<FormData> {
   const form = new FormData();
   form.append("local_id", entry.local_id);

@@ -5,6 +5,7 @@ import OnboardingScreen, { isOnboardingDone } from "./onboarding";
 import {
   Alert,
   Animated,
+  Easing,
   Image,
   KeyboardAvoidingView,
   Modal,
@@ -30,8 +31,7 @@ export default function LoginScreen() {
   const [checkingOnboarding, setCheckingOnboarding] = useState(true);
   const { login, isLoggedIn, mustChangePassword } = useAuth();
   const screenOpacity = useRef(new Animated.Value(0)).current;
-  const screenTranslateY = useRef(new Animated.Value(16)).current;
-  const screenScale = useRef(new Animated.Value(0.985)).current;
+  const screenScale = useRef(new Animated.Value(0.965)).current;
 
   useEffect(() => {
     isOnboardingDone().then((done) => {
@@ -46,21 +46,18 @@ export default function LoginScreen() {
     Animated.parallel([
       Animated.timing(screenOpacity, {
         toValue: 1,
-        duration: 420,
-        useNativeDriver: true,
-      }),
-      Animated.timing(screenTranslateY, {
-        toValue: 0,
-        duration: 420,
+        duration: 520,
+        easing: Easing.out(Easing.cubic),
         useNativeDriver: true,
       }),
       Animated.timing(screenScale, {
         toValue: 1,
-        duration: 420,
+        duration: 520,
+        easing: Easing.out(Easing.cubic),
         useNativeDriver: true,
       }),
     ]).start();
-  }, [screenOpacity, screenTranslateY, screenScale]);
+  }, [screenOpacity, screenScale]);
 
   if (isLoggedIn && mustChangePassword) return <Redirect href="/change-password" />;
   if (isLoggedIn) return <Redirect href="/(tabs)" />;
@@ -80,17 +77,14 @@ export default function LoginScreen() {
       Animated.parallel([
         Animated.timing(screenOpacity, {
           toValue: 0,
-          duration: 320,
-          useNativeDriver: true,
-        }),
-        Animated.timing(screenTranslateY, {
-          toValue: -14,
-          duration: 320,
+          duration: 440,
+          easing: Easing.inOut(Easing.cubic),
           useNativeDriver: true,
         }),
         Animated.timing(screenScale, {
-          toValue: 0.985,
-          duration: 320,
+          toValue: 1.045,
+          duration: 440,
+          easing: Easing.inOut(Easing.cubic),
           useNativeDriver: true,
         }),
       ]).start(() => {
@@ -98,11 +92,11 @@ export default function LoginScreen() {
           pathname: "/loading",
           params: { next: result.mustChangePassword ? "/change-password" : "/(tabs)" },
         } as any);
+        setLoading(false);
       });
     } catch (err: any) {
-      Alert.alert("Login Failed", err.message || "Something went wrong.");
-    } finally {
       setLoading(false);
+      Alert.alert("Login Failed", err.message || "Something went wrong.");
     }
   };
 
@@ -111,7 +105,7 @@ export default function LoginScreen() {
       style={{
         flex: 1,
         opacity: screenOpacity,
-        transform: [{ translateY: screenTranslateY }, { scale: screenScale }],
+        transform: [{ scale: screenScale }],
       }}
     >
     <SafeAreaView style={styles.safeArea}>

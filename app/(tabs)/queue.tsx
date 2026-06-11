@@ -1,12 +1,10 @@
 import { useRouter } from "expo-router";
 import { useAuth } from "@/context/auth-context";
-import { gpsQueueFlush, gpsQueueReadAll } from "@/lib/gps-queue";
-import { isOnline } from "@/lib/net-sync";
-import { processSimpleQueue, simpleQueueReadAll } from "@/lib/simple-queue";
+import { gpsQueueReadAll } from "@/lib/gps-queue";
+import { flushAllQueues, isOnline } from "@/lib/net-sync";
+import { simpleQueueReadAll } from "@/lib/simple-queue";
 import {
   imageQueueReadAll,
-  processImageQueue,
-  processSyncQueue,
   queueReadAll,
 } from "@/lib/sync-queue";
 import { getQueue } from "@/services/offline";
@@ -179,11 +177,8 @@ export default function QueueScreen() {
     }, 600);
 
     try {
-      const [tdResult] = await Promise.allSettled([
-        processSyncQueue(),
-        processSimpleQueue(),
-        gpsQueueFlush(),
-        processImageQueue(),
+      await Promise.allSettled([
+        flushAllQueues(),
         token ? import("@/services/offline").then(m => m.syncQueue(token)) : Promise.resolve(),
       ]);
 
@@ -199,9 +194,8 @@ export default function QueueScreen() {
       await load();
       await addSyncedToday(synced);
 
-      const td = tdResult.status === "fulfilled" ? tdResult.value : null;
-      if (td && (td as any).failed > 0) {
-        Alert.alert("Partially Synced", `${synced} uploaded · ${(td as any).failed} failed.\n${(td as any).firstError ?? ""}`);
+      if (remaining > 0) {
+        Alert.alert("Partially Synced", `${synced} uploaded · ${remaining} still pending.`);
       } else {
         Alert.alert("Synced!", `${synced} item${synced !== 1 ? "s" : ""} uploaded successfully.`);
       }

@@ -319,11 +319,12 @@ html,body,#map{
     poles.forEach(function(p, i){
       if(!validLatLng(p.lat, p.lng)) return;
       _store[i] = p;
-      // hasBefore: always red when before photo exists, regardless of image captured mode
+      var isCleared = p.status==='cleared';
       var hasBefore = !!p.has_before;
-      var c = hasBefore ? '#DC2626' : p.status==='cleared' ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
-      var lbl = p.status==='cleared' ? 'Completed' : p.status==='in_progress' ? 'Ongoing' : 'Pending';
-      var statusColor = p.status==='cleared' ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
+      var showBeforeBadge = hasBefore && !isCleared;
+      var c = isCleared ? '#10b981' : hasBefore ? '#DC2626' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
+      var lbl = isCleared ? 'Completed' : p.status==='in_progress' ? 'Ongoing' : 'Pending';
+      var statusColor = isCleared ? '#10b981' : p.status==='in_progress' ? '#6366f1' : '#f59e0b';
       var icon = L.divIcon({
         className: "",
         html: '<div class="pp-wrap"><div class="pp" style="background:'+c+'"></div></div>',
@@ -335,7 +336,7 @@ html,body,#map{
         ? '<button class="pstart" onclick="window._tap('+i+')">'+btnLabel+'</button>'
         : '';
       // Before badge — only shown in image captured mode when before photo exists
-      var beforeBadge = hasBefore
+      var beforeBadge = showBeforeBadge
         ? '<div style="display:inline-flex;align-items:center;gap:4px;background:#FEE2E2;border-radius:999px;padding:2px 8px;margin-top:4px;">'
           +'<span style="width:6px;height:6px;border-radius:50%;background:#DC2626;display:inline-block;"></span>'
           +'<span style="font-size:9px;font-weight:900;color:#DC2626;text-transform:uppercase;letter-spacing:0.08em;">Before ✓</span>'
@@ -974,6 +975,17 @@ export default function PolesScreen() {
                 }
               }
 
+              // Preserve locally edited pole code/name when backend still returns the old AsBuilt value.
+              if (cachedMatch?.pole?.pole_code) {
+                result = {
+                  ...result,
+                  pole: {
+                    ...result.pole,
+                    pole_code: cachedMatch.pole.pole_code,
+                  },
+                };
+              }
+
               // Preserve in_progress status when:
               // • cache says the pole was started (date_start set + in_progress)
               // • backend still returns pending (update in-flight or queued offline)
@@ -1062,7 +1074,10 @@ export default function PolesScreen() {
           code: p.pole.pole_code ?? "",
           id: p.id,
           pole_id: p.pole.id,
-          has_before: !!beforeCapturedMap[String(p.pole.id)],
+          has_before:
+            p.pole.skycable_status === "cleared"
+              ? false
+              : !!beforeCapturedMap[String(p.pole.id)],
           image_mode: imageCapturedMode, // still needed for block-navigation logic
         })),
     [beforeCapturedMap, imageCapturedMode, poles]

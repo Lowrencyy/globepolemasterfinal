@@ -5,7 +5,7 @@ Expo (SDK 54) / React Native mobile app for Globe field staff. Handles teardown 
 
 ## Backend
 ```
-BASE_URL = https://disguisedly-enarthrodial-kristi.ngrok-free.dev/api/v1
+BASE_URL = https://telcovantage.com/api/v1
 ```
 Two separate API clients:
 - `services/api.ts` → `api.request<T>(path, options, token)` — explicit token, used by services/

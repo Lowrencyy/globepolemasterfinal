@@ -32,6 +32,42 @@ let _flushing     = false;
 let _wasOnline    = false;        // track last known online state
 let _token: string | null         = null;
 
+export type NetSyncState = {
+  online: boolean;
+  flushing: boolean;
+  lastSyncAt: string | null;
+  lastError: string | null;
+};
+
+let _state: NetSyncState = {
+  online: false,
+  flushing: false,
+  lastSyncAt: null,
+  lastError: null,
+};
+
+const _listeners = new Set<(state: NetSyncState) => void>();
+
+function emitState() {
+  const snapshot = { ..._state };
+  _listeners.forEach((fn) => fn(snapshot));
+}
+
+function updateState(patch: Partial<NetSyncState>) {
+  _state = { ..._state, ...patch };
+  emitState();
+}
+
+export function getNetSyncState(): NetSyncState {
+  return { ..._state };
+}
+
+export function subscribeNetSyncState(fn: (state: NetSyncState) => void): () => void {
+  _listeners.add(fn);
+  fn({ ..._state });
+  return () => _listeners.delete(fn);
+}
+
 export function setNetSyncToken(token: string | null): void {
   _token = token;
 }
@@ -46,13 +82,12 @@ export async function isOnline(): Promise<boolean> {
       method: "GET",
       signal: controller.signal,
       headers: {
-        "ngrok-skip-browser-warning": "true",
         Accept: "application/json",
       },
     });
     return res.status < 600;
   } catch (e: any) {
-    // AbortError = timed out — treat as online (slow ngrok, not truly offline)
+    // AbortError = timed out — treat as online (slow connection, not truly offline)
     if (e?.name === "AbortError") return true;
     return false;
   } finally {
@@ -65,6 +100,7 @@ export async function isOnline(): Promise<boolean> {
 export async function flushAllQueues(): Promise<void> {
   if (_flushing) return;
   _flushing = true;
+  updateState({ flushing: true, lastError: null });
   try {
     const online = await isOnline();
 
@@ -73,27 +109,59 @@ export async function flushAllQueues(): Promise<void> {
       console.log("[NET_SYNC] Network restored — flushing queues");
     }
     _wasOnline = online;
+    updateState({ online });
 
     if (!online) return;
 
-    const results = await Promise.allSettled([
-      processSyncQueue(),                              // teardown reports + photos
-      processSimpleQueue(),                            // JSON PUT/POST actions
-      gpsQueueFlush(),                                 // GPS coordinates
-      processImageQueue(),                             // orphaned photos
-      _token ? prefetchSitemap(_token) : Promise.resolve(),
-    ]);
+    let simpleResult:
+      | Awaited<ReturnType<typeof processSimpleQueue>>
+      | null = null;
 
-    const labels = ["sync-queue", "simple-queue", "gps-queue", "image-queue", "sitemap"];
-    results.forEach((r, i) => {
-      if (r.status === "rejected") {
-        console.error(`[NET_SYNC_ERROR] ${labels[i]}:`, r.reason?.message ?? r.reason);
+    try {
+      simpleResult = await processSimpleQueue();
+    } catch (error: any) {
+      console.error(`[NET_SYNC_ERROR] simple-queue:`, error?.message ?? error);
+      updateState({ lastError: `simple-queue: ${error?.message ?? "Sync failed"}` });
+    }
+
+    try {
+      await gpsQueueFlush();
+    } catch (error: any) {
+      console.error(`[NET_SYNC_ERROR] gps-queue:`, error?.message ?? error);
+      updateState({ lastError: `gps-queue: ${error?.message ?? "Sync failed"}` });
+    }
+
+    // Do not continue with teardown report/image uploads while there are still
+    // pending simple updates. Pole-code edits must land first to keep naming
+    // consistent for uploaded teardown images and reports.
+    if ((simpleResult?.remaining ?? 0) > 0) {
+      await refreshPendingCount();
+      updateState({
+        lastError: "Waiting for pending field updates before teardown upload",
+      });
+      return;
+    }
+
+    const remainingTasks: Array<[string, () => Promise<unknown>]> = [
+      ["sync-queue", () => processSyncQueue()],
+      ["image-queue", () => processImageQueue()],
+      ["sitemap", () => (_token ? prefetchSitemap(_token) : Promise.resolve())],
+    ];
+
+    for (const [label, task] of remainingTasks) {
+      try {
+        await task();
+      } catch (error: any) {
+        console.error(`[NET_SYNC_ERROR] ${label}:`, error?.message ?? error);
+        updateState({ lastError: `${label}: ${error?.message ?? "Sync failed"}` });
       }
-    });
+    }
 
     await refreshPendingCount();
+    updateState({ lastSyncAt: new Date().toISOString() });
   } finally {
     _flushing = false;
+    updateState({ flushing: false });
   }
 }
 

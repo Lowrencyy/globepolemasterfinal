@@ -8,11 +8,13 @@ import {
   StatusBar,
   TextInput,
   Alert,
+  Image,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Stack, useRouter } from "expo-router";
-import { ChevronLeft, Send } from "lucide-react-native";
-import { createTicket } from "@/lib/ticket-store";
+import { ChevronLeft, ImagePlus, Send, X } from "lucide-react-native";
+import * as ImagePicker from "expo-image-picker";
+import { createSupportTicket, type SupportTicketAttachmentInput } from "@/lib/support-tickets";
 
 const GREEN = "#0B7A5A";
 const SLATE = "#111827";
@@ -23,7 +25,33 @@ export default function CreateTicketScreen() {
   const router = useRouter();
   const [concern, setConcern] = useState("");
   const [description, setDescription] = useState("");
+  const [attachments, setAttachments] = useState<SupportTicketAttachmentInput[]>([]);
   const [submitting, setSubmitting] = useState(false);
+
+  async function pickAttachments() {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== "granted") {
+      Alert.alert("Permission required", "Allow photo library access to attach screenshots.");
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.7,
+      allowsMultipleSelection: true,
+      selectionLimit: 4,
+    });
+
+    if (result.canceled) return;
+
+    const next = result.assets.map((asset, index) => ({
+      uri: asset.uri,
+      name: asset.fileName || `attachment-${Date.now()}-${index}.jpg`,
+      type: asset.mimeType || "image/jpeg",
+    }));
+
+    setAttachments(next);
+  }
 
   async function handleSubmit() {
     if (!concern.trim()) {
@@ -32,10 +60,20 @@ export default function CreateTicketScreen() {
     }
 
     setSubmitting(true);
-    await createTicket(concern, description);
-    setSubmitting(false);
+    try {
+      const ticket = await createSupportTicket({
+        subject: concern.trim(),
+        description: description.trim() || concern.trim(),
+        attachments,
+      });
+      router.replace(`/tickets/${ticket.id}` as any);
+    } catch (e: any) {
+      Alert.alert("Submit Failed", e?.message || "Could not create ticket.");
+      setSubmitting(false);
+      return;
+    }
 
-    router.back();
+    setSubmitting(false);
   }
 
   return (
@@ -83,6 +121,32 @@ export default function CreateTicketScreen() {
               numberOfLines={6}
               textAlignVertical="top"
             />
+
+            <View style={styles.attachmentsHeader}>
+              <Text style={[styles.label, { marginBottom: 0 }]}>ATTACH SCREENSHOTS</Text>
+              <TouchableOpacity style={styles.attachBtn} onPress={pickAttachments}>
+                <ImagePlus size={14} color={GREEN} />
+                <Text style={styles.attachBtnText}>Add</Text>
+              </TouchableOpacity>
+            </View>
+
+            {attachments.length > 0 ? (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.attachmentsRow}>
+                {attachments.map((file, index) => (
+                  <View key={`${file.uri}-${index}`} style={styles.attachmentCard}>
+                    <Image source={{ uri: file.uri }} style={styles.attachmentImage} />
+                    <TouchableOpacity
+                      style={styles.removeAttachmentBtn}
+                      onPress={() => setAttachments((prev) => prev.filter((_, i) => i !== index))}
+                    >
+                      <X size={12} color="#FFFFFF" />
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : (
+              <Text style={styles.attachHint}>Optional. Attach screenshots so admin can review the issue faster.</Text>
+            )}
           </View>
 
           <TouchableOpacity
@@ -178,6 +242,61 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: SLATE,
     minHeight: 130,
+  },
+  attachmentsHeader: {
+    marginTop: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  attachBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#ECFDF5",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+  },
+  attachBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: GREEN,
+  },
+  attachHint: {
+    marginTop: 10,
+    fontSize: 12,
+    lineHeight: 18,
+    color: MUTED,
+    fontWeight: "600",
+  },
+  attachmentsRow: {
+    gap: 10,
+    paddingTop: 12,
+  },
+  attachmentCard: {
+    width: 92,
+    height: 92,
+    borderRadius: 16,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#F8FAFC",
+  },
+  attachmentImage: {
+    width: "100%",
+    height: "100%",
+  },
+  removeAttachmentBtn: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: "rgba(15, 23, 42, 0.8)",
+    alignItems: "center",
+    justifyContent: "center",
   },
 
   submitBtn: {

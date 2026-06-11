@@ -5,6 +5,14 @@
 import * as FileSystem from "expo-file-system/legacy";
 import api from "./api";
 
+function triggerRefreshPendingCount() {
+  setTimeout(() => {
+    try {
+      require("./pending-store").refreshPendingCount().catch(() => {});
+    } catch {}
+  }, 0);
+}
+
 const QUEUE_FILE  = `${FileSystem.documentDirectory}simple_queue.json`;
 const MAX_RETRIES = 5;
 
@@ -16,6 +24,14 @@ export type SimpleQueueEntry = {
   retryCount: number;
   lastError?: string;
   queuedAt: string;
+};
+
+export type SimpleQueueProcessResult = {
+  processed: number;
+  succeeded: number;
+  deferred: number;
+  dropped: number;
+  remaining: number;
 };
 
 async function readQueue(): Promise<SimpleQueueEntry[]> {
@@ -49,6 +65,7 @@ export async function simpleQueuePush(
     filtered.push(newEntry);
   }
   await writeQueue(filtered);
+  triggerRefreshPendingCount();
 }
 
 export async function simpleQueueCount(): Promise<number> {
@@ -61,13 +78,19 @@ export async function simpleQueueReadAll(): Promise<SimpleQueueEntry[]> {
 
 export async function simpleQueueRemove(id: string): Promise<void> {
   await writeQueue((await readQueue()).filter(e => e.id !== id));
+  triggerRefreshPendingCount();
 }
 
-export async function processSimpleQueue(): Promise<void> {
+export async function processSimpleQueue(): Promise<SimpleQueueProcessResult> {
   const entries = await readQueue();
-  if (entries.length === 0) return;
+  if (entries.length === 0) {
+    return { processed: 0, succeeded: 0, deferred: 0, dropped: 0, remaining: 0 };
+  }
 
   const remaining: SimpleQueueEntry[] = [];
+  let succeeded = 0;
+  let deferred = 0;
+  let dropped = 0;
 
   for (const entry of entries) {
     try {
@@ -79,20 +102,32 @@ export async function processSimpleQueue(): Promise<void> {
         await api.post(entry.url, entry.body);
       }
       // Success — removed from remaining
+      succeeded++;
     } catch (e: any) {
       const status = e?.response?.status;
 
       if (status === 422 || status === 404 || status === 400) {
         // Validation/not-found — retrying won't help; log and drop
         console.warn(`[SIMPLE_QUEUE_DROP] ${entry.method.toUpperCase()} ${entry.url} → ${status}:`, e?.response?.data ?? e?.message);
+        dropped++;
       } else if ((entry.retryCount ?? 0) + 1 >= MAX_RETRIES) {
         console.warn(`[MAX_RETRIES_EXCEEDED] ${entry.method.toUpperCase()} ${entry.url} after ${MAX_RETRIES} attempts`);
+        dropped++;
       } else {
         // Network / 5xx — keep for retry
         remaining.push({ ...entry, retryCount: (entry.retryCount ?? 0) + 1, lastError: e?.message });
+        deferred++;
       }
     }
   }
 
   await writeQueue(remaining);
+  triggerRefreshPendingCount();
+  return {
+    processed: entries.length,
+    succeeded,
+    deferred,
+    dropped,
+    remaining: remaining.length,
+  };
 }

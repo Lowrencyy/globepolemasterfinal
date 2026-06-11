@@ -1,6 +1,7 @@
 import api from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { getDisplayTime, getPHTNow } from "@/lib/display-time";
+import { simpleQueuePush } from "@/lib/simple-queue";
 import { queuePush, imageQueuePush, persistImage } from "@/lib/sync-queue";
 import { tokenStore } from "@/lib/token";
 import * as FileSystem from "expo-file-system/legacy";
@@ -773,9 +774,15 @@ export default function TeardownComponentsScreen() {
   }>();
 
   const accentColor = params.accent || "#0B7A5A";
+  const [currentFromPoleCode, setCurrentFromPoleCode] = useState(
+    params.pole_code ?? "",
+  );
+  const [currentToPoleCode, setCurrentToPoleCode] = useState(
+    params.to_pole_code ?? "",
+  );
   const projFolder = sanitize(params.project_name);
-  const fromCode = sanitize(params.pole_code);
-  const toCode = sanitize(params.to_pole_code);
+  const fromCode = sanitize(currentFromPoleCode || params.from_pole_id || "");
+  const toCode = sanitize(currentToPoleCode || params.to_pole_id || "");
   const draftDir = `${FileSystem.documentDirectory}teardown_drafts/${projFolder}/${params.node_id}/${params.from_pole_id}/`;
   const poleDraftDir = `${FileSystem.documentDirectory}pole_drafts/${projFolder}/${params.node_id}/${params.from_pole_id}/`;
   const expectedCable = Number(params.expected_cable) || 0;
@@ -841,6 +848,7 @@ export default function TeardownComponentsScreen() {
   const [vicinityOpen, setVicinityOpen] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const submitLockRef = useRef(false);
 
   const fromLat = Number(params.from_pole_latitude) || null;
   const fromLng = Number(params.from_pole_longitude) || null;
@@ -882,6 +890,34 @@ export default function TeardownComponentsScreen() {
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerLabel, setViewerLabel] = useState("");
   const [viewerPhoto, setViewerPhoto] = useState<PhotoFile>(null);
+
+  useEffect(() => {
+    setCurrentFromPoleCode(params.pole_code ?? "");
+    setCurrentToPoleCode(params.to_pole_code ?? "");
+  }, [params.pole_code, params.to_pole_code]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      const [editedFrom, editedTo] = await Promise.all([
+        params.from_pole_id
+          ? cacheGet<string>(`draft_pole_name_${params.from_pole_id}`).catch(() => null)
+          : Promise.resolve(null),
+        params.to_pole_id
+          ? cacheGet<string>(`draft_to_pole_name_${params.to_pole_id}`).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+
+      if (!mounted) return;
+      if (editedFrom?.trim()) setCurrentFromPoleCode(editedFrom.trim());
+      if (editedTo?.trim()) setCurrentToPoleCode(editedTo.trim());
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [params.from_pole_id, params.to_pole_id]);
 
   const recoveredNum = parseFloat(recoveredCable) || 0;
   const adjExpected =
@@ -973,16 +1009,51 @@ export default function TeardownComponentsScreen() {
       return { uri, name: fileName, type: "image/jpeg" } as any;
     };
 
+    const destinationPoleDir = `${FileSystem.documentDirectory}pole_drafts/${sanitize(params.project_name)}/${params.node_id}/${params.to_pole_id}/`;
+
+    const findDestinationVariant = async (
+      suffix: "_before.jpg" | "_after.jpg" | "_poletag.jpg",
+      key: string,
+      fileName: string,
+    ): Promise<PhotoFile> => {
+      try {
+        const entries = await FileSystem.readDirectoryAsync(draftDir).catch(() => []);
+        const fromFile = `${fromCode}${suffix}`;
+        const match = entries.find((entry) => entry.endsWith(suffix) && entry !== fromFile);
+        if (!match) return null;
+        return await loadFile(draftDir + match, key, fileName);
+      } catch {
+        return null;
+      }
+    };
+
     await Promise.all(
       Object.entries(allFiles).map(async ([key, { dir, file }]) => {
         const loaded = await loadFile(dir + file, key, file);
         if (loaded) {
           result[key] = loaded;
-        } else if (key === "to_tag") {
-          // Fallback: destination-pole cross-copies the to-pole tag to pole_drafts.
-          // Try that path if the teardown_drafts version is missing.
-          const poleDir = `${FileSystem.documentDirectory}pole_drafts/${sanitize(params.project_name)}/${params.node_id}/${params.to_pole_id}/`;
-          result[key] = await loadFile(poleDir + `pole_${params.to_pole_id}_poletag.jpg`, key, file);
+        } else if (key === "to_before" || key === "to_after" || key === "to_tag") {
+          // Fallback: destination-pole cross-copies destination photos into pole_drafts
+          // using pole_id-based filenames. This lets us recover the photo set even if
+          // the destination pole code/name was edited after capture.
+          const poleDraftFile =
+            key === "to_before"
+              ? `pole_${params.to_pole_id}_before.jpg`
+              : key === "to_after"
+              ? `pole_${params.to_pole_id}_after.jpg`
+              : `pole_${params.to_pole_id}_poletag.jpg`;
+          const poleDraftLoaded = await loadFile(destinationPoleDir + poleDraftFile, key, file);
+          if (poleDraftLoaded) {
+            result[key] = poleDraftLoaded;
+          } else {
+            const suffix =
+              key === "to_before"
+                ? "_before.jpg"
+                : key === "to_after"
+                ? "_after.jpg"
+                : "_poletag.jpg";
+            result[key] = await findDestinationVariant(suffix, key, file);
+          }
         } else {
           result[key] = null;
         }
@@ -1154,11 +1225,16 @@ export default function TeardownComponentsScreen() {
     if (street) lines.push(street);
     const cityProv = [city, region].filter(Boolean).join(", ");
     if (cityProv) lines.push(cityProv);
-    const fromCode_ = params.pole_code ?? params.from_pole_id ?? "";
-    const toCode_ = params.to_pole_code ?? params.to_pole_id ?? "";
+    if (lat != null && lng != null) {
+      const latStr = `${Math.abs(lat).toFixed(6)}° ${lat >= 0 ? "N" : "S"}`;
+      const lngStr = `${Math.abs(lng).toFixed(6)}° ${lng >= 0 ? "E" : "W"}`;
+      lines.push(`${latStr}  ${lngStr}`);
+    }
+    const fromCode_ = currentFromPoleCode || params.from_pole_id || "";
+    const toCode_ = currentToPoleCode || params.to_pole_id || "";
     lines.push(`${fromCode_} → ${toCode_}  (BUNCHING)`);
     const nodeLabel = params.node_name || "";
-    if (nodeLabel) lines.push(`node name: ${nodeLabel}`);
+    if (nodeLabel) lines.push(`Node: ${nodeLabel}`);
     return lines;
   }
 
@@ -1209,6 +1285,9 @@ export default function TeardownComponentsScreen() {
         await new Promise(r => setTimeout(r, 350));
 
         const gps = bunchingGpsRef.current;
+        if (!gps || !Number.isFinite(gps.lat) || !Number.isFinite(gps.lng) || !gps.capturedAt) {
+          throw new Error("Bunching photo metadata is missing. Please retake with GPS enabled.");
+        }
 
         // Compress
         const manip = ImageManipulator.manipulate(result.uri);
@@ -1219,25 +1298,20 @@ export default function TeardownComponentsScreen() {
         await FileSystem.makeDirectoryAsync(draftDir, { intermediates: true });
         const dest = draftDir + `${fromCode}_bunching.jpg`;
 
-        if (gps && !bunchingMapCache.current) {
+        if (!bunchingMapCache.current) {
           bunchingMapCache.current = await _fetchBunchingMapTileB64(gps.lat, gps.lng).catch(() => null);
         }
 
         let displayUri = compressed.uri;
-        if (gps) {
-          const lines = buildBunchingStampLines(
-            gps.lat, gps.lng,
-            bunchingStreetRef.current, bunchingCityRef.current, bunchingRegionRef.current,
-          );
-          const stamped = await stampBunchingPhoto(compressed.uri, lines, gps.lat, gps.lng);
-          await FileSystem.copyAsync({ from: stamped, to: dest }).catch(() => {});
-          displayUri = stamped;
-        } else {
-          await FileSystem.copyAsync({ from: compressed.uri, to: dest }).catch(() => {});
-          displayUri = dest;
-        }
+        const lines = buildBunchingStampLines(
+          gps.lat, gps.lng,
+          bunchingStreetRef.current, bunchingCityRef.current, bunchingRegionRef.current,
+        );
+        const stamped = await stampBunchingPhoto(compressed.uri, lines, gps.lat, gps.lng);
+        await FileSystem.copyAsync({ from: stamped, to: dest }).catch(() => {});
+        displayUri = stamped;
 
-        photoTimestamps.current.before_span = gps?.capturedAt ?? await getDisplayTime();
+        photoTimestamps.current.before_span = gps.capturedAt;
         setCablePhoto({ uri: displayUri } as PhotoFile);
         setBunchingPreviewOpen(true);
       } catch (e: any) {
@@ -1254,33 +1328,39 @@ export default function TeardownComponentsScreen() {
     // Capture GPS before navigating so the overlay in capture.tsx shows it
     const { status: locStatus } = await Location.requestForegroundPermissionsAsync();
     let gps: { lat: number; lng: number; capturedAt: string } | null = null;
-    if (locStatus === "granted") {
-      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }).catch(() => null);
-      if (pos) {
-        gps = { lat: pos.coords.latitude, lng: pos.coords.longitude, capturedAt: getPHTNow() };
-        setBunchingGps(gps);
-        bunchingGpsRef.current = gps;
-        Location.reverseGeocodeAsync({ latitude: pos.coords.latitude, longitude: pos.coords.longitude })
-          .then(addrs => {
-            const a = addrs[0];
-            if (a) {
-              const street = String(a.street ?? a.name ?? "").trim();
-              const city   = String(a.city ?? a.district ?? a.subregion ?? "").trim();
-              const region = String(a.region ?? "").trim();
-              setBunchingStreet(street); bunchingStreetRef.current = street;
-              setBunchingCity(city);     bunchingCityRef.current   = city;
-              setBunchingRegion(region); bunchingRegionRef.current = region;
-            }
-          })
-          .catch(() => {});
-      }
+    if (locStatus !== "granted") {
+      Alert.alert("GPS Required", "Bunching photo requires location metadata before capture.");
+      return;
     }
+
+    const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }).catch(() => null);
+    if (!pos) {
+      Alert.alert("GPS Required", "Could not get GPS location for bunching metadata. Try again in an open area.");
+      return;
+    }
+
+    gps = { lat: pos.coords.latitude, lng: pos.coords.longitude, capturedAt: getPHTNow() };
+    setBunchingGps(gps);
+    bunchingGpsRef.current = gps;
+    Location.reverseGeocodeAsync({ latitude: pos.coords.latitude, longitude: pos.coords.longitude })
+      .then(addrs => {
+        const a = addrs[0];
+        if (a) {
+          const street = String(a.street ?? a.name ?? "").trim();
+          const city   = String(a.city ?? a.district ?? a.subregion ?? "").trim();
+          const region = String(a.region ?? "").trim();
+          setBunchingStreet(street); bunchingStreetRef.current = street;
+          setBunchingCity(city);     bunchingCityRef.current   = city;
+          setBunchingRegion(region); bunchingRegionRef.current = region;
+        }
+      })
+      .catch(() => {});
 
     router.push({
       pathname: "/capture" as any,
       params: {
         label: "BUNCHING",
-        poleCode: `${params.pole_code ?? ""} → ${params.to_pole_code ?? ""}`,
+        poleCode: `${currentFromPoleCode || ""} → ${currentToPoleCode || ""}`,
         nodeName: params.node_name ?? "",
         lat: gps ? String(gps.lat) : "",
         lng: gps ? String(gps.lng) : "",
@@ -1302,9 +1382,19 @@ export default function TeardownComponentsScreen() {
     openBunchingCamera();
   }
 
+  const bunchingRequired = collectedAll === false;
+  const hasBunchingMetadata =
+    !!bunchingGps &&
+    Number.isFinite(bunchingGps.lat) &&
+    Number.isFinite(bunchingGps.lng) &&
+    !!bunchingGps.capturedAt;
+
   const canProceed = useCallback(() => {
     if (step === 0) {
-      return collectedAll !== null && recoveredCable.trim() !== "" && !!cablePhoto;
+      const hasCableValue = recoveredCable.trim() !== "";
+      const hasValidBunchingPhoto = !!cablePhoto && hasBunchingMetadata;
+      const hasBunchingIfNeeded = !bunchingRequired || hasValidBunchingPhoto;
+      return collectedAll !== null && hasCableValue && hasBunchingIfNeeded;
     }
 
     const fromPhotosOk = polePreSubmitted || (!!photos.from_before && !!photos.from_tag);
@@ -1315,7 +1405,7 @@ export default function TeardownComponentsScreen() {
       !!photos.to_tag &&
       collectedAll !== null
     );
-  }, [step, collectedAll, recoveredCable, cablePhoto, polePreSubmitted, photos]);
+  }, [step, collectedAll, recoveredCable, cablePhoto, hasBunchingMetadata, bunchingRequired, polePreSubmitted, photos]);
 
   function goNext() {
     if (step < STEPS.length - 1) {
@@ -1391,8 +1481,8 @@ export default function TeardownComponentsScreen() {
       fields.node_name = params.node_name;
 
     // Pole codes — stored in queue for display purposes
-    if (params.pole_code) fields.from_pole_code = params.pole_code;
-    if (params.to_pole_code) fields.to_pole_code = params.to_pole_code;
+    if (currentFromPoleCode) fields.from_pole_code = currentFromPoleCode;
+    if (currentToPoleCode) fields.to_pole_code = currentToPoleCode;
 
     // Send lineman-edited pole names so the backend stamps them into the images
     if (params.pole_name) fields.from_pole_name = params.pole_name;
@@ -1470,7 +1560,52 @@ export default function TeardownComponentsScreen() {
     return paths;
   }
 
+  async function syncEditedPoleCodesBeforeSubmit(fields: Record<string, string>) {
+    const updates = [
+      {
+        poleId: params.from_pole_id,
+        poleCode: fields.from_pole_code,
+      },
+      {
+        poleId: params.to_pole_id,
+        poleCode: fields.to_pole_code,
+      },
+    ].filter(
+      (item): item is { poleId: string; poleCode: string } =>
+        !!item.poleId && !!item.poleCode && item.poleCode.trim() !== "",
+    );
+
+    for (const item of updates) {
+      try {
+        await api.put(`/skycable/poles/${item.poleId}`, {
+          pole_code: item.poleCode,
+        });
+      } catch (e: any) {
+        const status = e?.response?.status;
+        if (!status) {
+          await simpleQueuePush(
+            {
+              method: "put",
+              url: `/skycable/poles/${item.poleId}`,
+              body: { pole_code: item.poleCode },
+            },
+            true,
+          ).catch(() => {});
+          continue;
+        }
+
+        const detail =
+          e?.response?.data?.message ||
+          e?.message ||
+          `HTTP ${status}`;
+        throw new Error(`Failed to update pole code for ${item.poleCode}: ${detail}`);
+      }
+    }
+  }
+
   async function handleSubmit() {
+    if (submitLockRef.current) return;
+
     const missing: string[] = [];
     if (!polePreSubmitted && !photos.from_before) missing.push("From Pole — Before photo");
     if (!polePreSubmitted && !photos.from_tag) missing.push("From Pole — Pole Tag photo");
@@ -1481,7 +1616,8 @@ export default function TeardownComponentsScreen() {
     if (recoveredCable.trim() === "") {
       missing.push("Actual cable collected (meters)");
     }
-    if (!cablePhoto) missing.push("Bunching photo");
+    if (bunchingRequired && !cablePhoto) missing.push("Bunching photo");
+    if (cablePhoto && !hasBunchingMetadata) missing.push("Bunching photo metadata");
 
     if (missing.length > 0) {
       Alert.alert(
@@ -1491,6 +1627,7 @@ export default function TeardownComponentsScreen() {
       return;
     }
 
+    submitLockRef.current = true;
     setSubmitting(true);
 
     let fields: Record<string, string>;
@@ -1499,8 +1636,10 @@ export default function TeardownComponentsScreen() {
     try {
       fields = await buildFields();
       photoPaths = buildPhotoPaths();
-    } catch {
-      Alert.alert("Error", "Could not prepare submission. Please try again.");
+      await syncEditedPoleCodesBeforeSubmit(fields);
+    } catch (e: any) {
+      Alert.alert("Error", e?.message || "Could not prepare submission. Please try again.");
+      submitLockRef.current = false;
       setSubmitting(false);
       return;
     }
@@ -1515,7 +1654,6 @@ export default function TeardownComponentsScreen() {
     };
 
     // Photos are uploaded separately after the metadata record is created.
-    // Do NOT bundle them here — 6×3MB over ngrok reliably causes timeout.
     const form = new FormData();
     form.append("local_id", local_id);
     for (const [key, value] of Object.entries(fields)) {
@@ -1537,12 +1675,13 @@ export default function TeardownComponentsScreen() {
     router.replace({
       pathname: "/teardowns/teardown-complete" as any,
       params: {
-        from_pole_code: params.pole_code ?? "",
+        from_pole_code: currentFromPoleCode ?? "",
         from_pole_name: params.pole_name ?? "",
         to_pole_id: params.to_pole_id ?? "",
-        to_pole_code: params.to_pole_code ?? "",
+        to_pole_code: currentToPoleCode ?? "",
         to_pole_name: params.to_pole_name ?? "",
         node_id: params.node_id ?? "",
+        node_name: params.node_name ?? "",
         project_id: params.project_id ?? "",
         project_name: params.project_name ?? "",
         accent: params.accent ?? "",
@@ -1586,7 +1725,7 @@ export default function TeardownComponentsScreen() {
             if (fieldName === "bunching")    imageType = "bunching";
             const isToPole = fieldName.startsWith("to_");
             const poleId   = isToPole ? params.to_pole_id : params.from_pole_id;
-            const poleCode = isToPole ? params.to_pole_code : params.pole_code;
+            const poleCode = isToPole ? currentToPoleCode : currentFromPoleCode;
             const photoForm = new FormData();
             photoForm.append("report_id",      reportId);
             photoForm.append("pole_id",        String(poleId ?? ""));
@@ -1624,7 +1763,7 @@ export default function TeardownComponentsScreen() {
                 report_id:  reportId,
                 pole_id:    String(isToPole ? params.to_pole_id : params.from_pole_id ?? ""),
                 node_id:    String(params.node_id ?? ""),
-                pole_code:  String(isToPole ? params.to_pole_code : params.pole_code ?? ""),
+                pole_code:  String(isToPole ? currentToPoleCode : currentFromPoleCode ?? ""),
                 image_type: imageType,
                 ...(imageType === "bunching" && params.to_pole_id
                   ? { to_pole_id: String(params.to_pole_id) }
@@ -1712,7 +1851,10 @@ export default function TeardownComponentsScreen() {
       });
   }
 
-  const cableStepDone = collectedAll !== null && recoveredCable.trim() !== "" && !!cablePhoto;
+  const cableStepDone =
+    collectedAll !== null &&
+    recoveredCable.trim() !== "" &&
+    (!bunchingRequired || (!!cablePhoto && hasBunchingMetadata));
   const componentsTotal =
     collectedNode +
     collectedAmp +
@@ -1723,11 +1865,11 @@ export default function TeardownComponentsScreen() {
 
   const requiredPhotosDone = [
     polePreSubmitted || !!photos.from_before,
+    polePreSubmitted || !!photos.from_after,
     polePreSubmitted || !!photos.from_tag,
     !!photos.to_before,
     !!photos.to_after,
     !!photos.to_tag,
-    !!cablePhoto,
   ].filter(Boolean).length;
 
   const progress = useMemo(() => {
@@ -1800,7 +1942,7 @@ export default function TeardownComponentsScreen() {
                   style={[styles.spanPoleCode, { color: accentColor }]}
                   numberOfLines={1}
                 >
-                  {params.pole_code || "—"}
+                  {currentFromPoleCode || "—"}
                 </Text>
                 <Text style={styles.spanPoleLabel}>From</Text>
               </View>
@@ -1834,7 +1976,7 @@ export default function TeardownComponentsScreen() {
                   style={[styles.spanPoleCode, { color: "#6366F1" }]}
                   numberOfLines={1}
                 >
-                  {params.to_pole_code || "—"}
+                  {currentToPoleCode || "—"}
                 </Text>
                 <Text style={styles.spanPoleLabel}>To</Text>
               </View>
@@ -1886,7 +2028,7 @@ export default function TeardownComponentsScreen() {
               <View style={styles.vicinityModalCard}>
                 <View style={styles.vicinityModalHeader}>
                   <Text style={styles.vicinityModalTitle}>
-                    {params.pole_code} → {params.to_pole_code}
+                    {currentFromPoleCode} → {currentToPoleCode}
                   </Text>
                   <Pressable
                     onPress={() => setVicinityOpen(false)}
@@ -1911,10 +2053,10 @@ export default function TeardownComponentsScreen() {
                       html: buildSpanMapHtml(
                         mapFromLat!,
                         mapFromLng!,
-                        params.pole_code || "FROM",
+                        currentFromPoleCode || "FROM",
                         mapToLat!,
                         mapToLng!,
-                        params.to_pole_code || "TO",
+                        currentToPoleCode || "TO",
                         accentColor,
                         false,
                       ),
@@ -1970,7 +2112,7 @@ export default function TeardownComponentsScreen() {
                           : styles.sectionPillTextMuted,
                       ]}
                     >
-                      {requiredPhotosDone}/5
+                      {requiredPhotosDone}/6
                     </Text>
                   </View>
                 }
@@ -2049,7 +2191,7 @@ export default function TeardownComponentsScreen() {
             <View style={styles.routeBlock}>
               <Text style={styles.routeLabel}>From</Text>
               <Text style={styles.routeValue} numberOfLines={2}>
-                {params.pole_name || params.pole_code || "—"}
+                {params.pole_name || currentFromPoleCode || "—"}
               </Text>
             </View>
 
@@ -2058,7 +2200,7 @@ export default function TeardownComponentsScreen() {
             <View style={styles.routeBlock}>
               <Text style={styles.routeLabel}>To</Text>
               <Text style={styles.routeValue} numberOfLines={2}>
-                {params.to_pole_name || params.to_pole_code || "—"}
+                {params.to_pole_name || currentToPoleCode || "—"}
               </Text>
             </View>
           </View>
@@ -2248,7 +2390,7 @@ export default function TeardownComponentsScreen() {
                 right={
                   <View style={[styles.sectionPill, cablePhoto ? styles.sectionPillSuccess : styles.sectionPillMuted]}>
                     <Text style={[styles.sectionPillText, cablePhoto ? styles.sectionPillTextSuccess : styles.sectionPillTextMuted]}>
-                      {cablePhoto ? "Captured" : "Required"}
+                      {cablePhoto ? "Captured" : bunchingRequired ? "Required" : "Optional"}
                     </Text>
                   </View>
                 }
@@ -2300,12 +2442,25 @@ export default function TeardownComponentsScreen() {
                 <TouchableOpacity
                   onPress={openBunchingCamera}
                   activeOpacity={0.85}
-                  style={[styles.cablePhotoBox, { borderColor: "#EF4444", borderStyle: "dashed" }]}
+                  style={[
+                    styles.cablePhotoBox,
+                    {
+                      borderColor: bunchingRequired ? "#EF4444" : "#D8E0E8",
+                      borderStyle: "dashed",
+                    },
+                  ]}
                 >
                   <View style={styles.cablePhotoEmpty}>
                     <Text style={styles.cablePhotoEmptyIcon}>📷</Text>
-                    <Text style={[styles.cablePhotoEmptyText, { color: "#EF4444" }]}>
-                      Tap to capture (Required)
+                    <Text
+                      style={[
+                        styles.cablePhotoEmptyText,
+                        { color: bunchingRequired ? "#EF4444" : "#667085" },
+                      ]}
+                    >
+                      {bunchingRequired
+                        ? "Tap to capture (Required)"
+                        : "Tap to capture (Optional)"}
                     </Text>
                   </View>
                 </TouchableOpacity>
@@ -2525,7 +2680,7 @@ export default function TeardownComponentsScreen() {
                       style={[styles.spanPoleCode, { color: accentColor }]}
                       numberOfLines={1}
                     >
-                      {params.pole_code || "—"}
+                      {currentFromPoleCode || "—"}
                     </Text>
                     <Text style={styles.spanPoleLabel}>From</Text>
                   </View>
@@ -2568,7 +2723,7 @@ export default function TeardownComponentsScreen() {
                       style={[styles.spanPoleCode, { color: "#6366F1" }]}
                       numberOfLines={1}
                     >
-                      {params.to_pole_code || "—"}
+                      {currentToPoleCode || "—"}
                     </Text>
                     <Text style={styles.spanPoleLabel}>To</Text>
                   </View>
@@ -2588,10 +2743,10 @@ export default function TeardownComponentsScreen() {
                         html: buildSpanMapHtml(
                           mapFromLat!,
                           mapFromLng!,
-                          params.pole_code || "FROM",
+                          currentFromPoleCode || "FROM",
                           mapToLat!,
                           mapToLng!,
-                          params.to_pole_code || "TO",
+                          currentToPoleCode || "TO",
                           accentColor,
                           false,
                         ),
@@ -2612,7 +2767,7 @@ export default function TeardownComponentsScreen() {
               {/* Photo Review */}
               <View style={styles.summaryCard}>
                 <Text style={styles.summaryCardLabel}>
-                  PHOTO REVIEW ({requiredPhotosDone}/5)
+                  PHOTO REVIEW ({requiredPhotosDone}/6)
                 </Text>
                 <View style={styles.summaryPhotoGrid}>
                   {(
@@ -2760,13 +2915,16 @@ export default function TeardownComponentsScreen() {
               <Pressable
                 style={({ pressed }) => [
                   styles.summaryMarkBtn,
-                  { backgroundColor: accentColor },
-                  pressed && styles.pressedDown,
+                  { backgroundColor: submitting ? "#9CA3AF" : accentColor },
+                  pressed && !submitting && styles.pressedDown,
                 ]}
-                onPress={() => setConfirmOpen(true)}
+                onPress={() => {
+                  if (!submitting) setConfirmOpen(true);
+                }}
+                disabled={submitting}
               >
                 <Text style={styles.summaryMarkBtnText}>
-                  Mark as Complete ✓
+                  {submitting ? "Submitting..." : "Mark as Complete ✓"}
                 </Text>
               </Pressable>
             </View>
@@ -2799,15 +2957,19 @@ export default function TeardownComponentsScreen() {
                     <Pressable
                       style={({ pressed }) => [
                         styles.confirmYesBtn,
-                        { backgroundColor: accentColor },
-                        pressed && styles.pressedDown,
+                        { backgroundColor: submitting ? "#9CA3AF" : accentColor },
+                        pressed && !submitting && styles.pressedDown,
                       ]}
                       onPress={() => {
+                        if (submitting || submitLockRef.current) return;
                         setConfirmOpen(false);
                         handleSubmit();
                       }}
+                      disabled={submitting}
                     >
-                      <Text style={styles.confirmYesText}>Yes, Submit</Text>
+                      <Text style={styles.confirmYesText}>
+                        {submitting ? "Submitting..." : "Yes, Submit"}
+                      </Text>
                     </Pressable>
                   </View>
                 </View>

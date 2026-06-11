@@ -20,7 +20,7 @@ import {
   User,
   Monitor,
 } from "lucide-react-native";
-import { addMessageToTicket } from "@/lib/ticket-store";
+import { replySupportTicket } from "@/lib/support-tickets";
 
 const GREEN = "#0B7A5A";
 const RED = "#EF4444";
@@ -73,13 +73,12 @@ export default function SupportCallScreen() {
     if (id && connected) {
       const durationStr = formatTime(seconds);
       const shareTag = didShareScreen ? " · 🖥️ Screen Shared" : "";
-      await addMessageToTicket(
+      await replySupportTicket(
         id,
-        `📞 Secure Support Call ended (Duration: ${durationStr}${shareTag})`,
-        "user"
-      );
+        `Secure support call ended (Duration: ${durationStr}${shareTag})`
+      ).catch(() => {});
     } else if (id) {
-      await addMessageToTicket(id, "📞 Support Call cancelled before connect", "user");
+      await replySupportTicket(id, "Support call cancelled before connect").catch(() => {});
     }
 
     router.back();

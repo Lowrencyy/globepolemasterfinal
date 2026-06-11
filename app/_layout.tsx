@@ -46,11 +46,13 @@ function AuthGate() {
     if (!isReady) return;
 
     const root = segments[0] as string | undefined;
+    const publicRoots = new Set(["login", "onboarding"]);
     const onLogin = root === "login";
     const onChangePw = root === "change-password";
     const onLoading = root === "loading";
+    const isPublicRoute = !!root && publicRoots.has(root);
 
-    if (!isLoggedIn && !onLogin) {
+    if (!isLoggedIn && !isPublicRoute) {
       router.replace("/login");
     } else if (isLoggedIn && mustChangePassword && !onChangePw && !onLoading) {
       router.replace("/change-password");

@@ -29,13 +29,11 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 
 import { BASE_URL } from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/cache";
-import { isOnline } from "@/lib/net-sync";
+import { flushAllQueues, isOnline } from "@/lib/net-sync";
 import { simpleQueueCount } from "@/lib/simple-queue";
 import { cacheLocations, cachePhilippines } from "@/lib/tile-cache";
 import { useRouter } from "expo-router";
 import {
-  processSyncQueue,
-  processImageQueue,
   queueCount,
 } from "@/lib/sync-queue";
 import { getAreas, getNodes, getNodePoles } from "@/services/skycable";
@@ -104,8 +102,11 @@ export default function ProfileScreen() {
 
   React.useEffect(() => {
     const checkQueue = async () => {
-      const count = await queueCount();
-      setPendingSyncCount(count);
+      const [tdCount, actionCount] = await Promise.all([
+        queueCount(),
+        simpleQueueCount(),
+      ]);
+      setPendingSyncCount(tdCount + actionCount);
       
       const last = await AsyncStorage.getItem("last_sync_date");
       if (last) setLastSyncDate(last);
@@ -217,7 +218,6 @@ export default function ProfileScreen() {
           method: "GET",
           headers: {
             Accept: "application/json",
-            "ngrok-skip-browser-warning": "true",
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
         },
@@ -331,23 +331,21 @@ export default function ProfileScreen() {
 
       // 1. Upload teardown reports queue
       updateStep("upload", { status: "running", detail: tdCount > 0 ? `Uploading ${tdCount} teardown report${tdCount !== 1 ? "s" : ""}…` : "Checking…" });
-      const tdRes = await processSyncQueue();
-      await processImageQueue();
+      const tdBefore = await queueCount();
+      await flushAllQueues();
       const tdRemaining = await queueCount();
+      const tdSynced = Math.max(0, tdBefore - tdRemaining);
       setPendingSyncCount(tdRemaining);
       updateStep("upload", {
-        status: tdRes.failed > 0 ? "error" : "success",
-        detail: tdRes.submitted > 0
-          ? `${tdRes.submitted} uploaded${tdRes.failed > 0 ? ` · ${tdRes.failed} failed` : ""}`
+        status: tdRemaining > 0 ? "error" : "success",
+        detail: tdSynced > 0
+          ? `${tdSynced} uploaded${tdRemaining > 0 ? ` · ${tdRemaining} still pending` : ""}`
           : "Nothing to upload.",
       });
 
       // 2. Upload simple-queue actions (delivery moves, pickup requests, GPS)
       updateStep("actions", { status: "running", detail: simpleCount > 0 ? `Uploading ${simpleCount} queued action${simpleCount !== 1 ? "s" : ""}…` : "Checking…" });
       try {
-        const { processSimpleQueue } = await import("@/lib/simple-queue");
-        const { gpsQueueFlush } = await import("@/lib/gps-queue");
-        await Promise.all([processSimpleQueue(), gpsQueueFlush()]);
         const simpleRemaining = await simpleQueueCount();
         updateStep("actions", {
           status: simpleRemaining > 0 ? "error" : "success",
@@ -579,6 +577,7 @@ export default function ProfileScreen() {
       },
     ]);
   };
+
 
   const accountItems: ActionItem[] = [
     {

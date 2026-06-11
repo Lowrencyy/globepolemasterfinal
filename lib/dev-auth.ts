@@ -1,4 +1,4 @@
-export const DEV_BYPASS_AUTH = __DEV__ && true;
+export const DEV_BYPASS_AUTH = __DEV__ && false;
 
 export const DEV_BYPASS_USER = {
   id: 0,

@@ -66,7 +66,7 @@ export default function TeardownCompleteScreen() {
   const {
     from_pole_code,
     to_pole_id, to_pole_code, to_pole_name,
-    node_id, project_id, project_name,
+    node_id, node_name, project_id, project_name,
     accent, span_id,
     cable_collected, expected_cable, length_meters, recovered_cable, cable_reason,
     node_count, amplifier_count, extender_count,
@@ -133,7 +133,17 @@ export default function TeardownCompleteScreen() {
   function goToNext() {
     router.replace({
       pathname: "/teardowns/pole-detail" as any,
-      params: { pole_id: to_pole_id, pole_code: to_pole_code, pole_name: to_pole_name, node_id, project_id, project_name, accent },
+      params: {
+        pole_id: to_pole_id,
+        pole_code: to_pole_code,
+        pole_name: to_pole_name,
+        node_id,
+        node_name,
+        project_id,
+        project_name,
+        accent,
+        return_to_poles: "1",
+      },
     });
   }
 
@@ -151,7 +161,15 @@ export default function TeardownCompleteScreen() {
       <Stack.Screen options={{ headerShown: false }} />
       <SafeAreaView style={styles.root} edges={["top", "bottom"]}>
         <View style={styles.floatingHeader}>
-          <TouchableOpacity onPress={() => router.replace("/teardowns" as any)} style={styles.backBtn}>
+          <TouchableOpacity
+            onPress={() =>
+              router.replace({
+                pathname: "/teardowns/poles" as any,
+                params: { nodeId: node_id ?? "", nodeName: node_name ?? "" },
+              })
+            }
+            style={styles.backBtn}
+          >
             <ChevronLeft size={22} color="#111827" />
           </TouchableOpacity>
           <View style={styles.floatingHeaderText}>

@@ -13,60 +13,50 @@ type Props = {
 export default function TabTransitionOverlay({ visible, onDone }: Props) {
   const shellOpacity = useRef(new Animated.Value(0)).current;
   const shellScale = useRef(new Animated.Value(0.86)).current;
-  const shellLift = useRef(new Animated.Value(18)).current;
 
   const logoOpacity = useRef(new Animated.Value(0)).current;
   const logoScale = useRef(new Animated.Value(0.78)).current;
-  const shineX = useRef(new Animated.Value(-1)).current;
+  const shineOpacity = useRef(new Animated.Value(0.12)).current;
 
-  const mainOpacity = useRef(new Animated.Value(0)).current;
   const subOpacity = useRef(new Animated.Value(0)).current;
   const taglineOpacity = useRef(new Animated.Value(0)).current;
-  const mainTranslateY = useRef(new Animated.Value(18)).current;
-  const subTranslateY = useRef(new Animated.Value(14)).current;
-  const taglineTranslateY = useRef(new Animated.Value(10)).current;
-
-  const ringOneScale = useRef(new Animated.Value(0.82)).current;
-  const ringTwoScale = useRef(new Animated.Value(0.92)).current;
-  const ringOneOpacity = useRef(new Animated.Value(0)).current;
-  const ringTwoOpacity = useRef(new Animated.Value(0)).current;
+  const subScale = useRef(new Animated.Value(0.92)).current;
+  const taglineScale = useRef(new Animated.Value(0.94)).current;
 
   const wrapperOpacity = useRef(new Animated.Value(1)).current;
   const wrapperScale = useRef(new Animated.Value(1)).current;
-  const wrapperTranslateY = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     if (!visible) return;
 
     shellOpacity.setValue(0);
     shellScale.setValue(0.86);
-    shellLift.setValue(18);
     logoOpacity.setValue(0);
     logoScale.setValue(0.78);
-    shineX.setValue(-1);
-    mainOpacity.setValue(0);
+    shineOpacity.setValue(0.12);
     subOpacity.setValue(0);
     taglineOpacity.setValue(0);
-    mainTranslateY.setValue(18);
-    subTranslateY.setValue(14);
-    taglineTranslateY.setValue(10);
+    subScale.setValue(0.92);
+    taglineScale.setValue(0.94);
 
     wrapperOpacity.setValue(1);
     wrapperScale.setValue(1);
-    wrapperTranslateY.setValue(0);
-
-    ringOneScale.setValue(0.82);
-    ringTwoScale.setValue(0.92);
-    ringOneOpacity.setValue(0);
-    ringTwoOpacity.setValue(0);
 
     const shineLoop = Animated.loop(
-      Animated.timing(shineX, {
-        toValue: 1,
-        duration: 1800,
-        easing: Easing.linear,
-        useNativeDriver: true,
-      }),
+      Animated.sequence([
+        Animated.timing(shineOpacity, {
+          toValue: 0.28,
+          duration: 900,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(shineOpacity, {
+          toValue: 0.12,
+          duration: 900,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ]),
     );
 
     shineLoop.start();
@@ -85,12 +75,6 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
           easing: Easing.out(Easing.ease),
           useNativeDriver: true,
         }),
-        Animated.timing(shellLift, {
-          toValue: 0,
-          duration: 550,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: true,
-        }),
         Animated.timing(logoOpacity, {
           toValue: 1,
           duration: 300,
@@ -100,96 +84,52 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
         }),
         Animated.timing(logoScale, {
           toValue: 1,
-          duration: 550,
+          duration: 760,
           delay: 70,
-          easing: Easing.out(Easing.ease),
-          useNativeDriver: true,
-        }),
-        Animated.timing(ringOneOpacity, {
-          toValue: 0,
-          duration: 120,
-          easing: Easing.out(Easing.ease),
-          useNativeDriver: true,
-        }),
-        Animated.timing(ringTwoOpacity, {
-          toValue: 0,
-          duration: 120,
-          easing: Easing.out(Easing.ease),
-          useNativeDriver: true,
-        }),
-        Animated.timing(ringOneScale, {
-          toValue: 1.05,
-          duration: 650,
-          easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
-        }),
-        Animated.timing(ringTwoScale, {
-          toValue: 1.12,
-          duration: 350,
-          easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
-        }),
-      ]),
-      Animated.parallel([
-        Animated.timing(mainOpacity, {
-          toValue: 1,
-          duration: 380,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: true,
-        }),
-        Animated.timing(mainTranslateY, {
-          toValue: 0,
-          duration: 380,
-          easing: Easing.out(Easing.cubic),
+          easing: Easing.out(Easing.exp),
           useNativeDriver: true,
         }),
       ]),
       Animated.parallel([
         Animated.timing(subOpacity, {
           toValue: 1,
-          duration: 350,
-          easing: Easing.out(Easing.cubic),
+          duration: 520,
+          easing: Easing.out(Easing.exp),
           useNativeDriver: true,
         }),
-        Animated.timing(subTranslateY, {
-          toValue: 0,
-          duration: 350,
-          easing: Easing.out(Easing.cubic),
+        Animated.timing(subScale, {
+          toValue: 1,
+          duration: 520,
+          easing: Easing.out(Easing.exp),
           useNativeDriver: true,
         }),
         Animated.timing(taglineOpacity, {
           toValue: 1,
-          duration: 300,
-          delay: 80,
-          easing: Easing.out(Easing.ease),
+          duration: 420,
+          delay: 40,
+          easing: Easing.out(Easing.exp),
           useNativeDriver: true,
         }),
-        Animated.timing(taglineTranslateY, {
-          toValue: 0,
-          duration: 300,
-          delay: 80,
-          easing: Easing.out(Easing.ease),
+        Animated.timing(taglineScale, {
+          toValue: 1,
+          duration: 420,
+          delay: 40,
+          easing: Easing.out(Easing.exp),
           useNativeDriver: true,
         }),
       ]),
-      Animated.delay(720),
+      Animated.delay(1180),
       Animated.parallel([
         Animated.timing(wrapperScale, {
-          toValue: 3.45,
-          duration: 1350,
-          easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
-        }),
-        Animated.timing(wrapperTranslateY, {
-          toValue: -28,
-          duration: 1350,
-          easing: Easing.inOut(Easing.ease),
+          toValue: 3.05,
+          duration: 1620,
+          easing: Easing.inOut(Easing.cubic),
           useNativeDriver: true,
         }),
         Animated.timing(wrapperOpacity, {
           toValue: 0,
-          duration: 1180,
-          easing: Easing.inOut(Easing.ease),
+          duration: 1480,
+          easing: Easing.inOut(Easing.cubic),
           useNativeDriver: true,
         }),
       ]),
@@ -201,58 +141,28 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
     visible,
     shellOpacity,
     shellScale,
-    shellLift,
     logoOpacity,
     logoScale,
-    shineX,
-    mainOpacity,
+    shineOpacity,
     subOpacity,
     taglineOpacity,
-    mainTranslateY,
-    subTranslateY,
-    taglineTranslateY,
-    ringOneScale,
-    ringTwoScale,
-    ringOneOpacity,
-    ringTwoOpacity,
+    subScale,
+    taglineScale,
     wrapperOpacity,
     wrapperScale,
-    wrapperTranslateY,
     onDone,
   ]);
 
   if (!visible) return null;
 
-  const shineTranslate = shineX.interpolate({
-    inputRange: [-1, 1],
-    outputRange: [-scale(130), scale(150)],
-  });
-
   return (
     <View pointerEvents="auto" style={styles.overlay}>
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.ringOne,
-          { opacity: ringOneOpacity, transform: [{ scale: ringOneScale }] },
-        ]}
-      />
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.ringTwo,
-          { opacity: ringTwoOpacity, transform: [{ scale: ringTwoScale }] },
-        ]}
-      />
       <Animated.View
         style={[
           styles.content,
           {
             opacity: wrapperOpacity,
-            transform: [
-              { translateY: wrapperTranslateY },
-              { scale: wrapperScale },
-            ],
+            transform: [{ scale: wrapperScale }],
           },
         ]}
       >
@@ -261,7 +171,7 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
             styles.logoShell,
             {
               opacity: shellOpacity,
-              transform: [{ translateY: shellLift }, { scale: shellScale }],
+              transform: [{ scale: shellScale }],
             },
           ]}
         >
@@ -270,10 +180,7 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
               style={[
                 styles.logoShine,
                 {
-                  transform: [
-                    { translateX: shineTranslate },
-                    { rotate: "18deg" },
-                  ],
+                  opacity: shineOpacity,
                 },
               ]}
             />
@@ -289,8 +196,8 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
 
         <Animated.Text
           style={[
-            styles.subText,
-            { opacity: subOpacity, transform: [{ translateY: subTranslateY }] },
+            styles.mainText,
+            { opacity: subOpacity, transform: [{ scale: subScale }] },
           ]}
           numberOfLines={1}
           adjustsFontSizeToFit
@@ -302,7 +209,7 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
             styles.tagline,
             {
               opacity: taglineOpacity,
-              transform: [{ translateY: taglineTranslateY }],
+              transform: [{ scale: taglineScale }],
             },
           ]}
           numberOfLines={1}
@@ -315,9 +222,6 @@ export default function TabTransitionOverlay({ visible, onDone }: Props) {
   );
 }
 
-const RING_ONE = Math.max(SW, SH) * 0.46;
-const RING_TWO = Math.max(SW, SH) * 0.66;
-
 const styles = StyleSheet.create({
   overlay: {
     ...StyleSheet.absoluteFillObject,
@@ -327,22 +231,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     overflow: "hidden",
   },
-  ringOne: {
-    position: "absolute",
-    width: RING_ONE,
-    height: RING_ONE,
-    borderRadius: RING_ONE / 2,
-    borderWidth: 1.2,
-    borderColor: "rgba(109,141,132,0.14)",
-  },
-  ringTwo: {
-    position: "absolute",
-    width: RING_TWO,
-    height: RING_TWO,
-    borderRadius: RING_TWO / 2,
-    borderWidth: 1,
-    borderColor: "rgba(109,141,132,0.08)",
-  },
   content: {
     alignItems: "center",
     justifyContent: "center",
@@ -351,12 +239,12 @@ const styles = StyleSheet.create({
     width: "100%",
   },
   logoShell: {
-    width: scale(244),
-    height: scale(244),
+    width: scale(272),
+    height: scale(272),
     borderRadius: scale(64),
     alignItems: "center",
     justifyContent: "center",
-    marginBottom: scale(4),
+    marginBottom: scale(-12),
     overflow: "hidden",
   },
   logoShineMask: {
@@ -365,32 +253,34 @@ const styles = StyleSheet.create({
   },
   logoShine: {
     position: "absolute",
-    top: -scale(10),
-    bottom: -scale(10),
-    width: scale(54),
-    backgroundColor: "rgba(255,255,255,0.22)",
+    top: scale(24),
+    left: scale(52),
+    right: scale(52),
+    height: scale(118),
+    borderRadius: scale(999),
+    backgroundColor: "rgba(255,255,255,0.18)",
   },
   logo: {
-    width: scale(208),
-    height: scale(208),
+    width: scale(234),
+    height: scale(234),
   },
-  subText: {
-    marginTop: scale(-6),
-    fontSize: scale(28),
+  mainText: {
+    marginTop: scale(-8),
+    fontSize: scale(32),
     fontWeight: "900",
-    letterSpacing: scale(0.2),
+    letterSpacing: scale(-0.5),
     color: "#18392f",
     textAlign: "center",
-    lineHeight: scale(32),
-    maxWidth: scale(356),
+    lineHeight: scale(34),
+    maxWidth: scale(366),
   },
   tagline: {
-    marginTop: scale(6),
-    fontSize: scale(16),
-    fontWeight: "800",
-    letterSpacing: scale(-0.15),
-    color: "#80958d",
+    marginTop: scale(2),
+    fontSize: scale(18),
+    fontWeight: "900",
+    letterSpacing: scale(-0.2),
+    color: "#72867f",
     textAlign: "center",
-    maxWidth: scale(340),
+    maxWidth: scale(350),
   },
 });

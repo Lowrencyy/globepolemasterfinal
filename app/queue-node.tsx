@@ -14,13 +14,9 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
   imageQueueReadAll,
-  processImageQueue,
-  processSyncQueue,
   queueReadAll,
 } from "@/lib/sync-queue";
-import { processSimpleQueue } from "@/lib/simple-queue";
-import { gpsQueueFlush } from "@/lib/gps-queue";
-import { isOnline } from "@/lib/net-sync";
+import { flushAllQueues, isOnline } from "@/lib/net-sync";
 import { useAuth } from "@/context/auth-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
@@ -122,11 +118,15 @@ export default function QueueNodeScreen() {
 
     try {
       await Promise.allSettled([
-        processSyncQueue(), processSimpleQueue(), gpsQueueFlush(), processImageQueue(),
+        flushAllQueues(),
         token ? import("@/services/offline").then(m => m.syncQueue(token)) : Promise.resolve(),
       ]);
       clearInterval(pollRef.current!); pollRef.current = null;
-      const synced = Math.max(0, snapRef.current - uploaded);
+      const [tdAfter, imgsAfter] = await Promise.all([queueReadAll(), imageQueueReadAll()]);
+      const remaining = tdAfter.filter(i => i.status !== "synced" && (i.fields?.node_id === nodeId || i.nodeId === nodeId)).length
+        + imgsAfter.filter(i => i.status !== "synced" && i.meta?.node_id === nodeId).length;
+      const synced = Math.max(0, snapRef.current - remaining);
+      setUploaded(synced);
       const todayKey = `synced_today_${new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)}`;
       const prev = Number(await AsyncStorage.getItem(todayKey).catch(() => "0") ?? "0");
       const next = prev + synced;

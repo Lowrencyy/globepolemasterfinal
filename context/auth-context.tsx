@@ -93,6 +93,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setMustChangePassword(false);
         setBridgeToken(devToken);
         setNetSyncToken(devToken);
+        startNetSync();
+        startLocationTracking();
         setIsReady(true);
         return;
       }
